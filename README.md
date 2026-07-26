@@ -48,6 +48,10 @@ Implemented:
 - the transaction foundation: a monotonic generation, a checksummed journal with
   idempotent replay, and atomic commit through staged write and promotion.
 
+- the `.nost` language: a lexer, a comment-preserving tree, a recursive-descent
+  parser, semantic validation, and the canonical formatter whose second pass is
+  byte-identical.
+
 A section payload is still opaque. How a Node or an Edge is laid out inside a
 section is a separate contract that arrives with the parser, which is the first
 thing that needs to turn a record into bytes. The `.nost` parser,
@@ -57,8 +61,15 @@ synchronization, analyzers, and query execution arrive in later Stages.
 
 The container fixtures live in
 [nostdb-spec](https://github.com/nostdb/nostdb-spec) and are never copied here.
-`tests/container_conformance.rs` reads them from the path the superproject supplies
-in `NOSTDB_SPEC_FIXTURES`, so conformance is proven against the exact pinned commit.
+`tests/container_conformance.rs` and `tests/nost_conformance.rs` read them from the
+path the superproject supplies in `NOSTDB_SPEC_FIXTURES`, so conformance is proven
+against the exact pinned commit.
+
+The `.nost` suite deliberately does not compare error positions. The fixtures record
+them, and the language contract marks them informative: they pin the reference
+encoding, which is a PEG reporting the furthest position it backtracked from, while
+this parser is recursive descent and reports the offending token. Rejection with a
+usable range is what conformance requires.
 
 A standalone clone has no sibling checkout, so that test reports itself skipped and
 passes. Because a skipped test proves nothing, the root workspace verifier runs it

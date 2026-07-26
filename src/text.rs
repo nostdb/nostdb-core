@@ -34,6 +34,20 @@ impl NonEmptyText {
         Ok(Self(value))
     }
 
+    /// Wraps a compile-time literal that the author asserts is valid.
+    ///
+    /// This exists only so an infallible fallback can be written without `unwrap`,
+    /// keeping the crate's no-panic guarantee. It is crate-internal and takes a
+    /// `&'static str`, so a caller cannot smuggle runtime data past validation. The
+    /// debug assertion catches a bad literal during development.
+    pub(crate) fn literal(value: &'static str) -> Self {
+        debug_assert!(
+            Self::new(value).is_ok(),
+            "NonEmptyText::literal was given an invalid literal"
+        );
+        Self(value.to_owned())
+    }
+
     /// Borrows the text.
     #[must_use]
     pub fn as_str(&self) -> &str {

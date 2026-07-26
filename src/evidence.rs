@@ -31,6 +31,24 @@ pub struct SourceRange {
 }
 
 impl SourceRange {
+    /// A zero-length range at the start of a source.
+    ///
+    /// This exists so a caller that has provably valid positions can fall back
+    /// without panicking, rather than calling `unwrap` on
+    /// [`SourceRange::new`].
+    pub const ORIGIN: Self = Self {
+        start: SourcePosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+        end: SourcePosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+    };
+
     /// Creates a range.
     ///
     /// # Errors

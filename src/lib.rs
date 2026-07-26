@@ -54,6 +54,7 @@ pub mod id;
 pub mod journal;
 pub mod locator;
 pub mod name;
+pub mod nost;
 pub mod property;
 pub mod storage;
 pub mod text;
