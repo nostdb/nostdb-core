@@ -41,6 +41,7 @@
 //! process exit code, and never writes to stdout or stderr. It does not panic for
 //! ordinary failures.
 
+pub mod analysis;
 pub mod change;
 pub mod container;
 pub mod contribution;
@@ -59,8 +60,10 @@ pub mod name;
 pub mod nost;
 pub mod property;
 pub mod storage;
+pub mod sync;
 pub mod text;
 
+pub use analysis::{AnalyzerCapability, CapabilityRegistry, FactKind, PrecisionClass};
 pub use change::{ChangeSetError, GraphChangeSet, GraphOperation};
 pub use container::{Container, ContainerBuilder, ContainerError, Section, SectionKind};
 pub use contribution::{Contribution, ContributionKey, Owner};
@@ -75,3 +78,4 @@ pub use locator::CanonicalSourceLocator;
 pub use name::{DeclarationName, Label, LinkAlias, PropertyKey, RelationName};
 pub use property::{PropertyScalar, PropertyValue};
 pub use storage::{Database, StorageError};
+pub use sync::{SyncBaseline, SyncOutcome, SyncState};

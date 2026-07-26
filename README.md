@@ -50,14 +50,18 @@ Implemented:
 - the `.nost` language: a lexer, a comment-preserving tree, a recursive-descent
   parser, semantic validation, and the canonical formatter whose second pass is
   byte-identical;
-- section payload encodings, so a graph round-trips through a `.nostdb` file.
+- section payload encodings, so a graph round-trips through a `.nostdb` file;
+- the synchronization state machine, comparing a baseline of generation and content
+  digests rather than wall-clock time;
+- the deterministic analysis boundary: analyzer capability, precision class, and fact
+  kinds, with no closed language allowlist.
 
 Decoding rebuilds every value through the same typed constructors the model uses, so a
 corrupt or hostile file cannot produce a model that breaks an invariant; it produces an
 error instead. Every count is checked against the remaining bytes before anything is
 allocated.
 
-Synchronization, deterministic analyzers, and query execution are still to come.
+Query execution is still to come.
 
 ## Conformance against the specification
 

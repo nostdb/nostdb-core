@@ -74,6 +74,10 @@ pub enum DiagnosticCode {
     NostNonFiniteNumber,
     /// A datetime literal is not a valid RFC 3339 timestamp.
     NostInvalidDatetime,
+    /// The database advanced while the `.nost` file did not.
+    NostSourceStale,
+    /// Both representations changed from one baseline, so neither is modified.
+    SyncConflict,
     /// The container declares an unsupported format version.
     NostdbFormatUnsupported,
     /// The container is structurally invalid.
@@ -86,7 +90,7 @@ impl DiagnosticCode {
     /// Every code, in registry order.
     ///
     /// The root workspace compares this against the `nostdb-spec` registry.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 17] = [
         Self::NostParseError,
         Self::NostVersionUnsupported,
         Self::NostDuplicateLinkAlias,
@@ -99,6 +103,8 @@ impl DiagnosticCode {
         Self::NostIntegerOutOfRange,
         Self::NostNonFiniteNumber,
         Self::NostInvalidDatetime,
+        Self::NostSourceStale,
+        Self::SyncConflict,
         Self::NostdbFormatUnsupported,
         Self::NostdbCorrupt,
         Self::NostdbLimitExceeded,
@@ -120,6 +126,8 @@ impl DiagnosticCode {
             Self::NostIntegerOutOfRange => "NOST_INTEGER_OUT_OF_RANGE",
             Self::NostNonFiniteNumber => "NOST_NON_FINITE_NUMBER",
             Self::NostInvalidDatetime => "NOST_INVALID_DATETIME",
+            Self::NostSourceStale => "NOST_SOURCE_STALE",
+            Self::SyncConflict => "SYNC_CONFLICT",
             Self::NostdbFormatUnsupported => "NOSTDB_FORMAT_UNSUPPORTED",
             Self::NostdbCorrupt => "NOSTDB_CORRUPT",
             Self::NostdbLimitExceeded => "NOSTDB_LIMIT_EXCEEDED",

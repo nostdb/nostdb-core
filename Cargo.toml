@@ -26,5 +26,11 @@ missing_panics_doc = "deny"
 #                Maintenance: active, dtolnay/unicode-ident. It is the crate
 #                proc-macro2 uses for the same purpose.
 #                License: (MIT OR Apache-2.0) AND Unicode-3.0.
+# sha2           Purpose: SHA-256 for the content digests synchronization compares and
+#                evidence records. A digest needs collision resistance, so
+#                hand-rolling one would be reimplementing cryptography for no gain.
+#                Maintenance: active, RustCrypto/hashes.
+#                License: MIT OR Apache-2.0.
 [dependencies]
+sha2 = "0.10"
 unicode-ident = "1"
