@@ -29,6 +29,7 @@ Cargo.toml
 Cargo.lock
 rust-toolchain.toml
 src/lib.rs
+tests/container_conformance.rs
 "
 
 for required_file in $required_files; do

@@ -38,11 +38,31 @@ parser, storage engine, synchronizer, query engine, or `.nostdb` writer.
 
 ## Current status
 
-The graph model and the typed change contract are implemented: identifiers,
-canonical source locators, validated names, property values, graph records,
-ownership and evidence, diagnostics, the `GraphChangeSet` interchange contract, and
-build coverage. Storage, the `.nost` parser, synchronization, analyzers, and query
-execution arrive in later Stages.
+Implemented:
+
+- the graph model and the typed change contract: identifiers, canonical source
+  locators, validated names, property values, graph records, ownership and evidence,
+  diagnostics, `GraphChangeSet`, and build coverage;
+- the `.nostdb` container: CRC-32C, the header and section table, and the twelve
+  ordered bounded-parsing checks, reading and writing;
+- the transaction foundation: a monotonic generation, a checksummed journal with
+  idempotent replay, and atomic commit through staged write and promotion.
+
+A section payload is still opaque. How a Node or an Edge is laid out inside a
+section is a separate contract that arrives with the parser, which is the first
+thing that needs to turn a record into bytes. The `.nost` parser,
+synchronization, analyzers, and query execution arrive in later Stages.
+
+## Container conformance
+
+The container fixtures live in
+[nostdb-spec](https://github.com/nostdb/nostdb-spec) and are never copied here.
+`tests/container_conformance.rs` reads them from the path the superproject supplies
+in `NOSTDB_SPEC_FIXTURES`, so conformance is proven against the exact pinned commit.
+
+A standalone clone has no sibling checkout, so that test reports itself skipped and
+passes. Because a skipped test proves nothing, the root workspace verifier runs it
+with the path set and fails unless it confirms the fixtures ran.
 
 ## How invariants are enforced
 

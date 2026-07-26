@@ -42,23 +42,31 @@
 //! ordinary failures.
 
 pub mod change;
+pub mod container;
 pub mod contribution;
 pub mod coverage;
+pub mod crc;
 pub mod diagnostic;
 pub mod evidence;
+pub mod generation;
 pub mod graph;
 pub mod id;
+pub mod journal;
 pub mod locator;
 pub mod name;
 pub mod property;
+pub mod storage;
 pub mod text;
 
 pub use change::{ChangeSetError, GraphChangeSet, GraphOperation};
+pub use container::{Container, ContainerBuilder, ContainerError, Section, SectionKind};
 pub use contribution::{Contribution, ContributionKey, Owner};
 pub use diagnostic::{Diagnostic, DiagnosticCode, Severity};
 pub use evidence::{Confidence, Evidence, EvidenceMethod, Score, SourceRange};
+pub use generation::Generation;
 pub use graph::{Edge, Node, NodeReference, ScopedNodeId};
 pub use id::{LocalEdgeId, LocalNodeId, SourceUnitId, StableModuleId};
 pub use locator::CanonicalSourceLocator;
 pub use name::{DeclarationName, Label, LinkAlias, PropertyKey, RelationName};
 pub use property::{PropertyScalar, PropertyValue};
+pub use storage::{Database, StorageError};
