@@ -49,12 +49,15 @@ Implemented:
   idempotent replay, and atomic commit through staged write and promotion;
 - the `.nost` language: a lexer, a comment-preserving tree, a recursive-descent
   parser, semantic validation, and the canonical formatter whose second pass is
-  byte-identical.
+  byte-identical;
+- section payload encodings, so a graph round-trips through a `.nostdb` file.
 
-A section payload is still opaque. How a Node or an Edge is laid out inside a section
-is a separate contract, and it lands next now that records can be read. Section
-encodings, synchronization, deterministic analyzers, and query execution are still to
-come.
+Decoding rebuilds every value through the same typed constructors the model uses, so a
+corrupt or hostile file cannot produce a model that breaks an invariant; it produces an
+error instead. Every count is checked against the remaining bytes before anything is
+allocated.
+
+Synchronization, deterministic analyzers, and query execution are still to come.
 
 ## Conformance against the specification
 
