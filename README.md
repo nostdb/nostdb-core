@@ -56,14 +56,16 @@ Implemented:
 - the deterministic analysis boundary: analyzer capability, precision class, and fact
   kinds, with no closed language allowlist;
 - the openCypher subset parser for reading, refusing every construct outside the
-  published subset with a source range and no query plan.
+  published subset with a source range and no query plan;
+- query execution over a graph: pattern matching with bounded variable-length traversal,
+  predicates, projection, DISTINCT, ORDER BY, SKIP, LIMIT, UNWIND, and UNION.
 
 Decoding rebuilds every value through the same typed constructors the model uses, so a
 corrupt or hostile file cannot produce a model that breaks an invariant; it produces an
 error instead. Every count is checked against the remaining bytes before anything is
 allocated.
 
-Query execution, write clauses, and procedures are still to come.
+Aggregation, write clauses, transactions, and procedures are still to come.
 
 ## Conformance against the specification
 

@@ -1307,6 +1307,23 @@ fn parse_additive(parser: &mut Parser) -> Result<Expression, QueryError> {
 
 fn parse_primary(parser: &mut Parser) -> Result<Expression, QueryError> {
     let token = parser.current().clone();
+
+    // A leading minus makes a negative literal. Without this, `LIMIT -1` would fail as a
+    // syntax error, hiding the more useful complaint that the value must not be negative.
+    if token.kind == Kind::Minus {
+        parser.index += 1;
+        let inner = parse_primary(parser)?;
+        return Ok(match inner {
+            Expression::Integer(value) => Expression::Integer(-value),
+            Expression::Float(text) => Expression::Float(format!("-{text}")),
+            other => Expression::Binary {
+                operator: BinaryOperator::Subtract,
+                left: Box::new(Expression::Integer(0)),
+                right: Box::new(other),
+            },
+        });
+    }
+
     match token.kind {
         Kind::Integer => {
             parser.index += 1;
