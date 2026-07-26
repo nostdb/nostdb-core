@@ -7,8 +7,10 @@
 //! Positions are not compared, for the same reason as the `.nost` suite: where a parser
 //! notices that a construct is outside the subset is an artifact of its design.
 
-use nostdb_core::cypher::parse;
+use nostdb_core::cypher::{QueryError, parse};
 use nostdb_core::diagnostic::DiagnosticCode;
+use nostdb_core::encoding::Graph;
+use nostdb_core::execute::{DatabaseContext, Parameters, execute};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
@@ -61,7 +63,7 @@ fn supported_fixtures_parse() {
         return;
     };
     let paths = fixtures(&directory);
-    assert!(paths.len() >= 15, "expected the published supported suite");
+    assert!(paths.len() >= 36, "expected the published supported suite");
 
     for path in &paths {
         let name = path.display();
@@ -82,52 +84,118 @@ fn supported_fixtures_parse() {
 
 #[test]
 fn unsupported_fixtures_are_refused_with_the_declared_code() {
-    let Some(directory) = category("unsupported") else {
+    refused_suite("unsupported", 19);
+}
+
+/// The semantic suite covers the other refusal code the contract declares.
+///
+/// Every fixture in it is refused against any graph, including an empty one, which is what
+/// lets the suite carry no graph. Some are refused while parsing and some while executing;
+/// the contract makes the code and the outcome normative, not which pass notices.
+#[test]
+fn semantic_fixtures_are_refused_with_the_declared_code() {
+    refused_suite("semantic", 10);
+}
+
+/// A refused semantic fixture changes nothing, even when it is a write.
+///
+/// Refusal while executing is only worth as much as what it leaves behind, so this asserts
+/// the graph is still empty rather than only that an error came back.
+#[test]
+fn a_refused_semantic_fixture_leaves_the_graph_untouched() {
+    let Some(directory) = category("semantic") else {
+        println!("cypher conformance: skipped, NOSTDB_SPEC_FIXTURES is unset");
+        return;
+    };
+    for path in &fixtures(&directory) {
+        let Ok(query) = parse(&read(path)) else {
+            continue;
+        };
+        let mut graph = Graph::default();
+        assert!(
+            run(&query, &mut graph).is_err(),
+            "{} must be refused",
+            path.display()
+        );
+        assert!(
+            graph.is_empty(),
+            "{} was refused but changed the graph",
+            path.display()
+        );
+    }
+}
+
+fn run(
+    query: &nostdb_core::cypher::Query,
+    graph: &mut Graph,
+) -> Result<nostdb_core::execute::QueryResult, QueryError> {
+    execute(
+        query,
+        graph,
+        &Parameters::new(),
+        &DatabaseContext::default(),
+    )
+}
+
+fn refused_suite(name: &str, least: usize) {
+    let Some(directory) = category(name) else {
         println!("cypher conformance: skipped, NOSTDB_SPEC_FIXTURES is unset");
         return;
     };
     let paths = fixtures(&directory);
-    assert!(paths.len() >= 13, "expected the published refusal suite");
+    assert!(
+        paths.len() >= least,
+        "expected the published {name} suite to hold at least {least} fixtures"
+    );
 
     for path in &paths {
-        let name = path.display();
+        let fixture = path.display();
         let declared = expectation(path);
         assert_eq!(
             declared.get("outcome").map(String::as_str),
             Some("reject"),
-            "{name} must declare reject"
+            "{fixture} must declare reject"
         );
         let expected = DiagnosticCode::from_str(
             declared
                 .get("code")
-                .unwrap_or_else(|| panic!("{name} declares no code")),
+                .unwrap_or_else(|| panic!("{fixture} declares no code")),
         )
-        .unwrap_or_else(|error| panic!("{name}: {error}"));
+        .unwrap_or_else(|error| panic!("{fixture}: {error}"));
 
-        match parse(&read(path)) {
-            Ok(_) => panic!("{name} must be refused but parsed"),
-            Err(error) => {
-                assert_eq!(
-                    error.code, expected,
-                    "{name} must be refused with {expected}, not {} ({error})",
-                    error.code
-                );
-                // A usable range is required; its exact position is not.
-                assert!(error.range.start().line >= 1, "{name} needs a range");
-                assert!(!error.message.trim().is_empty(), "{name} needs a message");
-            }
-        }
+        // A refusal while parsing and a refusal while executing are both refusals. The
+        // contract makes the code normative, not which pass notices, so a fixture that
+        // parses is executed against an empty graph and must be refused there.
+        let refusal = match parse(&read(path)) {
+            Err(error) => error,
+            Ok(query) => run(&query, &mut Graph::default())
+                .err()
+                .unwrap_or_else(|| panic!("{fixture} must be refused but ran")),
+        };
+
+        assert_eq!(
+            refusal.code, expected,
+            "{fixture} must be refused with {expected}, not {} ({refusal})",
+            refusal.code
+        );
+        // A usable range is required; its exact position is not.
+        assert!(refusal.range.start().line >= 1, "{fixture} needs a range");
+        assert!(
+            !refusal.message.trim().is_empty(),
+            "{fixture} needs a message"
+        );
     }
     println!(
-        "cypher conformance: {} unsupported fixtures verified",
+        "cypher conformance: {} {name} fixtures verified",
         paths.len()
     );
 }
 
 #[test]
-fn a_refused_query_produces_no_plan() {
-    // The guarantee the contract makes is that nothing executes. Expressed in the type
-    // system: a refusal yields Err, so there is no partial query to run.
+fn an_unsupported_query_produces_no_plan() {
+    // The guarantee the contract makes for an unsupported construct is that nothing runs
+    // under a guessed alternative. Expressed in the type system: a refusal yields Err, so
+    // there is no partial query to execute.
     let Some(directory) = category("unsupported") else {
         println!("cypher conformance: skipped, NOSTDB_SPEC_FIXTURES is unset");
         return;

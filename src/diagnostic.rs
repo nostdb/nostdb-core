@@ -78,6 +78,17 @@ pub enum DiagnosticCode {
     CypherUnsupported,
     /// The query is inside the subset but meaningless.
     CypherSemanticError,
+    /// A write named a record belonging to a linked source.
+    ///
+    /// This build cannot emit it, and that is worth stating rather than leaving a reader
+    /// to wonder. No linked record is bindable yet, because link resolution and recursive
+    /// federation are not implemented, so a write has no way to name one. The guarantee is
+    /// structural rather than checked: every mutation resolves through the root graph, and
+    /// a record of another source is not in it.
+    ///
+    /// The code is registered because the published query subset contract names it and the
+    /// root product contract requires it. Federation is what makes it reachable.
+    LinkedDatabaseReadOnly,
     /// The database advanced while the `.nost` file did not.
     NostSourceStale,
     /// Both representations changed from one baseline, so neither is modified.
@@ -94,7 +105,7 @@ impl DiagnosticCode {
     /// Every code, in registry order.
     ///
     /// The root workspace compares this against the `nostdb-spec` registry.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::NostParseError,
         Self::NostVersionUnsupported,
         Self::NostDuplicateLinkAlias,
@@ -109,6 +120,7 @@ impl DiagnosticCode {
         Self::NostInvalidDatetime,
         Self::CypherUnsupported,
         Self::CypherSemanticError,
+        Self::LinkedDatabaseReadOnly,
         Self::NostSourceStale,
         Self::SyncConflict,
         Self::NostdbFormatUnsupported,
@@ -134,6 +146,7 @@ impl DiagnosticCode {
             Self::NostInvalidDatetime => "NOST_INVALID_DATETIME",
             Self::CypherUnsupported => "CYPHER_UNSUPPORTED",
             Self::CypherSemanticError => "CYPHER_SEMANTIC_ERROR",
+            Self::LinkedDatabaseReadOnly => "LINKED_DATABASE_READ_ONLY",
             Self::NostSourceStale => "NOST_SOURCE_STALE",
             Self::SyncConflict => "SYNC_CONFLICT",
             Self::NostdbFormatUnsupported => "NOSTDB_FORMAT_UNSUPPORTED",

@@ -15,10 +15,9 @@
 //!
 //! # Minting
 //!
-//! This module constructs an identifier from bytes and round-trips it through
-//! text. It does not mint one. Choosing an entropy source, and whether identifiers
-//! should sort by creation time, is a storage concern and is decided with the
-//! storage layer.
+//! [`Minter`] assigns identifiers to records a transaction creates. It derives them
+//! from the generation being written and a counter within that transaction rather
+//! than from randomness, which is a deliberate choice explained on the type.
 
 use std::fmt;
 use std::str::FromStr;
@@ -192,6 +191,85 @@ opaque_id!(
     "a source unit that a contribution was derived from"
 );
 
+impl SourceUnitId {
+    /// The source unit a change made through the query language belongs to.
+    ///
+    /// A query is not an analyzed source, so a record it creates derives from no source
+    /// unit. Every such contribution shares this one, which is harmless: an analyzer
+    /// refresh replaces only contributions its own owner holds, and this unit only ever
+    /// carries user-owned contributions.
+    pub const QUERY: Self = Self::from_bytes([0; 16]);
+}
+
+/// Assigns identifiers to records a transaction creates.
+///
+/// # Why not randomness
+///
+/// An identifier is only required to be unique within one database, because a record is
+/// identified across databases by the pair of canonical source locator and local
+/// identifier. Deriving it from the generation being written and a counter within that
+/// transaction satisfies that: a generation is committed at most once, so no two
+/// transactions can mint the same value, and a deleted record's identifier is never
+/// reissued.
+///
+/// Determinism also buys something an entropy source would take away. The same write
+/// against the same database produces the same file, which is what lets synchronization
+/// compare content digests rather than wall-clock time. A random identifier would make
+/// two identical writes produce two different databases.
+///
+/// Nothing reads an identifier's content. This is how a value is chosen, not a structure
+/// any part of the model interprets.
+///
+/// # Collisions with stated identifiers
+///
+/// A `.nost` file may state an identifier explicitly, so a minted value could in
+/// principle collide with one. A caller therefore passes each candidate through its own
+/// in-use check and calls [`Minter::node`] again; the counter never repeats, so that
+/// terminates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Minter {
+    generation: u64,
+    sequence: u64,
+}
+
+impl Minter {
+    /// A minter for records committed at `generation`.
+    ///
+    /// Pass the generation the transaction will write, not the one it read.
+    #[must_use]
+    pub const fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            sequence: 0,
+        }
+    }
+
+    fn next_bytes(&mut self) -> [u8; 16] {
+        let sequence = self.sequence;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut bytes = [0_u8; 16];
+        bytes[..8].copy_from_slice(&self.generation.to_be_bytes());
+        bytes[8..].copy_from_slice(&sequence.to_be_bytes());
+        bytes
+    }
+
+    /// The next Node identifier.
+    pub fn node(&mut self) -> LocalNodeId {
+        LocalNodeId::from_bytes(self.next_bytes())
+    }
+
+    /// The next Edge identifier.
+    pub fn edge(&mut self) -> LocalEdgeId {
+        LocalEdgeId::from_bytes(self.next_bytes())
+    }
+
+    /// How many identifiers this minter has issued.
+    #[must_use]
+    pub const fn issued(&self) -> u64 {
+        self.sequence
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +387,60 @@ mod tests {
             Err(IdError::OutOfRange)
         );
         assert!(LocalNodeId::from_str("n_70000000000000000000000000").is_ok());
+    }
+
+    #[test]
+    fn a_minter_never_repeats_within_a_generation() {
+        let mut minter = Minter::new(7);
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..1000 {
+            assert!(seen.insert(minter.node().to_bytes()));
+        }
+        assert_eq!(minter.issued(), 1000);
+    }
+
+    #[test]
+    fn two_generations_never_mint_the_same_identifier() {
+        // This is what makes a deleted record's identifier safe from reissue: a generation
+        // is committed at most once.
+        let first: Vec<[u8; 16]> = {
+            let mut minter = Minter::new(3);
+            (0..8).map(|_| minter.node().to_bytes()).collect()
+        };
+        let second: Vec<[u8; 16]> = {
+            let mut minter = Minter::new(4);
+            (0..8).map(|_| minter.node().to_bytes()).collect()
+        };
+        for bytes in &first {
+            assert!(!second.contains(bytes));
+        }
+    }
+
+    #[test]
+    fn minting_is_reproducible_so_two_identical_writes_produce_one_database() {
+        let mut left = Minter::new(12);
+        let mut right = Minter::new(12);
+        assert_eq!(left.node(), right.node());
+        assert_eq!(left.edge(), right.edge());
+    }
+
+    #[test]
+    fn a_node_and_an_edge_identifier_never_share_a_body() {
+        // One counter serves both kinds, so nothing depends on remembering that a node and
+        // an edge are different types.
+        let mut minter = Minter::new(1);
+        let node = minter.node();
+        let edge = minter.edge();
+        assert_ne!(node.to_bytes(), edge.to_bytes());
+    }
+
+    #[test]
+    fn the_query_source_unit_is_a_stable_well_known_value() {
+        assert_eq!(SourceUnitId::QUERY.to_bytes(), [0; 16]);
+        assert_eq!(
+            SourceUnitId::from_str(&SourceUnitId::QUERY.to_string()),
+            Ok(SourceUnitId::QUERY)
+        );
     }
 
     #[test]

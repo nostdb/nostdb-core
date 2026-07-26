@@ -55,25 +55,37 @@ Implemented:
   digests rather than wall-clock time;
 - the deterministic analysis boundary: analyzer capability, precision class, and fact
   kinds, with no closed language allowlist;
-- the openCypher subset parser for reading, refusing every construct outside the
-  published subset with a source range and no query plan;
+- the openCypher subset parser, refusing every construct outside the published subset
+  with a source range and no query plan;
 - query execution over a graph: pattern matching with bounded variable-length traversal,
-  predicates, projection, DISTINCT, ORDER BY, SKIP, LIMIT, UNWIND, and UNION.
+  inline property maps, predicates, projection, DISTINCT, ORDER BY, SKIP, LIMIT, UNWIND,
+  UNION, and aggregation with grouping;
+- write clauses: CREATE, MERGE, SET, REMOVE, DELETE, and DETACH DELETE, with identifier
+  minting derived from the generation being written;
+- the `CALL nostdb.*` procedures and the `nostdb.*` functions;
+- explicit transactions, reporting a conflict rather than rebasing when the database
+  advanced underneath.
 
 Decoding rebuilds every value through the same typed constructors the model uses, so a
 corrupt or hostile file cannot produce a model that breaks an invariant; it produces an
 error instead. Every count is checked against the remaining bytes before anything is
 allocated.
 
-Aggregation, write clauses, transactions, and procedures are still to come.
+Link resolution and recursive federation are still to come, and so is the one
+capability-gated procedure that needs them: `nostdb.refresh_links()` is refused with
+`CYPHER_UNSUPPORTED` naming the missing provider rather than answering "nothing changed".
 
 ## Conformance against the specification
 
-The container fixtures live in
-[nostdb-spec](https://github.com/nostdb/nostdb-spec) and are never copied here.
-`tests/container_conformance.rs` and `tests/nost_conformance.rs` read them from the
-path the superproject supplies in `NOSTDB_SPEC_FIXTURES`, so conformance is proven
-against the exact pinned commit.
+The fixtures live in [nostdb-spec](https://github.com/nostdb/nostdb-spec) and are never
+copied here. `tests/container_conformance.rs`, `tests/nost_conformance.rs`, and
+`tests/cypher_conformance.rs` read them from the path the superproject supplies in
+`NOSTDB_SPEC_FIXTURES`, so conformance is proven against the exact pinned commit.
+
+The Cypher suite has three parts. An accepted fixture must parse; an unsupported one must
+be refused with no query produced at all; a semantic one must be refused against any
+graph, including an empty one, and must leave that graph untouched. The last assertion is
+the one worth making: a refusal is only worth as much as what it leaves behind.
 
 The `.nost` suite deliberately does not compare error positions. The fixtures record
 them, and the language contract marks them informative: they pin the reference

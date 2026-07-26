@@ -9,10 +9,12 @@
 //!
 //! # What this crate contains today
 //!
-//! This is the graph model and the typed change contract: the data types, their
-//! validated construction, and their explicit error types. Storage, the `.nost`
-//! parser, synchronization, analyzers, and query execution arrive in later Stages.
-//! The module documentation states what is deferred where it matters.
+//! The graph model and the typed change contract, the `.nostdb` container and its
+//! transaction foundation, the `.nost` lexer, comment-preserving parser and canonical
+//! formatter, section payload encodings, the synchronization state machine, the
+//! deterministic analysis boundary, and the openCypher query subset: parsing,
+//! execution, writing, and explicit transactions. The module documentation states
+//! what is deferred where it matters.
 //!
 //! # Contract source
 //!
@@ -58,28 +60,34 @@ pub mod id;
 pub mod journal;
 pub mod link;
 pub mod locator;
+pub mod mutate;
 pub mod name;
 pub mod nost;
+pub mod procedure;
 pub mod property;
 pub mod storage;
 pub mod sync;
 pub mod text;
+pub mod transaction;
 
 pub use analysis::{AnalyzerCapability, CapabilityRegistry, FactKind, PrecisionClass};
 pub use change::{ChangeSetError, GraphChangeSet, GraphOperation};
 pub use container::{Container, ContainerBuilder, ContainerError, Section, SectionKind};
 pub use contribution::{Contribution, ContributionKey, Owner};
-pub use cypher::{Query, QueryError};
+pub use cypher::{Query, QueryError, parse};
 pub use diagnostic::{Diagnostic, DiagnosticCode, Severity};
-pub use encoding::{Graph, decode_graph, encode_graph};
+pub use encoding::{Graph, commit_graph, decode_graph, encode_graph, read_graph};
 pub use evidence::{Confidence, Evidence, EvidenceMethod, Score, SourceRange};
-pub use execute::{QueryResult, QueryValue, execute};
+pub use execute::{DatabaseContext, Parameters, QueryResult, QueryValue, execute};
 pub use generation::Generation;
 pub use graph::{Edge, Node, NodeReference, ScopedNodeId};
-pub use id::{LocalEdgeId, LocalNodeId, SourceUnitId, StableModuleId};
+pub use id::{LocalEdgeId, LocalNodeId, Minter, SourceUnitId, StableModuleId};
 pub use link::Link;
 pub use locator::CanonicalSourceLocator;
+pub use mutate::WriteSummary;
 pub use name::{DeclarationName, Label, LinkAlias, PropertyKey, RelationName};
+pub use procedure::{FUNCTIONS, PROCEDURES};
 pub use property::{PropertyScalar, PropertyValue};
 pub use storage::{Database, StorageError};
 pub use sync::{SyncBaseline, SyncOutcome, SyncState};
+pub use transaction::{Transaction, TransactionError, run_once};

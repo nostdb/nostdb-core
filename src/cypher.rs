@@ -11,14 +11,19 @@
 //! [`QueryError`] and no query plan at all, so a caller cannot receive a result that
 //! silently approximated a clause.
 //!
-//! # What this increment implements
+//! # What this parses
 //!
-//! The reading subset: `MATCH`, `OPTIONAL MATCH`, `WHERE`, `WITH`, `UNWIND`, `RETURN`,
-//! `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`, `UNION`, and parameters.
+//! The whole published subset: `MATCH`, `OPTIONAL MATCH`, `WHERE`, `WITH`, `UNWIND`,
+//! `RETURN`, `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`, `UNION`, parameters, inline property
+//! maps, aggregation, `CALL` with `YIELD`, and the write clauses `CREATE`, `MERGE`, `SET`,
+//! `REMOVE`, `DELETE`, and `DETACH DELETE`.
 //!
-//! Write clauses are in the published subset but are not implemented here yet. They are
-//! refused rather than half-parsed, with a message saying so, because producing a plan
-//! that drops a `SET` would be worse than refusing the query.
+//! # Where a rule lives
+//!
+//! A rule this parser can decide from the query text alone is decided here. A rule needing
+//! the graph, such as whether a variable is bound or whether a deleted node still has a
+//! relationship, is decided in [`crate::execute`]. The split is not aesthetic: a parser
+//! that guessed at a binding would have to guess wrong sometimes.
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Severity};
 use crate::evidence::{SourcePosition, SourceRange};
@@ -37,20 +42,22 @@ pub struct QueryError {
 }
 
 impl QueryError {
-    fn unsupported(message: impl Into<String>, range: SourceRange) -> Self {
+    /// A refusal with an explicit code and position.
+    #[must_use]
+    pub fn at(code: DiagnosticCode, message: impl Into<String>, range: SourceRange) -> Self {
         Self {
-            code: DiagnosticCode::CypherUnsupported,
+            code,
             message: message.into(),
             range,
         }
     }
 
+    fn unsupported(message: impl Into<String>, range: SourceRange) -> Self {
+        Self::at(DiagnosticCode::CypherUnsupported, message, range)
+    }
+
     fn semantic(message: impl Into<String>, range: SourceRange) -> Self {
-        Self {
-            code: DiagnosticCode::CypherSemanticError,
-            message: message.into(),
-            range,
-        }
+        Self::at(DiagnosticCode::CypherSemanticError, message, range)
     }
 
     /// Renders this refusal as a diagnostic.
@@ -136,7 +143,9 @@ pub enum Word {
     Call,
     /// `YIELD`
     Yield,
-    /// A write clause: in the published subset, not implemented in this increment.
+    /// `ON`, which only ever introduces a construct outside the subset.
+    On,
+    /// A write clause keyword.
     Write(WriteWord),
     /// A word the subset excludes outright.
     Excluded(ExcludedWord),
@@ -207,19 +216,6 @@ impl ExcludedWord {
     }
 }
 
-impl WriteWord {
-    const fn spelling(self) -> &'static str {
-        match self {
-            Self::Create => "CREATE",
-            Self::Merge => "MERGE",
-            Self::Set => "SET",
-            Self::Remove => "REMOVE",
-            Self::Delete => "DELETE",
-            Self::Detach => "DETACH",
-        }
-    }
-}
-
 fn word_of(text: &str) -> Option<Word> {
     let upper = text.to_ascii_uppercase();
     Some(match upper.as_str() {
@@ -248,6 +244,7 @@ fn word_of(text: &str) -> Option<Word> {
         "NULL" => Word::Null,
         "CALL" => Word::Call,
         "YIELD" => Word::Yield,
+        "ON" => Word::On,
         "CREATE" => Word::Write(WriteWord::Create),
         "MERGE" => Word::Write(WriteWord::Merge),
         "SET" => Word::Write(WriteWord::Set),
@@ -272,6 +269,24 @@ fn word_of(text: &str) -> Option<Word> {
 
 /// Functions the subset excludes, because they imply unbounded or specialised traversal.
 const EXCLUDED_FUNCTIONS: [&str; 2] = ["shortestpath", "allshortestpaths"];
+
+/// The aggregate functions the query contract declares, in section 9.1.
+///
+/// This list lives here rather than in the executor because both need it: the parser
+/// enforces where an aggregate may appear, and the executor groups by what is left.
+pub const AGGREGATE_FUNCTIONS: [&str; 6] = ["count", "sum", "avg", "min", "max", "collect"];
+
+/// Reports whether a function name is an aggregate, ignoring case as Cypher does.
+#[must_use]
+pub fn is_aggregate(name: &str) -> bool {
+    AGGREGATE_FUNCTIONS.contains(&name.to_ascii_lowercase().as_str())
+}
+
+/// How `count(*)` records its argument.
+///
+/// A star is not a variable name the lexer can produce, so this cannot collide with
+/// anything a caller wrote.
+pub const STAR_ARGUMENT: &str = "*";
 
 /// A lexical token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -553,18 +568,39 @@ pub struct Query {
     pub union_all: Vec<bool>,
 }
 
+impl Query {
+    /// Reports whether this query modifies the database.
+    ///
+    /// A caller holding a read-only graph therefore cannot be surprised by a write: it
+    /// can ask before executing, and it has no `&mut Graph` to execute one with anyway.
+    #[must_use]
+    pub fn is_writing(&self) -> bool {
+        self.parts.iter().any(QueryPart::is_writing)
+    }
+}
+
 /// One `UNION` operand.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryPart {
-    /// Reading clauses, in order.
-    pub reading: Vec<ReadingClause>,
-    /// The projection this part returns.
-    pub result: Projection,
+    /// Clauses, in the order they were written and the order they run in.
+    pub clauses: Vec<Clause>,
+    /// The projection this part returns, when it has a `RETURN`.
+    ///
+    /// A part containing a write clause, or ending in a `CALL`, may have none.
+    pub result: Option<Projection>,
 }
 
-/// A reading clause.
+impl QueryPart {
+    /// Reports whether this part modifies the database.
+    #[must_use]
+    pub fn is_writing(&self) -> bool {
+        self.clauses.iter().any(Clause::is_writing)
+    }
+}
+
+/// One clause.
 #[derive(Clone, Debug, PartialEq)]
-pub enum ReadingClause {
+pub enum Clause {
     /// `MATCH` or `OPTIONAL MATCH`.
     Match {
         /// Whether unmatched rows survive with `null` bindings.
@@ -582,6 +618,134 @@ pub enum ReadingClause {
         list: Expression,
         /// The variable each element binds to.
         variable: String,
+    },
+    /// `CALL`, optionally with `YIELD`.
+    Call(ProcedureCall),
+    /// `CREATE`, which creates every unbound node and relationship in its patterns.
+    Create {
+        /// The patterns to create.
+        patterns: Vec<Pattern>,
+        /// Where the clause was written, so a refusal can point at it.
+        range: SourceRange,
+    },
+    /// `MERGE`, which matches one pattern or creates it once.
+    Merge {
+        /// The pattern to match or create.
+        pattern: Pattern,
+        /// Where the clause was written.
+        range: SourceRange,
+    },
+    /// `SET`, which assigns properties and adds labels.
+    Set {
+        /// The assignments, in order.
+        items: Vec<SetItem>,
+        /// Where the clause was written.
+        range: SourceRange,
+    },
+    /// `REMOVE`, which removes properties and labels.
+    Remove {
+        /// The targets, in order.
+        items: Vec<RemoveItem>,
+        /// Where the clause was written.
+        range: SourceRange,
+    },
+    /// `DELETE` or `DETACH DELETE`.
+    Delete {
+        /// Whether incident relationships are deleted along with a node.
+        detach: bool,
+        /// What to delete.
+        targets: Vec<Expression>,
+        /// Where the clause was written.
+        range: SourceRange,
+    },
+}
+
+impl Clause {
+    /// Reports whether this clause modifies the database.
+    ///
+    /// `CALL` counts as reading. The only procedure that would change anything is
+    /// capability-gated and refused by this build, and a procedure that writes would have
+    /// to declare it, per query contract section 12.
+    #[must_use]
+    pub const fn is_writing(&self) -> bool {
+        matches!(
+            self,
+            Self::Create { .. }
+                | Self::Merge { .. }
+                | Self::Set { .. }
+                | Self::Remove { .. }
+                | Self::Delete { .. }
+        )
+    }
+}
+
+/// A procedure invocation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcedureCall {
+    /// The dotted procedure name.
+    pub name: String,
+    /// Its arguments.
+    pub arguments: Vec<Expression>,
+    /// The columns `YIELD` kept, empty when there was no `YIELD`.
+    pub yields: Vec<YieldItem>,
+    /// Where the call was written, so a refusal can point at it.
+    pub range: SourceRange,
+}
+
+/// One `YIELD` item.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct YieldItem {
+    /// The procedure column to keep.
+    pub column: String,
+    /// The name to bind it to, when `AS` renamed it.
+    pub alias: Option<String>,
+}
+
+impl YieldItem {
+    /// The name this item binds.
+    #[must_use]
+    pub fn bound_name(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.column)
+    }
+}
+
+/// One `SET` assignment.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SetItem {
+    /// `SET n.key = expression`, where a `null` value removes the property.
+    Property {
+        /// The record being modified.
+        variable: String,
+        /// The property key.
+        key: String,
+        /// The value to assign.
+        value: Expression,
+    },
+    /// `SET n:Label`.
+    Label {
+        /// The record being modified.
+        variable: String,
+        /// The label to add.
+        label: String,
+    },
+}
+
+/// One `REMOVE` target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoveItem {
+    /// `REMOVE n.key`.
+    Property {
+        /// The record being modified.
+        variable: String,
+        /// The property key.
+        key: String,
+    },
+    /// `REMOVE n:Label`.
+    Label {
+        /// The record being modified.
+        variable: String,
+        /// The label to remove.
+        label: String,
     },
 }
 
@@ -638,6 +802,8 @@ pub struct NodePattern {
     pub variable: Option<String>,
     /// Required labels.
     pub labels: Vec<String>,
+    /// An inline property map: a filter when reading, values when writing.
+    pub properties: Vec<(String, Expression)>,
 }
 
 /// Which way a relationship points.
@@ -662,6 +828,8 @@ pub struct RelationshipPattern {
     pub direction: Direction,
     /// The bounded length range, when the pattern is variable-length.
     pub length: Option<LengthRange>,
+    /// An inline property map: a filter when reading, values when writing.
+    pub properties: Vec<(String, Expression)>,
 }
 
 /// A bounded variable-length range.
@@ -721,6 +889,69 @@ pub enum Expression {
     },
 }
 
+impl Expression {
+    /// Reports whether this expression contains an aggregate anywhere inside it.
+    #[must_use]
+    pub fn contains_aggregate(&self) -> bool {
+        match self {
+            Self::Call { name, arguments } => {
+                is_aggregate(name) || arguments.iter().any(Self::contains_aggregate)
+            }
+            Self::List(items) => items.iter().any(Self::contains_aggregate),
+            Self::Not(inner) => inner.contains_aggregate(),
+            Self::Binary { left, right, .. } => {
+                left.contains_aggregate() || right.contains_aggregate()
+            }
+            Self::Integer(_)
+            | Self::Float(_)
+            | Self::Text(_)
+            | Self::Boolean(_)
+            | Self::Null
+            | Self::Parameter(_)
+            | Self::Variable(_)
+            | Self::Property { .. } => false,
+        }
+    }
+
+    /// Renders this expression back to query text.
+    ///
+    /// This is what an unaliased column is named, which is how openCypher names one. The
+    /// rendering does not have to reproduce the original spacing; it has to be something a
+    /// caller can read in a column header and match to what they wrote.
+    #[must_use]
+    pub fn render(&self) -> String {
+        match self {
+            Self::Integer(value) => value.to_string(),
+            Self::Float(text) => text.clone(),
+            Self::Text(value) => format!("{value:?}"),
+            Self::Boolean(value) => value.to_string(),
+            Self::Null => "null".to_owned(),
+            Self::Parameter(name) => format!("${name}"),
+            Self::Variable(name) => name.clone(),
+            Self::Property { variable, key } => format!("{variable}.{key}"),
+            Self::List(items) => {
+                let rendered: Vec<String> = items.iter().map(Self::render).collect();
+                format!("[{}]", rendered.join(", "))
+            }
+            Self::Call { name, arguments } => {
+                let rendered: Vec<String> = arguments.iter().map(Self::render).collect();
+                format!("{name}({})", rendered.join(", "))
+            }
+            Self::Not(inner) => format!("NOT {}", inner.render()),
+            Self::Binary {
+                operator,
+                left,
+                right,
+            } => format!(
+                "{} {} {}",
+                left.render(),
+                operator.spelling(),
+                right.render()
+            ),
+        }
+    }
+}
+
 /// A binary operator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinaryOperator {
@@ -752,6 +983,29 @@ pub enum BinaryOperator {
     Divide,
     /// `%`
     Modulo,
+}
+
+impl BinaryOperator {
+    /// How this operator is written.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::And => "AND",
+            Self::Or => "OR",
+            Self::Equal => "=",
+            Self::NotEqual => "<>",
+            Self::Less => "<",
+            Self::LessEqual => "<=",
+            Self::Greater => ">",
+            Self::GreaterEqual => ">=",
+            Self::In => "IN",
+            Self::Add => "+",
+            Self::Subtract => "-",
+            Self::Multiply => "*",
+            Self::Divide => "/",
+            Self::Modulo => "%",
+        }
+    }
 }
 
 struct Parser {
@@ -878,12 +1132,22 @@ pub fn parse(source: &str) -> Result<Query, QueryError> {
         ));
     }
 
+    // A UNION operand that wrote would make the result depend on which operand ran first,
+    // so the contract keeps every operand read-only.
+    if parts.len() > 1 && parts.iter().any(QueryPart::is_writing) {
+        return Err(QueryError::unsupported(
+            "every `UNION` operand must be read-only",
+            parser.range(),
+        ));
+    }
+
     // Every operand must project the same column names, which the contract requires and
     // a caller cannot work around.
-    if let Some(first) = parts.first() {
-        let expected = column_names(&first.result);
+    if let Some(expected) = parts.first().and_then(|part| part.result.as_ref()) {
+        let expected = column_names(expected);
         for part in parts.iter().skip(1) {
-            if column_names(&part.result) != expected {
+            let found = part.result.as_ref().map(column_names).unwrap_or_default();
+            if found != expected {
                 return Err(QueryError::semantic(
                     "UNION operands must project the same column names",
                     parser.range(),
@@ -895,69 +1159,34 @@ pub fn parse(source: &str) -> Result<Query, QueryError> {
     Ok(Query { parts, union_all })
 }
 
-fn column_names(projection: &Projection) -> Vec<String> {
-    projection
-        .items
-        .iter()
-        .map(|item| {
-            item.alias
-                .clone()
-                .unwrap_or_else(|| match &item.expression {
-                    Expression::Variable(name) => name.clone(),
-                    Expression::Property { variable, key } => format!("{variable}.{key}"),
-                    other => format!("{other:?}"),
-                })
-        })
-        .collect()
+/// The column names a projection produces.
+pub(crate) fn column_names(projection: &Projection) -> Vec<String> {
+    projection.items.iter().map(column_name).collect()
+}
+
+/// The name one projected item produces.
+///
+/// An unaliased item is named by its own text, which is what openCypher does. An earlier
+/// version fell back to the Rust debug rendering of the expression, so a caller who wrote
+/// `RETURN toUpper(n.name)` received a column named `Call { name: "toUpper", .. }`.
+pub(crate) fn column_name(item: &ProjectionItem) -> String {
+    item.alias
+        .clone()
+        .unwrap_or_else(|| item.expression.render())
 }
 
 fn parse_part(parser: &mut Parser) -> Result<QueryPart, QueryError> {
-    let mut reading = Vec::new();
+    let mut clauses = Vec::new();
 
     loop {
-        if let Kind::Word(Word::Write(word)) = parser.kind() {
-            return Err(QueryError::unsupported(
-                format!(
-                    "`{}` is in the published subset but this build implements reading only",
-                    word.spelling()
-                ),
-                parser.range(),
-            ));
-        }
-        if parser.at(Word::Call) {
-            return Err(QueryError::unsupported(
-                "`CALL` is in the published subset but this build implements reading only",
-                parser.range(),
-            ));
-        }
         if parser.at(Word::Match) || parser.at(Word::Optional) {
-            let optional = parser.eat_word(Word::Optional);
-            if optional && !parser.at(Word::Match) {
-                return Err(QueryError::semantic(
-                    "expected `MATCH` after `OPTIONAL`",
-                    parser.range(),
-                ));
-            }
-            parser.index += 1;
-            let mut patterns = vec![parse_pattern(parser)?];
-            while parser.eat(Kind::Comma) {
-                patterns.push(parse_pattern(parser)?);
-            }
-            let predicate = if parser.eat_word(Word::Where) {
-                Some(parse_expression(parser)?)
-            } else {
-                None
-            };
-            reading.push(ReadingClause::Match {
-                optional,
-                patterns,
-                predicate,
-            });
+            clauses.push(parse_match(parser)?);
             continue;
         }
         if parser.at(Word::Unwind) {
             parser.index += 1;
             let list = parse_expression(parser)?;
+            reject_aggregate(&list, "an `UNWIND` list", parser.range())?;
             if !parser.eat_word(Word::As) {
                 return Err(QueryError::semantic(
                     "expected `AS` after an UNWIND list",
@@ -965,27 +1194,312 @@ fn parse_part(parser: &mut Parser) -> Result<QueryPart, QueryError> {
                 ));
             }
             let variable = parser.expect_name("a variable name")?;
-            reading.push(ReadingClause::Unwind { list, variable });
+            clauses.push(Clause::Unwind { list, variable });
             continue;
         }
         if parser.at(Word::With) {
             parser.index += 1;
-            reading.push(ReadingClause::With(parse_projection(parser, true)?));
+            clauses.push(Clause::With(parse_projection(parser, true)?));
+            continue;
+        }
+        if parser.at(Word::Call) {
+            clauses.push(parse_procedure_call(parser)?);
+            continue;
+        }
+        if let Kind::Word(Word::Write(word)) = parser.kind() {
+            clauses.push(parse_write(parser, word)?);
             continue;
         }
         break;
     }
 
-    if !parser.at(Word::Return) {
+    let result = if parser.at(Word::Return) {
+        parser.index += 1;
+        Some(parse_projection(parser, false)?)
+    } else {
+        None
+    };
+
+    if result.is_none() {
+        // A write reports what it did through its own summary, and a `CALL` produces the
+        // columns it yields, so either may end a part. A read that projects nothing has
+        // asked a question with no answer, which is far more likely a mistake than intent.
+        let ends_in_call = matches!(clauses.last(), Some(Clause::Call(_)));
+        if !clauses.iter().any(Clause::is_writing) && !ends_in_call {
+            return Err(QueryError::semantic(
+                "a read-only query part must end with `RETURN`",
+                parser.range(),
+            ));
+        }
+    }
+
+    if clauses.is_empty() && result.is_none() {
+        return Err(QueryError::semantic("expected a query", parser.range()));
+    }
+
+    Ok(QueryPart { clauses, result })
+}
+
+fn parse_match(parser: &mut Parser) -> Result<Clause, QueryError> {
+    let optional = parser.eat_word(Word::Optional);
+    if optional && !parser.at(Word::Match) {
         return Err(QueryError::semantic(
-            "a query part must end with `RETURN`",
+            "expected `MATCH` after `OPTIONAL`",
             parser.range(),
         ));
     }
     parser.index += 1;
-    let result = parse_projection(parser, false)?;
+    let mut patterns = vec![parse_pattern(parser)?];
+    while parser.eat(Kind::Comma) {
+        patterns.push(parse_pattern(parser)?);
+    }
+    let predicate = if parser.eat_word(Word::Where) {
+        let where_range = parser.range();
+        let predicate = parse_expression(parser)?;
+        // The predicate runs before any grouping exists, so an aggregate here has nothing
+        // to aggregate over. The contract sends this through `WITH` instead.
+        reject_aggregate(
+            &predicate,
+            "a `WHERE` on `MATCH`; use `WITH` to filter on an aggregate",
+            where_range,
+        )?;
+        Some(predicate)
+    } else {
+        None
+    };
+    Ok(Clause::Match {
+        optional,
+        patterns,
+        predicate,
+    })
+}
 
-    Ok(QueryPart { reading, result })
+fn reject_aggregate(
+    expression: &Expression,
+    where_it_was: &str,
+    range: SourceRange,
+) -> Result<(), QueryError> {
+    if expression.contains_aggregate() {
+        return Err(QueryError::semantic(
+            format!("an aggregate is not allowed in {where_it_was}"),
+            range,
+        ));
+    }
+    Ok(())
+}
+
+fn parse_procedure_call(parser: &mut Parser) -> Result<Clause, QueryError> {
+    let range = parser.range();
+    parser.index += 1;
+
+    if parser.kind() == Kind::LeftBrace {
+        return Err(QueryError::unsupported(
+            "a `CALL {}` subquery is outside the declared query subset",
+            parser.range(),
+        ));
+    }
+
+    let mut name = parser.expect_name("a procedure name")?;
+    while parser.eat(Kind::Dot) {
+        name.push('.');
+        name.push_str(&parser.expect_name("a procedure name")?);
+    }
+
+    parser.expect(Kind::LeftParen, "`(` after a procedure name")?;
+    let mut arguments = Vec::new();
+    if parser.kind() != Kind::RightParen {
+        loop {
+            let argument = parse_expression(parser)?;
+            reject_aggregate(&argument, "a procedure argument", range)?;
+            arguments.push(argument);
+            if !parser.eat(Kind::Comma) {
+                break;
+            }
+        }
+    }
+    parser.expect(Kind::RightParen, "`)` to close a procedure call")?;
+
+    let mut yields = Vec::new();
+    if parser.eat_word(Word::Yield) {
+        loop {
+            let column = parser.expect_name("a yielded column name")?;
+            let alias = if parser.eat_word(Word::As) {
+                Some(parser.expect_name("a column name")?)
+            } else {
+                None
+            };
+            yields.push(YieldItem { column, alias });
+            if !parser.eat(Kind::Comma) {
+                break;
+            }
+        }
+    }
+
+    Ok(Clause::Call(ProcedureCall {
+        name,
+        arguments,
+        yields,
+        range,
+    }))
+}
+
+fn parse_write(parser: &mut Parser, word: WriteWord) -> Result<Clause, QueryError> {
+    let range = parser.range();
+    parser.index += 1;
+
+    match word {
+        WriteWord::Create => {
+            let mut patterns = vec![parse_write_pattern(parser)?];
+            while parser.eat(Kind::Comma) {
+                patterns.push(parse_write_pattern(parser)?);
+            }
+            Ok(Clause::Create { patterns, range })
+        }
+        WriteWord::Merge => {
+            let pattern = parse_write_pattern(parser)?;
+            if parser.at(Word::On) {
+                return Err(QueryError::unsupported(
+                    "`ON CREATE` and `ON MATCH` are outside the declared query subset",
+                    parser.range(),
+                ));
+            }
+            Ok(Clause::Merge { pattern, range })
+        }
+        WriteWord::Set => {
+            let mut items = vec![parse_set_item(parser)?];
+            while parser.eat(Kind::Comma) {
+                items.push(parse_set_item(parser)?);
+            }
+            Ok(Clause::Set { items, range })
+        }
+        WriteWord::Remove => {
+            let mut items = vec![parse_remove_item(parser)?];
+            while parser.eat(Kind::Comma) {
+                items.push(parse_remove_item(parser)?);
+            }
+            Ok(Clause::Remove { items, range })
+        }
+        WriteWord::Delete => Ok(Clause::Delete {
+            detach: false,
+            targets: parse_delete_targets(parser)?,
+            range,
+        }),
+        WriteWord::Detach => {
+            if !parser.eat(Kind::Word(Word::Write(WriteWord::Delete))) {
+                return Err(QueryError::semantic(
+                    "expected `DELETE` after `DETACH`",
+                    range,
+                ));
+            }
+            Ok(Clause::Delete {
+                detach: true,
+                targets: parse_delete_targets(parser)?,
+                range,
+            })
+        }
+    }
+}
+
+fn parse_delete_targets(parser: &mut Parser) -> Result<Vec<Expression>, QueryError> {
+    let mut targets = vec![parse_expression(parser)?];
+    while parser.eat(Kind::Comma) {
+        targets.push(parse_expression(parser)?);
+    }
+    Ok(targets)
+}
+
+/// A pattern in a write clause.
+///
+/// The refusals here are the rules decidable from the query text alone. A variable-length
+/// pattern names no single relationship to create; a named path would bind a path over
+/// records the clause is still creating; and an Edge has a source and a target, so an
+/// undirected or untyped relationship names nothing storable however the graph looks.
+///
+/// The remaining model rule, that a created node carries a label, is not here. It depends on
+/// whether the variable is already bound, which the parser does not know: `CREATE (a)-[:R]->(b)`
+/// after a `MATCH` binding both is legitimate.
+fn parse_write_pattern(parser: &mut Parser) -> Result<Pattern, QueryError> {
+    let range = parser.range();
+    let pattern = parse_pattern(parser)?;
+
+    if pattern.path_variable.is_some() {
+        return Err(QueryError::unsupported(
+            "a named path in a write clause is outside the declared query subset",
+            range,
+        ));
+    }
+    for (relationship, _) in &pattern.steps {
+        if relationship.length.is_some() {
+            return Err(QueryError::unsupported(
+                "a variable-length pattern in a write clause has no single relationship to \
+                 create",
+                range,
+            ));
+        }
+        if relationship.direction == Direction::Either {
+            return Err(QueryError::semantic(
+                "a relationship in a write clause must be directed, written `->` or `<-`, \
+                 because an Edge has a source and a target",
+                range,
+            ));
+        }
+        if relationship.types.len() != 1 {
+            return Err(QueryError::semantic(
+                "a relationship in a write clause names exactly one relation type",
+                range,
+            ));
+        }
+    }
+    Ok(pattern)
+}
+
+fn parse_set_item(parser: &mut Parser) -> Result<SetItem, QueryError> {
+    let variable = parser.expect_name("a variable name")?;
+
+    if parser.eat(Kind::Colon) {
+        return Ok(SetItem::Label {
+            variable,
+            label: parser.expect_name("a label")?,
+        });
+    }
+
+    // `SET n = {...}` and `SET n += {...}` differ only in what happens to a property the
+    // map omits, and choosing wrongly silently loses exactly that data.
+    if parser.kind() == Kind::Equal || parser.kind() == Kind::Plus {
+        return Err(QueryError::unsupported(
+            "assigning a whole record with `SET n = {...}` or `SET n += {...}` is outside \
+             the declared query subset; set each property",
+            parser.range(),
+        ));
+    }
+
+    parser.expect(Kind::Dot, "`.` or `:` after a variable in `SET`")?;
+    let key = parser.expect_name("a property key")?;
+    parser.expect(Kind::Equal, "`=` in a `SET` assignment")?;
+    let value_range = parser.range();
+    let value = parse_expression(parser)?;
+    reject_aggregate(&value, "a `SET` value", value_range)?;
+
+    Ok(SetItem::Property {
+        variable,
+        key,
+        value,
+    })
+}
+
+fn parse_remove_item(parser: &mut Parser) -> Result<RemoveItem, QueryError> {
+    let variable = parser.expect_name("a variable name")?;
+    if parser.eat(Kind::Colon) {
+        return Ok(RemoveItem::Label {
+            variable,
+            label: parser.expect_name("a label")?,
+        });
+    }
+    parser.expect(Kind::Dot, "`.` or `:` after a variable in `REMOVE`")?;
+    Ok(RemoveItem::Property {
+        variable,
+        key: parser.expect_name("a property key")?,
+    })
 }
 
 fn parse_projection(parser: &mut Parser, allow_where: bool) -> Result<Projection, QueryError> {
@@ -1044,16 +1558,8 @@ fn parse_projection(parser: &mut Parser, allow_where: bool) -> Result<Projection
         }
     }
 
-    let skip = if parser.eat_word(Word::Skip) {
-        Some(parse_expression(parser)?)
-    } else {
-        None
-    };
-    let limit = if parser.eat_word(Word::Limit) {
-        Some(parse_expression(parser)?)
-    } else {
-        None
-    };
+    let skip = parse_row_count(parser, Word::Skip, "a `SKIP` count")?;
+    let limit = parse_row_count(parser, Word::Limit, "a `LIMIT` count")?;
 
     Ok(Projection {
         distinct,
@@ -1063,6 +1569,20 @@ fn parse_projection(parser: &mut Parser, allow_where: bool) -> Result<Projection
         skip,
         limit,
     })
+}
+
+fn parse_row_count(
+    parser: &mut Parser,
+    word: Word,
+    what: &str,
+) -> Result<Option<Expression>, QueryError> {
+    if !parser.eat_word(word) {
+        return Ok(None);
+    }
+    let range = parser.range();
+    let expression = parse_expression(parser)?;
+    reject_aggregate(&expression, what, range)?;
+    Ok(Some(expression))
 }
 
 fn parse_pattern(parser: &mut Parser) -> Result<Pattern, QueryError> {
@@ -1103,14 +1623,53 @@ fn parse_node(parser: &mut Parser) -> Result<NodePattern, QueryError> {
     while parser.eat(Kind::Colon) {
         labels.push(parser.expect_name("a label")?);
     }
-    if parser.kind() == Kind::LeftBrace {
-        return Err(QueryError::unsupported(
-            "an inline property map in a pattern is not in this build's subset",
-            parser.range(),
-        ));
-    }
+    let properties = parse_property_map(parser)?;
     parser.expect(Kind::RightParen, "`)` to close a node pattern")?;
-    Ok(NodePattern { variable, labels })
+    Ok(NodePattern {
+        variable,
+        labels,
+        properties,
+    })
+}
+
+/// An inline property map, when the pattern has one.
+///
+/// The map means a filter in a reading clause and values in a writing one, per query
+/// contract section 8. The parser records it once; which meaning applies is decided by the
+/// clause that holds the pattern.
+fn parse_property_map(parser: &mut Parser) -> Result<Vec<(String, Expression)>, QueryError> {
+    if parser.kind() != Kind::LeftBrace {
+        return Ok(Vec::new());
+    }
+    let open = parser.range();
+    parser.index += 1;
+
+    let mut entries: Vec<(String, Expression)> = Vec::new();
+    if parser.kind() != Kind::RightBrace {
+        loop {
+            let key = parser.expect_name("a property key")?;
+            parser.expect(Kind::Colon, "`:` after a property key")?;
+            let value_range = parser.range();
+            let value = parse_expression(parser)?;
+            reject_aggregate(&value, "a property map", value_range)?;
+
+            // The last value must not silently win: the model reports a repeated key as a
+            // violation rather than resolving it, and so does the language.
+            if entries.iter().any(|(existing, _)| *existing == key) {
+                return Err(QueryError::semantic(
+                    format!("the property key `{key}` is set more than once in one map"),
+                    value_range,
+                ));
+            }
+            entries.push((key, value));
+            if !parser.eat(Kind::Comma) {
+                break;
+            }
+        }
+    }
+    parser.expect(Kind::RightBrace, "`}` to close a property map")?;
+    let _ = open;
+    Ok(entries)
 }
 
 fn parse_relationship(parser: &mut Parser) -> Result<RelationshipPattern, QueryError> {
@@ -1136,6 +1695,7 @@ fn parse_relationship(parser: &mut Parser) -> Result<RelationshipPattern, QueryE
             types: Vec::new(),
             direction,
             length: None,
+            properties: Vec::new(),
         });
     }
 
@@ -1161,6 +1721,7 @@ fn parse_relationship(parser: &mut Parser) -> Result<RelationshipPattern, QueryE
         None
     };
 
+    let properties = parse_property_map(parser)?;
     parser.expect(Kind::RightBracket, "`]` to close a relationship pattern")?;
 
     let direction = if parser.eat(Kind::ArrowRight) {
@@ -1183,6 +1744,7 @@ fn parse_relationship(parser: &mut Parser) -> Result<RelationshipPattern, QueryE
         types,
         direction,
         length,
+        properties,
     })
 }
 
@@ -1447,15 +2009,29 @@ fn parse_call(
         ));
     }
     parser.index += 1;
+    let aggregate = is_aggregate(&name);
+
+    if aggregate && parser.at(Word::Distinct) {
+        return Err(QueryError::unsupported(
+            format!("`DISTINCT` inside `{name}` is outside the declared query subset"),
+            parser.range(),
+        ));
+    }
+
     let mut arguments = Vec::new();
     if parser.kind() != Kind::RightParen {
         loop {
             // `count(*)` is the one place a star is an argument.
             if parser.kind() == Kind::Star {
                 parser.index += 1;
-                arguments.push(Expression::Variable("*".to_owned()));
+                arguments.push(Expression::Variable(STAR_ARGUMENT.to_owned()));
             } else {
-                arguments.push(parse_expression(parser)?);
+                let argument_range = parser.range();
+                let argument = parse_expression(parser)?;
+                if aggregate {
+                    reject_aggregate(&argument, "another aggregate", argument_range)?;
+                }
+                arguments.push(argument);
             }
             if !parser.eat(Kind::Comma) {
                 break;
@@ -1480,24 +2056,44 @@ mod tests {
         error
     }
 
+    fn semantic_error(source: &str) -> QueryError {
+        let error = parse(source).expect_err("must be refused");
+        assert_eq!(
+            error.code,
+            DiagnosticCode::CypherSemanticError,
+            "{source}: {error}"
+        );
+        error
+    }
+
+    fn clauses(source: &str) -> Vec<Clause> {
+        parse(source)
+            .unwrap_or_else(|error| panic!("{source}: {error}"))
+            .parts
+            .swap_remove(0)
+            .clauses
+    }
+
     #[test]
     fn parses_the_smallest_reading_query() {
         let query = parse("MATCH (n:Function) RETURN n.name").unwrap();
         assert_eq!(query.parts.len(), 1);
-        assert_eq!(query.parts[0].reading.len(), 1);
-        assert_eq!(query.parts[0].result.items.len(), 1);
+        assert_eq!(query.parts[0].clauses.len(), 1);
+        assert_eq!(query.parts[0].result.as_ref().unwrap().items.len(), 1);
+        assert!(!query.is_writing());
     }
 
     #[test]
     fn keywords_are_case_insensitive() {
         assert!(parse("match (n) return n").is_ok());
         assert!(parse("MaTcH (n) ReTuRn n").is_ok());
+        assert!(parse("create (n:A) return n").is_ok());
     }
 
     #[test]
     fn parses_a_bounded_variable_length_pattern() {
         let query = parse("MATCH p = (a)-[:CALLS*1..5]->(b) RETURN p").unwrap();
-        let ReadingClause::Match { patterns, .. } = &query.parts[0].reading[0] else {
+        let Clause::Match { patterns, .. } = &query.parts[0].clauses[0] else {
             panic!("expected a match clause");
         };
         assert_eq!(patterns[0].path_variable.as_deref(), Some("p"));
@@ -1526,8 +2122,7 @@ mod tests {
     fn an_inverted_bound_is_a_semantic_error_not_an_unsupported_one() {
         // The construct is in the subset; the values are wrong. A caller retrying against
         // a newer build would not be helped, which is what the code distinction means.
-        let error = parse("MATCH (a)-[:CALLS*5..1]->(b) RETURN b").unwrap_err();
-        assert_eq!(error.code, DiagnosticCode::CypherSemanticError);
+        semantic_error("MATCH (a)-[:CALLS*5..1]->(b) RETURN b");
     }
 
     #[test]
@@ -1557,19 +2152,6 @@ mod tests {
     }
 
     #[test]
-    fn a_write_clause_is_refused_with_a_message_that_says_why() {
-        for source in [
-            "CREATE (n:Function) RETURN n",
-            "MATCH (n) SET n.a = 1 RETURN n",
-            "MATCH (n) DETACH DELETE n RETURN n",
-            "MERGE (n:Function) RETURN n",
-        ] {
-            let error = unsupported(source);
-            assert!(error.message.contains("reading only"), "{source}: {error}");
-        }
-    }
-
-    #[test]
     fn a_refused_query_yields_no_plan_at_all() {
         // The type system carries this: parse returns Result, so there is no partial
         // query to accidentally execute.
@@ -1586,12 +2168,13 @@ mod tests {
         )
         .unwrap();
         let part = &query.parts[0];
-        assert_eq!(part.reading.len(), 3);
-        assert!(part.result.distinct);
-        assert_eq!(part.result.order_by.len(), 1);
-        assert!(part.result.order_by[0].descending);
-        assert!(part.result.skip.is_some());
-        assert!(part.result.limit.is_some());
+        assert_eq!(part.clauses.len(), 3);
+        let result = part.result.as_ref().unwrap();
+        assert!(result.distinct);
+        assert_eq!(result.order_by.len(), 1);
+        assert!(result.order_by[0].descending);
+        assert!(result.skip.is_some());
+        assert!(result.limit.is_some());
     }
 
     #[test]
@@ -1599,9 +2182,7 @@ mod tests {
         assert!(parse("MATCH (n:A) RETURN n.name UNION MATCH (n:B) RETURN n.name").is_ok());
         assert!(parse("MATCH (n:A) RETURN n.name UNION ALL MATCH (n:B) RETURN n.name").is_ok());
 
-        let error = parse("MATCH (n:A) RETURN n.name UNION MATCH (n:B) RETURN n.title")
-            .expect_err("mismatched columns");
-        assert_eq!(error.code, DiagnosticCode::CypherSemanticError);
+        let error = semantic_error("MATCH (n:A) RETURN n.name UNION MATCH (n:B) RETURN n.title");
         assert!(error.message.contains("same column names"), "{error}");
     }
 
@@ -1619,16 +2200,23 @@ mod tests {
     }
 
     #[test]
+    fn a_writing_union_operand_is_refused() {
+        let error = unsupported(
+            "MATCH (n:A) RETURN n.name AS name UNION CREATE (m:A {name: \"x\"}) RETURN m.name AS name",
+        );
+        assert!(error.message.contains("read-only"), "{error}");
+    }
+
+    #[test]
     fn where_is_refused_on_return() {
-        let error = parse("MATCH (n) RETURN n WHERE n.a = 1").unwrap_err();
-        assert_eq!(error.code, DiagnosticCode::CypherSemanticError);
+        semantic_error("MATCH (n) RETURN n WHERE n.a = 1");
     }
 
     #[test]
     fn parses_directions_and_types() {
         let query =
             parse("MATCH (a)-[r:CALLS|USES]-(b), (c)<-[:OWNS]-(d) RETURN a, b, c, d").unwrap();
-        let ReadingClause::Match { patterns, .. } = &query.parts[0].reading[0] else {
+        let Clause::Match { patterns, .. } = &query.parts[0].clauses[0] else {
             panic!("expected a match clause");
         };
         assert_eq!(patterns[0].steps[0].0.direction, Direction::Either);
@@ -1638,9 +2226,8 @@ mod tests {
     }
 
     #[test]
-    fn a_query_without_return_is_refused() {
-        let error = parse("MATCH (n)").unwrap_err();
-        assert_eq!(error.code, DiagnosticCode::CypherSemanticError);
+    fn a_read_only_query_without_return_is_refused() {
+        let error = semantic_error("MATCH (n)");
         assert!(error.message.contains("RETURN"), "{error}");
     }
 
@@ -1650,6 +2237,8 @@ mod tests {
             "MATCH (a)-[:CALLS*]->(b) RETURN b",
             "MATCH (n)",
             "USE other MATCH (n) RETURN n",
+            "MATCH (n) SET n = {a: 1}",
+            "MERGE (n:A) ON CREATE SET n.a = 1",
         ] {
             let error = parse(source).unwrap_err();
             assert!(error.range.start().line >= 1, "{source}");
@@ -1663,6 +2252,200 @@ mod tests {
     #[test]
     fn line_comments_and_multiple_lines_are_handled() {
         let query = parse("MATCH (n:Function) // a comment\nRETURN n.name").unwrap();
-        assert_eq!(query.parts[0].result.items.len(), 1);
+        assert_eq!(query.parts[0].result.as_ref().unwrap().items.len(), 1);
+    }
+
+    #[test]
+    fn parses_an_inline_property_map_in_both_positions() {
+        let query = parse(
+            "MATCH (a:Service {name: \"alpha\", live: true})-[r:CALLS {kind: \"direct\"}]->(b) \
+             RETURN b",
+        )
+        .unwrap();
+        let Clause::Match { patterns, .. } = &query.parts[0].clauses[0] else {
+            panic!("expected a match clause");
+        };
+        assert_eq!(patterns[0].start.properties.len(), 2);
+        assert_eq!(patterns[0].start.properties[0].0, "name");
+        assert_eq!(patterns[0].steps[0].0.properties.len(), 1);
+    }
+
+    #[test]
+    fn a_repeated_key_in_one_map_is_reported_rather_than_letting_the_last_value_win() {
+        let error = semantic_error("MATCH (n:A {name: \"one\", name: \"two\"}) RETURN n");
+        assert!(error.message.contains("more than once"), "{error}");
+    }
+
+    #[test]
+    fn parses_every_write_clause() {
+        assert!(matches!(
+            clauses("CREATE (n:Function {name: \"login\"})").as_slice(),
+            [Clause::Create { .. }]
+        ));
+        assert!(matches!(
+            clauses("MERGE (n:Function {name: \"login\"})").as_slice(),
+            [Clause::Merge { .. }]
+        ));
+        assert!(matches!(
+            clauses("MATCH (n) SET n.a = 1, n:Reviewed").as_slice(),
+            [Clause::Match { .. }, Clause::Set { .. }]
+        ));
+        assert!(matches!(
+            clauses("MATCH (n) REMOVE n.a, n:Reviewed").as_slice(),
+            [Clause::Match { .. }, Clause::Remove { .. }]
+        ));
+        assert!(matches!(
+            clauses("MATCH (n) DELETE n").as_slice(),
+            [Clause::Match { .. }, Clause::Delete { detach: false, .. }]
+        ));
+        assert!(matches!(
+            clauses("MATCH (n) DETACH DELETE n").as_slice(),
+            [Clause::Match { .. }, Clause::Delete { detach: true, .. }]
+        ));
+    }
+
+    #[test]
+    fn a_write_query_may_omit_return_and_is_reported_as_writing() {
+        let query = parse("MATCH (n:Function) SET n.seen = true").unwrap();
+        assert!(query.parts[0].result.is_none());
+        assert!(query.is_writing());
+
+        let reading = parse("MATCH (n:Function) RETURN n").unwrap();
+        assert!(!reading.is_writing());
+    }
+
+    #[test]
+    fn set_items_record_which_variable_and_key_they_name() {
+        let Clause::Set { items, .. } = &clauses("MATCH (n) SET n.reviewed = true")[1] else {
+            panic!("expected a set clause");
+        };
+        assert_eq!(
+            items[0],
+            SetItem::Property {
+                variable: "n".to_owned(),
+                key: "reviewed".to_owned(),
+                value: Expression::Boolean(true)
+            }
+        );
+    }
+
+    #[test]
+    fn whole_record_assignment_is_refused_in_both_spellings() {
+        for source in [
+            "MATCH (n) SET n = {name: \"x\"}",
+            "MATCH (n) SET n += {name: \"x\"}",
+        ] {
+            let error = unsupported(source);
+            assert!(error.message.contains("whole record"), "{source}: {error}");
+        }
+    }
+
+    #[test]
+    fn merge_refuses_on_create_and_on_match() {
+        for source in [
+            "MERGE (n:A {name: \"x\"}) ON CREATE SET n.made = true",
+            "MERGE (n:A {name: \"x\"}) ON MATCH SET n.seen = true",
+        ] {
+            let error = unsupported(source);
+            assert!(error.message.contains("ON CREATE"), "{source}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_write_pattern_may_not_be_variable_length_or_a_named_path() {
+        let error = unsupported("MATCH (a), (b) CREATE (a)-[:R*1..2]->(b)");
+        assert!(error.message.contains("variable-length"), "{error}");
+
+        let error = unsupported("CREATE p = (a:A)-[:R]->(b:B)");
+        assert!(error.message.contains("named path"), "{error}");
+    }
+
+    #[test]
+    fn detach_must_be_followed_by_delete() {
+        semantic_error("MATCH (n) DETACH n");
+    }
+
+    #[test]
+    fn parses_a_call_with_and_without_yield() {
+        let Clause::Call(call) = &clauses("CALL nostdb.build_status()")[0] else {
+            panic!("expected a call clause");
+        };
+        assert_eq!(call.name, "nostdb.build_status");
+        assert!(call.yields.is_empty());
+        assert!(call.arguments.is_empty());
+
+        let Clause::Call(call) = &clauses("CALL nostdb.links() YIELD source AS s RETURN s")[0]
+        else {
+            panic!("expected a call clause");
+        };
+        assert_eq!(call.yields.len(), 1);
+        assert_eq!(call.yields[0].column, "source");
+        assert_eq!(call.yields[0].bound_name(), "s");
+    }
+
+    #[test]
+    fn a_call_subquery_is_still_refused() {
+        let error = unsupported("CALL { MATCH (n) RETURN n } RETURN n");
+        assert!(error.message.contains("subquery"), "{error}");
+    }
+
+    #[test]
+    fn an_aggregate_is_refused_everywhere_the_contract_forbids_one() {
+        // In a MATCH predicate, because grouping does not exist yet.
+        let error = semantic_error("MATCH (n)-[:CALLS]->(m) WHERE count(m) > 3 RETURN n");
+        assert!(error.message.contains("WITH"), "{error}");
+
+        // Inside another aggregate.
+        semantic_error("MATCH (n) RETURN sum(count(n))");
+        // In an UNWIND list, a SKIP, a LIMIT, a SET value, and a property map.
+        semantic_error("MATCH (n) UNWIND collect(n) AS each RETURN each");
+        semantic_error("MATCH (n) RETURN n LIMIT count(n)");
+        semantic_error("MATCH (n) RETURN n SKIP count(n)");
+        semantic_error("MATCH (n) SET n.total = count(n)");
+        semantic_error("MATCH (n) CREATE (m:A {total: count(n)})");
+    }
+
+    #[test]
+    fn distinct_inside_an_aggregate_is_unsupported_rather_than_ignored() {
+        let error =
+            unsupported("MATCH (n)-[:CALLS]->(m) RETURN n.name AS n, count(DISTINCT m) AS c");
+        assert!(error.message.contains("DISTINCT"), "{error}");
+    }
+
+    #[test]
+    fn an_aggregate_is_detected_through_a_surrounding_expression() {
+        let query = parse("MATCH (n) RETURN count(n) + 1 AS more").unwrap();
+        let items = &query.parts[0].result.as_ref().unwrap().items;
+        assert!(items[0].expression.contains_aggregate());
+
+        let query = parse("MATCH (n) RETURN n.name AS name").unwrap();
+        let items = &query.parts[0].result.as_ref().unwrap().items;
+        assert!(!items[0].expression.contains_aggregate());
+    }
+
+    #[test]
+    fn an_unaliased_column_is_named_by_its_own_text_not_a_debug_rendering() {
+        let query = parse("MATCH (n) RETURN toUpper(n.name), n.age + 1, count(*)").unwrap();
+        assert_eq!(
+            column_names(query.parts[0].result.as_ref().unwrap()),
+            vec!["toUpper(n.name)", "n.age + 1", "count(*)"]
+        );
+    }
+
+    #[test]
+    fn a_rendered_expression_reads_back_as_the_query_text() {
+        for source in [
+            "n.name",
+            "$wanted",
+            "[1, 2]",
+            "NOT n.live",
+            "n.a AND n.b",
+            "count(*)",
+            "null",
+        ] {
+            let query = parse(&format!("MATCH (n) RETURN {source}")).unwrap();
+            let items = &query.parts[0].result.as_ref().unwrap().items;
+            assert_eq!(items[0].expression.render(), source);
+        }
     }
 }
