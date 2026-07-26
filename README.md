@@ -46,18 +46,17 @@ Implemented:
 - the `.nostdb` container: CRC-32C, the header and section table, and the twelve
   ordered bounded-parsing checks, reading and writing;
 - the transaction foundation: a monotonic generation, a checksummed journal with
-  idempotent replay, and atomic commit through staged write and promotion.
-
+  idempotent replay, and atomic commit through staged write and promotion;
 - the `.nost` language: a lexer, a comment-preserving tree, a recursive-descent
   parser, semantic validation, and the canonical formatter whose second pass is
   byte-identical.
 
-A section payload is still opaque. How a Node or an Edge is laid out inside a
-section is a separate contract that arrives with the parser, which is the first
-thing that needs to turn a record into bytes. The `.nost` parser,
-synchronization, analyzers, and query execution arrive in later Stages.
+A section payload is still opaque. How a Node or an Edge is laid out inside a section
+is a separate contract, and it lands next now that records can be read. Section
+encodings, synchronization, deterministic analyzers, and query execution are still to
+come.
 
-## Container conformance
+## Conformance against the specification
 
 The container fixtures live in
 [nostdb-spec](https://github.com/nostdb/nostdb-spec) and are never copied here.
