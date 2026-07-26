@@ -47,6 +47,7 @@ pub mod container;
 pub mod contribution;
 pub mod coverage;
 pub mod crc;
+pub mod cypher;
 pub mod diagnostic;
 pub mod encoding;
 pub mod evidence;
@@ -67,6 +68,7 @@ pub use analysis::{AnalyzerCapability, CapabilityRegistry, FactKind, PrecisionCl
 pub use change::{ChangeSetError, GraphChangeSet, GraphOperation};
 pub use container::{Container, ContainerBuilder, ContainerError, Section, SectionKind};
 pub use contribution::{Contribution, ContributionKey, Owner};
+pub use cypher::{Query, QueryError};
 pub use diagnostic::{Diagnostic, DiagnosticCode, Severity};
 pub use encoding::{Graph, decode_graph, encode_graph};
 pub use evidence::{Confidence, Evidence, EvidenceMethod, Score, SourceRange};

@@ -74,6 +74,10 @@ pub enum DiagnosticCode {
     NostNonFiniteNumber,
     /// A datetime literal is not a valid RFC 3339 timestamp.
     NostInvalidDatetime,
+    /// The query uses a construct outside the declared subset.
+    CypherUnsupported,
+    /// The query is inside the subset but meaningless.
+    CypherSemanticError,
     /// The database advanced while the `.nost` file did not.
     NostSourceStale,
     /// Both representations changed from one baseline, so neither is modified.
@@ -90,7 +94,7 @@ impl DiagnosticCode {
     /// Every code, in registry order.
     ///
     /// The root workspace compares this against the `nostdb-spec` registry.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 19] = [
         Self::NostParseError,
         Self::NostVersionUnsupported,
         Self::NostDuplicateLinkAlias,
@@ -103,6 +107,8 @@ impl DiagnosticCode {
         Self::NostIntegerOutOfRange,
         Self::NostNonFiniteNumber,
         Self::NostInvalidDatetime,
+        Self::CypherUnsupported,
+        Self::CypherSemanticError,
         Self::NostSourceStale,
         Self::SyncConflict,
         Self::NostdbFormatUnsupported,
@@ -126,6 +132,8 @@ impl DiagnosticCode {
             Self::NostIntegerOutOfRange => "NOST_INTEGER_OUT_OF_RANGE",
             Self::NostNonFiniteNumber => "NOST_NON_FINITE_NUMBER",
             Self::NostInvalidDatetime => "NOST_INVALID_DATETIME",
+            Self::CypherUnsupported => "CYPHER_UNSUPPORTED",
+            Self::CypherSemanticError => "CYPHER_SEMANTIC_ERROR",
             Self::NostSourceStale => "NOST_SOURCE_STALE",
             Self::SyncConflict => "SYNC_CONFLICT",
             Self::NostdbFormatUnsupported => "NOSTDB_FORMAT_UNSUPPORTED",

@@ -54,14 +54,16 @@ Implemented:
 - the synchronization state machine, comparing a baseline of generation and content
   digests rather than wall-clock time;
 - the deterministic analysis boundary: analyzer capability, precision class, and fact
-  kinds, with no closed language allowlist.
+  kinds, with no closed language allowlist;
+- the openCypher subset parser for reading, refusing every construct outside the
+  published subset with a source range and no query plan.
 
 Decoding rebuilds every value through the same typed constructors the model uses, so a
 corrupt or hostile file cannot produce a model that breaks an invariant; it produces an
 error instead. Every count is checked against the remaining bytes before anything is
 allocated.
 
-Query execution is still to come.
+Query execution, write clauses, and procedures are still to come.
 
 ## Conformance against the specification
 
