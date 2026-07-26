@@ -25,6 +25,10 @@ LICENSE
 .gitignore
 .editorconfig
 .github/workflows/verify.yml
+Cargo.toml
+Cargo.lock
+rust-toolchain.toml
+src/lib.rs
 "
 
 for required_file in $required_files; do
@@ -35,12 +39,15 @@ for required_file in $required_files; do
 done
 
 # LICENSE is verbatim upstream text and is intentionally not whitespace-scanned.
+# Rust sources are covered by `cargo fmt`.
 checked_text_files="
 AGENTS.md
 README.md
 .gitignore
 .editorconfig
 .github/workflows/verify.yml
+Cargo.toml
+rust-toolchain.toml
 scripts/verify-repository.sh
 "
 
@@ -74,5 +81,34 @@ if ! grep -q 'Offering the Program as a Service' LICENSE; then
 fi
 
 git diff --check
+
+# The Rust command set from the root contract.
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "cargo is required to verify the Engine" >&2
+  exit 1
+fi
+
+cargo fmt --check
+cargo check --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+
+# The Engine must not grow a command surface, a listener, or a second contract
+# copy. These are the ownership boundaries in AGENTS.md, and nothing else checks
+# them.
+if grep -rnE '^[[:space:]]*fn main\(' src >/dev/null 2>&1; then
+  echo "nostdb-core must not contain a binary entry point; a CLI belongs to nostdb-cli" >&2
+  exit 1
+fi
+
+if grep -rnE '\b(TcpListener|TcpStream|UnixListener|HttpServer)\b' src >/dev/null 2>&1; then
+  echo "nostdb-core must not contain a network or IPC listener" >&2
+  exit 1
+fi
+
+if [ -e src/bin ]; then
+  echo "nostdb-core must not declare binary targets" >&2
+  exit 1
+fi
 
 echo "nostdb-core verification passed"

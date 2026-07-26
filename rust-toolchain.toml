@@ -1,0 +1,6 @@
+# The root contract requires Rust stable and Edition 2024. Declaring the channel
+# and the components the verifier needs keeps a local run and a CI run identical,
+# rather than depending on whatever a runner image happens to preinstall.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

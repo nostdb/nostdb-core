@@ -1,0 +1,30 @@
+[package]
+name = "nostdb-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "SSPL-1.0"
+description = "NostDB Engine: graph model, .nost parser, .nostdb storage, transactions, synchronization, providers, and the openCypher query subset. Source-available under SSPL-1.0."
+publish = false
+
+# These lints mechanically enforce the root contract rather than leaving it to
+# review: every public item needs rustdoc, and every fallible public function
+# needs an documented error contract.
+[lints.rust]
+missing_docs = "deny"
+
+[lints.clippy]
+missing_errors_doc = "deny"
+missing_panics_doc = "deny"
+
+# Dependency review:
+#
+# unicode-ident  Purpose: UAX #31 XID_Start and XID_Continue membership, which the
+#                .nost identifier rule in nostdb-spec requires and the standard
+#                library does not expose. Approximating it with is_alphabetic
+#                would silently diverge from the contract.
+#                Maintenance: active, dtolnay/unicode-ident. It is the crate
+#                proc-macro2 uses for the same purpose.
+#                License: (MIT OR Apache-2.0) AND Unicode-3.0.
+[dependencies]
+unicode-ident = "1"

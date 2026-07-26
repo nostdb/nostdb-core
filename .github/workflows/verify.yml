@@ -1,9 +1,12 @@
 # Independent verification for nostdb-core.
 #
 # The root contract requires every child repository to format, build, lint, and
-# test independently. Stage 1 carries scaffolding only, so this workflow runs the
-# repository verifier. Later Stages add the Rust command set once Engine code
-# lands.
+# test independently. scripts/verify-repository.sh runs the repository checks, the
+# full Rust command set, and the ownership-boundary checks, so a local run and a CI
+# run check exactly the same invariants.
+#
+# The toolchain comes from rust-toolchain.toml rather than the runner image, so
+# rustfmt and clippy are guaranteed present.
 #
 # Action dependency: actions/checkout, maintained by GitHub, MIT licensed, and
 # pinned to the exact commit of tag v7.0.1 rather than a floating major tag.
@@ -28,6 +31,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+
+      - name: Report the toolchain
+        run: |
+          rustup show active-toolchain
+          cargo --version
+          cargo fmt --version
+          cargo clippy --version
 
       - name: Verify the repository
         run: ./scripts/verify-repository.sh

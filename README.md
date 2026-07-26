@@ -38,9 +38,30 @@ parser, storage engine, synchronizer, query engine, or `.nostdb` writer.
 
 ## Current status
 
-This repository is initialized as root Stage 1 scaffolding. No model, storage,
-parser, analyzer, or query code is present yet. Stage 3 begins the model and
-typed change contracts, and later Stages add storage, analysis, and query.
+The graph model and the typed change contract are implemented: identifiers,
+canonical source locators, validated names, property values, graph records,
+ownership and evidence, diagnostics, the `GraphChangeSet` interchange contract, and
+build coverage. Storage, the `.nost` parser, synchronization, analyzers, and query
+execution arrive in later Stages.
+
+## How invariants are enforced
+
+The model uses two mechanisms deliberately:
+
+- A **value invariant** is enforced by its type, so an invalid value cannot exist.
+  A float property cannot be infinite, a confidence score cannot fall outside
+  `0.0..=1.0`, a label cannot be a reserved word, and an `Edge` cannot have a
+  missing endpoint because its endpoints are not optional. There is no null
+  property variant at all.
+- A **collection invariant**, such as a property block setting one key twice, is
+  reported by a validation call. The Engine has to surface those as diagnostics
+  against real source positions, so refusing construction would discard the context
+  a caller needs.
+
+Diagnostic codes are stable identifiers registered in
+[nostdb-spec](https://github.com/nostdb/nostdb-spec). The root workspace verifies
+that this crate's vocabulary and that registry match exactly, because the two are
+separate repositories pinned together.
 
 ## Product contract
 
@@ -57,8 +78,11 @@ competing contracts.
 ./scripts/verify-repository.sh
 ```
 
-Continuous integration runs the same verifier on every push and pull request, so
-a local pass and a CI pass check identical invariants.
+The verifier runs the repository checks, `cargo fmt --check`, `cargo check`,
+`cargo clippy -- -D warnings`, `cargo test`, and the ownership-boundary checks that
+keep a command surface or a network listener out of the Engine. Continuous
+integration runs the same script, so a local pass and a CI pass check identical
+invariants.
 
 ## License
 
