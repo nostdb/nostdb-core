@@ -204,7 +204,7 @@ fn evidence_rows(
     range: crate::evidence::SourceRange,
 ) -> Result<Vec<Vec<QueryValue>>, QueryError> {
     let evidence: Vec<&Evidence> = match bound {
-        QueryValue::Node(id) => node_of(graph, *id)
+        QueryValue::Node(handle) => node_of(graph, handle.id)
             .map(|node| {
                 node.contributions
                     .iter()
@@ -212,7 +212,7 @@ fn evidence_rows(
                     .collect()
             })
             .unwrap_or_default(),
-        QueryValue::Relationship(id) => edge_of(graph, *id)
+        QueryValue::Relationship(handle) => edge_of(graph, handle.id)
             .map(|edge| {
                 edge.contributions
                     .iter()
@@ -329,12 +329,12 @@ pub fn function(
     // Every function here describes the record a value denotes, so anything that is not a
     // record has nothing to describe. Null propagates rather than failing.
     let first = match bound {
-        QueryValue::Node(id) => node_of(graph, *id).and_then(|node| {
+        QueryValue::Node(handle) => node_of(graph, handle.id).and_then(|node| {
             node.contributions
                 .first()
                 .and_then(|contribution| contribution.evidence.first())
         }),
-        QueryValue::Relationship(id) => edge_of(graph, *id).and_then(|edge| {
+        QueryValue::Relationship(handle) => edge_of(graph, handle.id).and_then(|edge| {
             edge.contributions
                 .first()
                 .and_then(|contribution| contribution.evidence.first())
@@ -383,6 +383,7 @@ mod tests {
     use super::*;
     use crate::contribution::{Contribution, Owner};
     use crate::evidence::{ContentDigest, SourcePosition, SourceRange};
+    use crate::execute::Scoped;
     use crate::id::SourceUnitId;
     use crate::link::Link;
     use crate::locator::CanonicalSourceLocator;
@@ -523,7 +524,9 @@ mod tests {
         let graph = graph();
         let rows = run(
             lookup("nostdb.evidence", origin()).unwrap(),
-            &[QueryValue::Node(LocalNodeId::from_bytes([1; 16]))],
+            &[QueryValue::Node(Scoped::root(LocalNodeId::from_bytes(
+                [1; 16],
+            )))],
             &graph,
             &DatabaseContext::default(),
             origin(),
@@ -579,7 +582,9 @@ mod tests {
             generation: None,
             source: Some(locator("./packages/child")),
         };
-        let node = [QueryValue::Node(LocalNodeId::from_bytes([1; 16]))];
+        let node = [QueryValue::Node(Scoped::root(LocalNodeId::from_bytes(
+            [1; 16],
+        )))];
 
         assert_eq!(
             function("nostdb.source", &node, &graph, &context, origin()).unwrap(),
@@ -601,7 +606,9 @@ mod tests {
 
     #[test]
     fn source_is_null_when_the_caller_named_no_database() {
-        let node = [QueryValue::Node(LocalNodeId::from_bytes([1; 16]))];
+        let node = [QueryValue::Node(Scoped::root(LocalNodeId::from_bytes(
+            [1; 16],
+        )))];
         assert_eq!(
             function(
                 "nostdb.source",
@@ -663,7 +670,9 @@ mod tests {
             (0..EVIDENCE_ROW_LIMIT + 50).map(|_| evidence()).collect();
         let rows = run(
             lookup("nostdb.evidence", origin()).unwrap(),
-            &[QueryValue::Node(LocalNodeId::from_bytes([1; 16]))],
+            &[QueryValue::Node(Scoped::root(LocalNodeId::from_bytes(
+                [1; 16],
+            )))],
             &graph,
             &DatabaseContext::default(),
             origin(),

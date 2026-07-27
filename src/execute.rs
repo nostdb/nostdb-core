@@ -58,6 +58,99 @@ use std::fmt;
 /// Functions this build evaluates.
 const SCALAR_FUNCTIONS: [&str; 6] = ["toupper", "tolower", "size", "labels", "type", "coalesce"];
 
+/// A linked source a read may see beside the root.
+///
+/// Defined here rather than taken from `federation`, so the executor depends on the shape
+/// of a source and not on how one is discovered. A caller that has resolved a
+/// `Federation` hands over a slice of these; a caller with no links hands over nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct LinkedSource<'a> {
+    /// The canonical locator, which is the source's identity.
+    pub locator: &'a CanonicalSourceLocator,
+    /// The records it holds.
+    pub graph: &'a Graph,
+}
+
+/// The root and its linked sources, in the order the executor indexes them.
+fn source_list<'a>(
+    root: &'a Graph,
+    linked: &[LinkedSource<'a>],
+) -> Vec<(Option<&'a CanonicalSourceLocator>, &'a Graph)> {
+    std::iter::once((None, root))
+        .chain(
+            linked
+                .iter()
+                .map(|source| (Some(source.locator), source.graph)),
+        )
+        .collect()
+}
+
+/// A record handle inside a query, carrying which source it came from.
+///
+/// A `LocalNodeId` is unique within one database and nowhere else. A federated query sees
+/// several, and two of them may carry the same identifier: a database copied and then
+/// linked from its original does exactly that, and root PRD section 18.4 says the two
+/// remain distinct sources however identical their bytes. A bound record therefore has to
+/// name its source as well as its identifier.
+///
+/// `source` is an index into the query's source list, and `0` is always the root. An
+/// index rather than a locator keeps the handle `Copy` and cheap to compare; the locator
+/// is recovered from the executor when a caller asks for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Scoped<T> {
+    /// Which source, indexed from the root at zero.
+    pub source: u32,
+    /// The record's identifier within that source.
+    pub id: T,
+}
+
+impl<T> Scoped<T> {
+    /// A handle to a record in the root database.
+    pub const fn root(id: T) -> Self {
+        Self { source: 0, id }
+    }
+
+    /// Reports whether this record belongs to the root rather than a linked source.
+    ///
+    /// A write may only touch the root, so this is what a refusal turns on.
+    #[must_use]
+    pub const fn is_root(&self) -> bool {
+        self.source == 0
+    }
+}
+
+impl<T: fmt::Display> Scoped<T> {
+    /// A total-order key that keeps two sources apart.
+    ///
+    /// [`fmt::Display`] renders the identifier alone, because that is what a caller sees
+    /// and what the result envelope carries. Sorting cannot use it: two sources may hold
+    /// the same identifier, and a key that rendered both the same would let `ORDER BY`
+    /// and `DISTINCT` treat two records as one.
+    #[must_use]
+    pub fn sort_key(&self) -> String {
+        // A separator no identifier can contain, so the two fields cannot run together.
+        // The source is zero padded so the key orders numerically, and a colon cannot
+        // appear in an identifier, so the two fields cannot run together.
+        format!("{:010}:{}", self.source, self.id)
+    }
+}
+
+/// Renders the identifier alone.
+///
+/// The source is deliberately absent: `nostdb.source(n)` reports it, and the result
+/// envelope carries the identifier in the form the record itself uses.
+impl<T: fmt::Display> fmt::Display for Scoped<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.id)
+    }
+}
+
+/// A bound node.
+pub type ScopedNode = Scoped<LocalNodeId>;
+
+/// A bound relationship.
+pub type ScopedEdge = Scoped<LocalEdgeId>;
+
 /// A value a query can produce.
 #[derive(Clone, Debug)]
 pub enum QueryValue {
@@ -74,15 +167,15 @@ pub enum QueryValue {
     /// A list.
     List(Vec<QueryValue>),
     /// A bound node.
-    Node(LocalNodeId),
+    Node(ScopedNode),
     /// A bound relationship.
-    Relationship(LocalEdgeId),
+    Relationship(ScopedEdge),
     /// A bound path: alternating nodes and relationships.
     Path {
         /// Nodes along the path, in order.
-        nodes: Vec<LocalNodeId>,
+        nodes: Vec<ScopedNode>,
         /// Relationships between them, in order.
-        relationships: Vec<LocalEdgeId>,
+        relationships: Vec<ScopedEdge>,
     },
 }
 
@@ -147,11 +240,9 @@ impl QueryValue {
             Self::Float(value) => SortKey::Number(Number::Float(value.get())),
             Self::Text(value) => SortKey::Text(value.clone()),
             Self::List(items) => SortKey::List(items.iter().map(Self::sort_key).collect()),
-            Self::Node(id) => SortKey::Node(id.to_string()),
-            Self::Relationship(id) => SortKey::Relationship(id.to_string()),
-            Self::Path { nodes, .. } => {
-                SortKey::Path(nodes.iter().map(ToString::to_string).collect())
-            }
+            Self::Node(id) => SortKey::Node(id.sort_key()),
+            Self::Relationship(id) => SortKey::Relationship(id.sort_key()),
+            Self::Path { nodes, .. } => SortKey::Path(nodes.iter().map(Scoped::sort_key).collect()),
         }
     }
 
@@ -352,39 +443,112 @@ impl QueryResult {
 /// A row paired with the sort key computed for it.
 type KeyedRow = (Vec<SortKey>, Vec<QueryValue>);
 
+/// Turns one endpoint into a scoped handle, or `None` when its source was not opened.
+fn resolve_endpoint(
+    reference: &NodeReference,
+    own_source: u32,
+    index_of: &impl Fn(&CanonicalSourceLocator) -> Option<u32>,
+) -> Option<ScopedNode> {
+    match reference {
+        NodeReference::Local(id) => Some(Scoped {
+            source: own_source,
+            id: *id,
+        }),
+        NodeReference::External(scoped) => index_of(&scoped.source).map(|source| Scoped {
+            source,
+            id: scoped.local,
+        }),
+    }
+}
+
 struct Executor<'a> {
-    graph: &'a Graph,
+    /// Every source a read may see. Index zero is always the root.
+    sources: Vec<&'a Graph>,
+    /// The locator of each source. The root has none.
+    locators: Vec<Option<&'a CanonicalSourceLocator>>,
     parameters: &'a Parameters,
     context: &'a DatabaseContext,
-    nodes: BTreeMap<LocalNodeId, &'a Node>,
-    outgoing: BTreeMap<LocalNodeId, Vec<&'a Edge>>,
-    incoming: BTreeMap<LocalNodeId, Vec<&'a Edge>>,
+    nodes: BTreeMap<ScopedNode, &'a Node>,
+    edges: BTreeMap<ScopedEdge, &'a Edge>,
+    outgoing: BTreeMap<ScopedNode, Vec<ScopedEdge>>,
+    incoming: BTreeMap<ScopedNode, Vec<ScopedEdge>>,
 }
 
 impl<'a> Executor<'a> {
-    fn new(graph: &'a Graph, parameters: &'a Parameters, context: &'a DatabaseContext) -> Self {
+    /// Indexes the root and every linked source.
+    ///
+    /// An edge's endpoint is resolved here rather than during traversal, because an
+    /// external reference names another source by locator and that lookup should happen
+    /// once. An endpoint naming a source that was not opened is dropped: the edge stays
+    /// in its own source's records, and traversal simply cannot leave through it, which
+    /// is what a partial result means.
+    fn new(
+        sources: Vec<(Option<&'a CanonicalSourceLocator>, &'a Graph)>,
+        parameters: &'a Parameters,
+        context: &'a DatabaseContext,
+    ) -> Self {
+        let locators: Vec<Option<&CanonicalSourceLocator>> =
+            sources.iter().map(|(locator, _)| *locator).collect();
+        let graphs: Vec<&Graph> = sources.iter().map(|(_, graph)| *graph).collect();
+
+        let index_of = |locator: &CanonicalSourceLocator| -> Option<u32> {
+            locators
+                .iter()
+                .position(|held| held.is_some_and(|held| held == locator))
+                .and_then(|position| u32::try_from(position).ok())
+        };
+
         let mut nodes = BTreeMap::new();
-        for node in &graph.nodes {
-            nodes.insert(node.id, node);
-        }
-        let mut outgoing: BTreeMap<LocalNodeId, Vec<&Edge>> = BTreeMap::new();
-        let mut incoming: BTreeMap<LocalNodeId, Vec<&Edge>> = BTreeMap::new();
-        for edge in &graph.edges {
-            if let NodeReference::Local(from) = edge.source {
-                outgoing.entry(from).or_default().push(edge);
+        let mut edges = BTreeMap::new();
+        let mut outgoing: BTreeMap<ScopedNode, Vec<ScopedEdge>> = BTreeMap::new();
+        let mut incoming: BTreeMap<ScopedNode, Vec<ScopedEdge>> = BTreeMap::new();
+
+        for (position, graph) in graphs.iter().enumerate() {
+            let source = u32::try_from(position).unwrap_or(u32::MAX);
+            for node in &graph.nodes {
+                nodes.insert(
+                    Scoped {
+                        source,
+                        id: node.id,
+                    },
+                    node,
+                );
             }
-            if let NodeReference::Local(to) = edge.target {
-                incoming.entry(to).or_default().push(edge);
+            for edge in &graph.edges {
+                let handle = Scoped {
+                    source,
+                    id: edge.id,
+                };
+                edges.insert(handle, edge);
+                if let Some(from) = resolve_endpoint(&edge.source, source, &index_of) {
+                    outgoing.entry(from).or_default().push(handle);
+                }
+                if let Some(to) = resolve_endpoint(&edge.target, source, &index_of) {
+                    incoming.entry(to).or_default().push(handle);
+                }
             }
         }
+
         Self {
-            graph,
+            sources: graphs,
+            locators,
             parameters,
             context,
             nodes,
+            edges,
             outgoing,
             incoming,
         }
+    }
+
+    /// The root graph, which is the only one a write may touch.
+    fn root(&self) -> &'a Graph {
+        self.sources[0]
+    }
+
+    /// The locator of a bound record's source, when it is not the root.
+    fn locator_of(&self, source: u32) -> Option<&'a CanonicalSourceLocator> {
+        self.locators.get(source as usize).copied().flatten()
     }
 
     fn node_matches(
@@ -433,12 +597,16 @@ impl<'a> Executor<'a> {
         Ok(true)
     }
 
+    /// Every edge leaving `from` that the pattern admits, with the node it reaches.
+    ///
+    /// Both handles are scoped, so a traversal that crosses into a linked source keeps
+    /// saying which source each record came from.
     fn edges_from(
         &self,
-        from: LocalNodeId,
+        from: ScopedNode,
         pattern: &RelationshipPattern,
         bindings: &Bindings,
-    ) -> Result<Vec<(&'a Edge, LocalNodeId)>, QueryError> {
+    ) -> Result<Vec<(ScopedEdge, ScopedNode)>, QueryError> {
         let mut found = Vec::new();
         let type_matches = |edge: &Edge| {
             pattern.types.is_empty()
@@ -448,27 +616,98 @@ impl<'a> Executor<'a> {
                     .any(|wanted| edge.relation.as_str() == wanted)
         };
 
-        if matches!(pattern.direction, Direction::Outgoing | Direction::Either) {
-            for edge in self.outgoing.get(&from).into_iter().flatten() {
-                if type_matches(edge)
-                    && self.properties_match(&edge.properties, &pattern.properties, bindings)?
-                    && let NodeReference::Local(other) = edge.target
+        let consider = |handles: Option<&Vec<ScopedEdge>>,
+                        take_target: bool,
+                        found: &mut Vec<(ScopedEdge, ScopedNode)>|
+         -> Result<(), QueryError> {
+            for handle in handles.into_iter().flatten() {
+                let Some(edge) = self.edges.get(handle) else {
+                    continue;
+                };
+                if !type_matches(edge)
+                    || !self.properties_match(&edge.properties, &pattern.properties, bindings)?
                 {
-                    found.push((*edge, other));
+                    continue;
+                }
+                let reference = if take_target {
+                    &edge.target
+                } else {
+                    &edge.source
+                };
+                if let Some(other) = self.endpoint(reference, handle.source) {
+                    found.push((*handle, other));
                 }
             }
+            Ok(())
+        };
+
+        if matches!(pattern.direction, Direction::Outgoing | Direction::Either) {
+            consider(self.outgoing.get(&from), true, &mut found)?;
         }
         if matches!(pattern.direction, Direction::Incoming | Direction::Either) {
-            for edge in self.incoming.get(&from).into_iter().flatten() {
-                if type_matches(edge)
-                    && self.properties_match(&edge.properties, &pattern.properties, bindings)?
-                    && let NodeReference::Local(other) = edge.source
-                {
-                    found.push((*edge, other));
-                }
-            }
+            consider(self.incoming.get(&from), false, &mut found)?;
         }
         Ok(found)
+    }
+
+    /// Answers `nostdb.source` and `nostdb.link_alias` from a bound record's own source.
+    ///
+    /// Returns `None` for anything else, so the caller falls through to the procedure
+    /// registry. A record of the root reports the root's own locator, which is what
+    /// `DatabaseContext` carries; a record reached through a link reports that link's.
+    fn source_function(&self, lower: &str, values: &[QueryValue]) -> Option<QueryValue> {
+        if !matches!(lower, "nostdb.source" | "nostdb.link_alias") {
+            return None;
+        }
+        let source = match values.first() {
+            Some(QueryValue::Node(handle)) => handle.source,
+            Some(QueryValue::Relationship(handle)) => handle.source,
+            // A null argument yields null rather than failing, so an unmatched
+            // `OPTIONAL MATCH` row can still be piped in.
+            Some(QueryValue::Null) | None => return Some(QueryValue::Null),
+            Some(_) => return None,
+        };
+
+        Some(match (lower, self.locator_of(source)) {
+            // A root record was not reached through a link, so it has no alias.
+            ("nostdb.link_alias", None) => QueryValue::Null,
+            ("nostdb.link_alias", Some(locator)) => self
+                .root()
+                .links
+                .iter()
+                .find(|link| link.source == *locator)
+                .and_then(|link| link.alias.as_ref())
+                .map_or(QueryValue::Null, |alias| {
+                    QueryValue::Text(alias.as_str().to_owned())
+                }),
+            (_, Some(locator)) => QueryValue::Text(locator.as_str().to_owned()),
+            (_, None) => self
+                .context
+                .source
+                .as_ref()
+                .map_or(QueryValue::Null, |source| {
+                    QueryValue::Text(source.as_str().to_owned())
+                }),
+        })
+    }
+
+    /// Resolves an endpoint against the sources this query opened.
+    fn endpoint(&self, reference: &NodeReference, own_source: u32) -> Option<ScopedNode> {
+        match reference {
+            NodeReference::Local(id) => Some(Scoped {
+                source: own_source,
+                id: *id,
+            }),
+            NodeReference::External(scoped) => self
+                .locators
+                .iter()
+                .position(|held| held.is_some_and(|held| *held == scoped.source))
+                .and_then(|position| u32::try_from(position).ok())
+                .map(|source| Scoped {
+                    source,
+                    id: scoped.local,
+                }),
+        }
     }
 
     /// Enumerates every way `pattern` can be satisfied, extending `base`.
@@ -477,24 +716,26 @@ impl<'a> Executor<'a> {
         pattern: &Pattern,
         base: &Bindings,
     ) -> Result<Vec<Bindings>, QueryError> {
-        let mut partial: Vec<(Bindings, LocalNodeId, Vec<LocalNodeId>, Vec<LocalEdgeId>)> =
-            Vec::new();
+        let mut partial: Vec<(Bindings, ScopedNode, Vec<ScopedNode>, Vec<ScopedEdge>)> = Vec::new();
 
-        for node in &self.graph.nodes {
+        // Every source contributes candidates, which is what makes a match federated.
+        // Order across sources is not meaning: a query without ORDER BY promises a row
+        // set, and the root simply happens to come first.
+        for (handle, node) in &self.nodes {
             if !self.node_matches(node, &pattern.start, base)? {
                 continue;
             }
             let mut bindings = base.clone();
             if let Some(name) = &pattern.start.variable {
                 if let Some(existing) = bindings.get(name) {
-                    if *existing != QueryValue::Node(node.id) {
+                    if *existing != QueryValue::Node(*handle) {
                         continue;
                     }
                 } else {
-                    bindings.insert(name.clone(), QueryValue::Node(node.id));
+                    bindings.insert(name.clone(), QueryValue::Node(*handle));
                 }
             }
-            partial.push((bindings, node.id, vec![node.id], Vec::new()));
+            partial.push((bindings, *handle, vec![*handle], Vec::new()));
         }
 
         for (relationship, next_node) in &pattern.steps {
@@ -504,7 +745,7 @@ impl<'a> Executor<'a> {
                     None => self
                         .edges_from(current, relationship, &bindings)?
                         .into_iter()
-                        .map(|(edge, other)| (vec![edge.id], other))
+                        .map(|(edge, other)| (vec![edge], other))
                         .collect(),
                     Some(range) => self.walk(current, relationship, range, &bindings)?,
                 };
@@ -572,13 +813,15 @@ impl<'a> Executor<'a> {
     /// cycle from producing the same node repeatedly within one path.
     fn walk(
         &self,
-        from: LocalNodeId,
+        from: ScopedNode,
         pattern: &RelationshipPattern,
         range: LengthRange,
         bindings: &Bindings,
-    ) -> Result<Vec<(Vec<LocalEdgeId>, LocalNodeId)>, QueryError> {
+    ) -> Result<Vec<(Vec<ScopedEdge>, ScopedNode)>, QueryError> {
         let mut found = Vec::new();
-        let mut frontier: Vec<(Vec<LocalEdgeId>, LocalNodeId, BTreeSet<LocalNodeId>)> =
+        // The visited set is scoped, so a walk that reaches the same identifier in two
+        // sources treats them as two nodes rather than as a cycle.
+        let mut frontier: Vec<(Vec<ScopedEdge>, ScopedNode, BTreeSet<ScopedNode>)> =
             vec![(Vec::new(), from, BTreeSet::from([from]))];
 
         for depth in 1..=range.maximum {
@@ -589,7 +832,7 @@ impl<'a> Executor<'a> {
                         continue;
                     }
                     let mut edge_ids = edges.clone();
-                    edge_ids.push(edge.id);
+                    edge_ids.push(edge);
                     let mut seen = visited.clone();
                     seen.insert(other);
                     if depth >= range.minimum {
@@ -668,10 +911,8 @@ impl<'a> Executor<'a> {
                     QueryValue::from_property(value)
                 }),
             QueryValue::Relationship(id) => self
-                .graph
                 .edges
-                .iter()
-                .find(|edge| edge.id == *id)
+                .get(id)
                 .and_then(|edge| {
                     edge.properties
                         .iter()
@@ -711,10 +952,17 @@ impl<'a> Executor<'a> {
             .collect::<Result<_, _>>()?;
 
         if lower.starts_with(procedure::NAMESPACE) {
+            // Two functions answer questions about *where* a record came from, and only
+            // the executor knows: the bound handle carries a source index, and the
+            // locators live here. Everything else is about the record's content and is
+            // answered against the graph holding it.
+            if let Some(answer) = self.source_function(&lower, &values) {
+                return Ok(answer);
+            }
             return procedure::function(
                 &lower,
                 &values,
-                self.graph,
+                self.root(),
                 self.context,
                 SourceRange::ORIGIN,
             );
@@ -755,14 +1003,11 @@ impl<'a> Executor<'a> {
                 _ => QueryValue::Null,
             },
             "type" => match first {
-                QueryValue::Relationship(id) => self
-                    .graph
-                    .edges
-                    .iter()
-                    .find(|edge| edge.id == id)
-                    .map_or(QueryValue::Null, |edge| {
+                QueryValue::Relationship(id) => {
+                    self.edges.get(&id).map_or(QueryValue::Null, |edge| {
                         QueryValue::Text(edge.relation.as_str().to_owned())
-                    }),
+                    })
+                }
                 _ => QueryValue::Null,
             },
             // `coalesce` returns its first non-null argument.
@@ -919,7 +1164,8 @@ impl<'a> Executor<'a> {
                 .iter()
                 .map(|argument| self.evaluate(argument, &row))
                 .collect::<Result<_, _>>()?;
-            for produced in procedure::run(found, &arguments, self.graph, self.context, call.range)?
+            for produced in
+                procedure::run(found, &arguments, self.root(), self.context, call.range)?
             {
                 let mut extended = row.clone();
                 for (index, name) in &kept {
@@ -1356,6 +1602,26 @@ pub fn execute(
     parameters: &Parameters,
     context: &DatabaseContext,
 ) -> Result<QueryResult, QueryError> {
+    execute_federated(query, graph, &[], parameters, context)
+}
+
+/// Runs a query over the root and every linked source it was given.
+///
+/// A read sees the union; a write touches the root alone. A write naming a record from a
+/// linked source is refused with `LINKED_DATABASE_READ_ONLY`, which is the rule in root
+/// PRD section 18.8 and is enforced by the type: a bound record carries its source, and
+/// the writer refuses any handle whose source is not zero.
+///
+/// # Errors
+///
+/// The same as [`execute`].
+pub fn execute_federated(
+    query: &Query,
+    graph: &mut Graph,
+    linked: &[LinkedSource<'_>],
+    parameters: &Parameters,
+    context: &DatabaseContext,
+) -> Result<QueryResult, QueryError> {
     // Records this query creates receive a minted UUID version 7. The generation they
     // commit at no longer takes part, because an identifier is no longer derived from it.
     let mut minter = Minter::new();
@@ -1365,8 +1631,15 @@ pub fn execute(
     let mut all_rows: Vec<Vec<QueryValue>> = Vec::new();
 
     for (index, part) in query.parts.iter().enumerate() {
-        let (part_columns, part_rows) =
-            run_part(part, graph, parameters, context, &mut minter, &mut writes)?;
+        let (part_columns, part_rows) = run_part(
+            part,
+            graph,
+            linked,
+            parameters,
+            context,
+            &mut minter,
+            &mut writes,
+        )?;
         if index == 0 {
             columns = part_columns;
         }
@@ -1390,6 +1663,7 @@ pub fn execute(
 fn run_part(
     part: &QueryPart,
     graph: &mut Graph,
+    linked: &[LinkedSource<'_>],
     parameters: &Parameters,
     context: &DatabaseContext,
     minter: &mut Minter,
@@ -1408,11 +1682,11 @@ fn run_part(
                 patterns,
                 predicate,
             } => {
-                let executor = Executor::new(graph, parameters, context);
+                let executor = Executor::new(source_list(graph, linked), parameters, context);
                 rows = run_match(&executor, *optional, patterns, predicate.as_ref(), rows)?;
             }
             Clause::Unwind { list, variable } => {
-                let executor = Executor::new(graph, parameters, context);
+                let executor = Executor::new(source_list(graph, linked), parameters, context);
                 let mut next = Vec::new();
                 for bindings in rows {
                     // UNWIND of a non-list produces no rows, matching Cypher's treatment
@@ -1428,7 +1702,7 @@ fn run_part(
                 rows = next;
             }
             Clause::With(projection) => {
-                let executor = Executor::new(graph, parameters, context);
+                let executor = Executor::new(source_list(graph, linked), parameters, context);
                 let (names, projected) = apply_projection(&executor, projection, rows)?;
                 // WITH opens a new scope: only the projected names survive.
                 rows = projected
@@ -1437,7 +1711,7 @@ fn run_part(
                     .collect();
             }
             Clause::Call(call) => {
-                let executor = Executor::new(graph, parameters, context);
+                let executor = Executor::new(source_list(graph, linked), parameters, context);
                 let (names, next) = executor.run_call(call, rows)?;
                 rows = next;
                 call_columns = Some(names);
@@ -1446,7 +1720,7 @@ fn run_part(
                 // Every map value is evaluated against the graph as this clause found it,
                 // so one row's write cannot change what another row assigns.
                 let evaluated: Vec<Vec<PatternValues>> = {
-                    let executor = Executor::new(graph, parameters, context);
+                    let executor = Executor::new(source_list(graph, linked), parameters, context);
                     rows.iter()
                         .map(|bindings| {
                             patterns
@@ -1469,7 +1743,8 @@ fn run_part(
                 let mut next = Vec::with_capacity(rows.len());
                 for bindings in rows {
                     let found = {
-                        let executor = Executor::new(graph, parameters, context);
+                        let executor =
+                            Executor::new(source_list(graph, linked), parameters, context);
                         executor.match_pattern(pattern, &bindings)?
                     };
                     if !found.is_empty() {
@@ -1477,7 +1752,8 @@ fn run_part(
                         continue;
                     }
                     let values = {
-                        let executor = Executor::new(graph, parameters, context);
+                        let executor =
+                            Executor::new(source_list(graph, linked), parameters, context);
                         executor.pattern_values(pattern, &bindings)?
                     };
                     let mut created = bindings;
@@ -1489,7 +1765,7 @@ fn run_part(
             }
             Clause::Set { items, range } => {
                 let evaluated: Vec<Vec<Option<QueryValue>>> = {
-                    let executor = Executor::new(graph, parameters, context);
+                    let executor = Executor::new(source_list(graph, linked), parameters, context);
                     rows.iter()
                         .map(|bindings| {
                             items
@@ -1535,7 +1811,7 @@ fn run_part(
                 range,
             } => {
                 let evaluated: Vec<Vec<QueryValue>> = {
-                    let executor = Executor::new(graph, parameters, context);
+                    let executor = Executor::new(source_list(graph, linked), parameters, context);
                     rows.iter()
                         .map(|bindings| {
                             targets
@@ -1560,7 +1836,7 @@ fn run_part(
 
     match &part.result {
         Some(projection) => {
-            let executor = Executor::new(graph, parameters, context);
+            let executor = Executor::new(source_list(graph, linked), parameters, context);
             apply_projection(&executor, projection, rows)
         }
         // A trailing `CALL` produces the columns it yields.
@@ -2855,5 +3131,209 @@ mod tests {
         assert!(run("MATCH (n) RETURN n.name").writes.is_empty());
         let mut target = Graph::default();
         assert!(!run_on(&mut target, "CREATE (n:A {n: 1})").writes.is_empty());
+    }
+
+    // -- federated reads -----------------------------------------------------------
+
+    mod federated {
+        use super::*;
+        use crate::link::Link;
+        use crate::locator::CanonicalSourceLocator;
+
+        fn locator(value: &str) -> CanonicalSourceLocator {
+            CanonicalSourceLocator::new(value).unwrap()
+        }
+
+        fn linked_graph(marker: u8, label: &str, name: &str) -> Graph {
+            Graph {
+                nodes: vec![node(
+                    marker,
+                    &[label],
+                    &[("name", PropertyValue::from(name))],
+                )],
+                edges: Vec::new(),
+                links: Vec::new(),
+                schemas: Vec::new(),
+            }
+        }
+
+        fn run_over(
+            source: &str,
+            root: &mut Graph,
+            linked: &[(CanonicalSourceLocator, Graph)],
+        ) -> QueryResult {
+            let held: Vec<LinkedSource<'_>> = linked
+                .iter()
+                .map(|(locator, graph)| LinkedSource { locator, graph })
+                .collect();
+            let query = parse(source).expect("must parse");
+            execute_federated(
+                &query,
+                root,
+                &held,
+                &Parameters::new(),
+                &DatabaseContext {
+                    generation: Some(Generation::from_raw(1)),
+                    source: Some(locator("./root.nostdb")),
+                },
+            )
+            .expect("must execute")
+        }
+
+        #[test]
+        fn a_read_sees_the_root_and_every_linked_source() {
+            let mut root = linked_graph(0x1, "Function", "root-node");
+            let linked = vec![
+                (locator("./a"), linked_graph(0x2, "Function", "a-node")),
+                (locator("./b"), linked_graph(0x3, "Function", "b-node")),
+            ];
+            let result = run_over(
+                "MATCH (n:Function) RETURN n.name ORDER BY n.name",
+                &mut root,
+                &linked,
+            );
+            let names: Vec<String> = result.rows.iter().map(|row| row[0].to_string()).collect();
+            assert_eq!(names, ["a-node", "b-node", "root-node"]);
+        }
+
+        #[test]
+        fn two_sources_carrying_one_identifier_produce_two_rows() {
+            // A database copied and linked from its original. Without a scoped handle the
+            // two would collapse into one row, or worse, one would shadow the other.
+            let mut root = linked_graph(0x7, "Function", "original");
+            let linked = vec![(locator("./copy"), linked_graph(0x7, "Function", "copy"))];
+            let result = run_over(
+                "MATCH (n) RETURN n.name ORDER BY n.name",
+                &mut root,
+                &linked,
+            );
+            assert_eq!(result.rows.len(), 2, "{:?}", result.rows);
+
+            // And DISTINCT over the bound nodes keeps them apart, because the sort key
+            // carries the source.
+            let distinct = run_over("MATCH (n) RETURN DISTINCT n", &mut root, &linked);
+            assert_eq!(distinct.rows.len(), 2, "{:?}", distinct.rows);
+        }
+
+        #[test]
+        fn nostdb_source_reports_the_locator_a_record_came_through() {
+            let mut root = linked_graph(0x1, "Function", "root-node");
+            let linked = vec![(
+                locator("./child"),
+                linked_graph(0x2, "Function", "child-node"),
+            )];
+            let result = run_over(
+                "MATCH (n) RETURN n.name, nostdb.source(n) ORDER BY n.name",
+                &mut root,
+                &linked,
+            );
+            assert_eq!(result.rows[0][0].to_string(), "child-node");
+            assert_eq!(result.rows[0][1].to_string(), "./child");
+            assert_eq!(result.rows[1][0].to_string(), "root-node");
+            assert_eq!(result.rows[1][1].to_string(), "./root.nostdb");
+        }
+
+        #[test]
+        fn a_write_naming_a_linked_record_is_refused_and_changes_nothing() {
+            let mut root = linked_graph(0x1, "Function", "root-node");
+            let linked = [(locator("./child"), linked_graph(0x2, "Other", "child-node"))];
+            let held: Vec<LinkedSource<'_>> = linked
+                .iter()
+                .map(|(locator, graph)| LinkedSource { locator, graph })
+                .collect();
+            let query = parse("MATCH (n:Other) SET n.name = \"changed\"").expect("must parse");
+            let error = execute_federated(
+                &query,
+                &mut root,
+                &held,
+                &Parameters::new(),
+                &DatabaseContext {
+                    generation: Some(Generation::from_raw(1)),
+                    source: None,
+                },
+            )
+            .expect_err("a linked write is refused");
+            assert_eq!(error.code, DiagnosticCode::LinkedDatabaseReadOnly);
+            assert_eq!(
+                linked[0].1.nodes[0].properties[0].1,
+                PropertyValue::from("child-node")
+            );
+        }
+
+        #[test]
+        fn a_write_naming_a_root_record_still_works_alongside_a_link() {
+            let mut root = linked_graph(0x1, "Function", "root-node");
+            let linked = [(locator("./child"), linked_graph(0x2, "Other", "child-node"))];
+            let result = run_over(
+                "MATCH (n:Function) SET n.name = \"renamed\" RETURN n.name",
+                &mut root,
+                &linked,
+            );
+            assert_eq!(result.rows[0][0].to_string(), "renamed");
+            assert_eq!(result.writes.properties_set, 1);
+        }
+
+        #[test]
+        fn an_edge_naming_a_linked_node_traverses_into_it() {
+            // The root declares the link, and an edge crosses into it by locator.
+            let child_id = LocalNodeId::from_bytes([0x2; 16]);
+            let mut root = Graph {
+                nodes: vec![node(
+                    0x1,
+                    &["Function"],
+                    &[("name", PropertyValue::from("caller"))],
+                )],
+                edges: vec![Edge {
+                    id: LocalEdgeId::from_bytes([0x9; 16]),
+                    source: NodeReference::Local(LocalNodeId::from_bytes([0x1; 16])),
+                    target: NodeReference::External(crate::graph::ScopedNodeId {
+                        source: locator("./child"),
+                        local: child_id,
+                    }),
+                    relation: crate::name::RelationName::new("CALLS").unwrap(),
+                    properties: Vec::new(),
+                    contributions: Vec::new(),
+                }],
+                links: vec![Link::new(locator("./child"))],
+                schemas: Vec::new(),
+            };
+            let linked = vec![(locator("./child"), linked_graph(0x2, "Other", "callee"))];
+            let result = run_over("MATCH (a)-[:CALLS]->(b) RETURN b.name", &mut root, &linked);
+            assert_eq!(result.rows.len(), 1, "{:?}", result.rows);
+            assert_eq!(result.rows[0][0].to_string(), "callee");
+        }
+
+        #[test]
+        fn an_edge_naming_a_source_that_was_not_opened_leads_nowhere() {
+            // The link is declared and unreachable, so the edge stays in the root's
+            // records and traversal simply cannot leave through it. That is what a
+            // partial result means, and it is not an error.
+            let mut root = Graph {
+                nodes: vec![node(0x1, &["Function"], &[])],
+                edges: vec![Edge {
+                    id: LocalEdgeId::from_bytes([0x9; 16]),
+                    source: NodeReference::Local(LocalNodeId::from_bytes([0x1; 16])),
+                    target: NodeReference::External(crate::graph::ScopedNodeId {
+                        source: locator("./absent"),
+                        local: LocalNodeId::from_bytes([0x2; 16]),
+                    }),
+                    relation: crate::name::RelationName::new("CALLS").unwrap(),
+                    properties: Vec::new(),
+                    contributions: Vec::new(),
+                }],
+                links: vec![Link::new(locator("./absent"))],
+                schemas: Vec::new(),
+            };
+            let result = run_over("MATCH (a)-[:CALLS]->(b) RETURN b", &mut root, &[]);
+            assert!(result.rows.is_empty(), "{:?}", result.rows);
+        }
+
+        #[test]
+        fn with_no_links_a_query_behaves_exactly_as_before() {
+            let mut root = linked_graph(0x1, "Function", "only");
+            let result = run_over("MATCH (n) RETURN n.name", &mut root, &[]);
+            assert_eq!(result.rows.len(), 1);
+            assert_eq!(result.rows[0][0].to_string(), "only");
+        }
     }
 }

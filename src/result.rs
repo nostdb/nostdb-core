@@ -235,6 +235,7 @@ pub fn value_csv(value: &QueryValue) -> String {
 mod tests {
     use super::*;
     use crate::diagnostic::Severity;
+    use crate::execute::Scoped;
     use crate::id::{LocalEdgeId, LocalNodeId};
     use crate::property::FiniteF64;
     use crate::text::NonEmptyText;
@@ -328,10 +329,10 @@ mod tests {
         let node = LocalNodeId::from_bytes([1; 16]);
         let edge = LocalEdgeId::from_bytes([2; 16]);
         for value in [
-            QueryValue::Node(node),
-            QueryValue::Relationship(edge),
+            QueryValue::Node(Scoped::root(node)),
+            QueryValue::Relationship(Scoped::root(edge)),
             QueryValue::Path {
-                nodes: vec![node],
+                nodes: vec![Scoped::root(node)],
                 relationships: Vec::new(),
             },
         ] {
@@ -345,10 +346,10 @@ mod tests {
     fn a_path_alternates_so_it_has_one_fewer_relationship_than_nodes() {
         let rendered = value_json(&QueryValue::Path {
             nodes: vec![
-                LocalNodeId::from_bytes([1; 16]),
-                LocalNodeId::from_bytes([2; 16]),
+                Scoped::root(LocalNodeId::from_bytes([1; 16])),
+                Scoped::root(LocalNodeId::from_bytes([2; 16])),
             ],
-            relationships: vec![LocalEdgeId::from_bytes([3; 16])],
+            relationships: vec![Scoped::root(LocalEdgeId::from_bytes([3; 16]))],
         });
         assert_eq!(rendered["path"]["nodes"].as_array().map(Vec::len), Some(2));
         assert_eq!(
@@ -402,8 +403,10 @@ mod tests {
         assert_eq!(value_csv(&QueryValue::Integer(42)), "42");
         // A tagged form keeps its JSON rendering, so it stays recognizable in CSV.
         assert!(
-            value_csv(&QueryValue::Node(LocalNodeId::from_bytes([1; 16])))
-                .starts_with("{\"node\":")
+            value_csv(&QueryValue::Node(Scoped::root(LocalNodeId::from_bytes(
+                [1; 16]
+            ))))
+            .starts_with("{\"node\":")
         );
     }
 

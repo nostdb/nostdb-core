@@ -30,7 +30,7 @@
 
 use crate::cypher::{Query, QueryError};
 use crate::encoding::{DecodeError, Graph, commit_graph, read_graph};
-use crate::execute::{DatabaseContext, Parameters, QueryResult, execute};
+use crate::execute::{DatabaseContext, LinkedSource, Parameters, QueryResult};
 use crate::generation::Generation;
 use crate::locator::CanonicalSourceLocator;
 use crate::mutate::WriteSummary;
@@ -161,7 +161,31 @@ impl<'a> Transaction<'a> {
         query: &Query,
         parameters: &Parameters,
     ) -> Result<QueryResult, QueryError> {
-        let result = execute(query, &mut self.graph, parameters, &self.context)?;
+        self.run_federated(query, parameters, &[])
+    }
+
+    /// Runs one query over this database and the linked sources it was given.
+    ///
+    /// A read sees the union; a write touches this database alone. A write naming a
+    /// linked record is refused with `LINKED_DATABASE_READ_ONLY` before anything is
+    /// modified.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Transaction::run`].
+    pub fn run_federated(
+        &mut self,
+        query: &Query,
+        parameters: &Parameters,
+        linked: &[LinkedSource<'_>],
+    ) -> Result<QueryResult, QueryError> {
+        let result = crate::execute::execute_federated(
+            query,
+            &mut self.graph,
+            linked,
+            parameters,
+            &self.context,
+        )?;
         self.accumulate(result.writes);
         Ok(result)
     }

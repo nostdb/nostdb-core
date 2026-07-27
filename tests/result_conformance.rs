@@ -6,6 +6,7 @@
 //! being absorbed by a lenient reader.
 
 use nostdb_core::diagnostic::{Diagnostic, DiagnosticCode, Severity};
+use nostdb_core::execute::Scoped;
 use nostdb_core::execute::{QueryValue, execute};
 use nostdb_core::generation::Generation;
 use nostdb_core::id::{LocalEdgeId, LocalNodeId};
@@ -124,8 +125,8 @@ fn warning(code: DiagnosticCode) -> Diagnostic {
 
 /// Envelopes covering every shape the Engine can produce.
 fn produced() -> Vec<(&'static str, ResultEnvelope)> {
-    let node = LocalNodeId::from_bytes([1; 16]);
-    let edge = LocalEdgeId::from_bytes([2; 16]);
+    let node = Scoped::root(LocalNodeId::from_bytes([1; 16]));
+    let edge = Scoped::root(LocalEdgeId::from_bytes([2; 16]));
     vec![
         (
             "empty",

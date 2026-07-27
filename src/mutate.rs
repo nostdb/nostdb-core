@@ -129,6 +129,29 @@ pub struct Writer<'a> {
     summary: &'a mut WriteSummary,
 }
 
+/// The identifier of a bound record, refused when it belongs to a linked source.
+///
+/// Root PRD section 18.8: a root transaction may write only to its root database, and a
+/// write naming a linked record returns `LINKED_DATABASE_READ_ONLY`. The check lives here
+/// because this is the only place a write turns a binding into something it will modify.
+fn writable<T: Copy>(
+    scoped: &crate::execute::Scoped<T>,
+    what: &str,
+    range: SourceRange,
+) -> Result<T, QueryError> {
+    if scoped.is_root() {
+        return Ok(scoped.id);
+    }
+    Err(QueryError::at(
+        DiagnosticCode::LinkedDatabaseReadOnly,
+        format!(
+            "{what} belongs to a linked source, and a root transaction writes only to its \
+             root database"
+        ),
+        range,
+    ))
+}
+
 impl<'a> Writer<'a> {
     /// A writer over `graph`, continuing an existing minter and summary.
     pub fn new(
@@ -228,7 +251,7 @@ impl<'a> Writer<'a> {
                 ));
             }
             return match existing {
-                QueryValue::Node(id) => Ok(*id),
+                QueryValue::Node(id) => writable(id, "the bound node", range),
                 other => Err(semantic(
                     format!(
                         "`{name}` is bound to {}, which is not a node",
@@ -266,7 +289,10 @@ impl<'a> Writer<'a> {
         self.summary.nodes_created += 1;
 
         if let Some(name) = &pattern.variable {
-            bindings.insert(name.clone(), QueryValue::Node(id));
+            bindings.insert(
+                name.clone(),
+                QueryValue::Node(crate::execute::Scoped::root(id)),
+            );
         }
         Ok(id)
     }
@@ -301,7 +327,10 @@ impl<'a> Writer<'a> {
         self.summary.edges_created += 1;
 
         if let Some(name) = &pattern.variable {
-            bindings.insert(name.clone(), QueryValue::Relationship(id));
+            bindings.insert(
+                name.clone(),
+                QueryValue::Relationship(crate::execute::Scoped::root(id)),
+            );
         }
         Ok(id)
     }
@@ -475,7 +504,8 @@ impl<'a> Writer<'a> {
         range: SourceRange,
     ) -> Result<(), QueryError> {
         match bound {
-            QueryValue::Node(id) => {
+            QueryValue::Node(handle) => {
+                let id = &writable(handle, "the node named by `DELETE`", range)?;
                 let incident: Vec<LocalEdgeId> = self
                     .graph
                     .edges
@@ -505,8 +535,12 @@ impl<'a> Writer<'a> {
                 }
                 Ok(())
             }
-            QueryValue::Relationship(id) => {
-                self.delete_edge(*id);
+            QueryValue::Relationship(handle) => {
+                self.delete_edge(writable(
+                    handle,
+                    "the relationship named by `DELETE`",
+                    range,
+                )?);
                 Ok(())
             }
             // Deleting null is a no-op, which is what makes deleting the same record twice
@@ -537,28 +571,36 @@ impl<'a> Writer<'a> {
         range: SourceRange,
     ) -> Result<RecordMut<'graph>, QueryError> {
         match bound {
-            QueryValue::Node(id) => graph
-                .nodes
-                .iter_mut()
-                .find(|node| node.id == *id)
-                .map(RecordMut::Node)
-                .ok_or_else(|| {
-                    semantic(
-                        format!("`{variable}` names a node this database no longer holds"),
-                        range,
-                    )
-                }),
-            QueryValue::Relationship(id) => graph
-                .edges
-                .iter_mut()
-                .find(|edge| edge.id == *id)
-                .map(RecordMut::Edge)
-                .ok_or_else(|| {
-                    semantic(
-                        format!("`{variable}` names a relationship this database no longer holds"),
-                        range,
-                    )
-                }),
+            QueryValue::Node(handle) => {
+                let id = writable(handle, format!("`{variable}`").as_str(), range)?;
+                graph
+                    .nodes
+                    .iter_mut()
+                    .find(|node| node.id == id)
+                    .map(RecordMut::Node)
+                    .ok_or_else(|| {
+                        semantic(
+                            format!("`{variable}` names a node this database no longer holds"),
+                            range,
+                        )
+                    })
+            }
+            QueryValue::Relationship(handle) => {
+                let id = writable(handle, format!("`{variable}`").as_str(), range)?;
+                graph
+                    .edges
+                    .iter_mut()
+                    .find(|edge| edge.id == id)
+                    .map(RecordMut::Edge)
+                    .ok_or_else(|| {
+                        semantic(
+                            format!(
+                                "`{variable}` names a relationship this database no longer holds"
+                            ),
+                            range,
+                        )
+                    })
+            }
             other => Err(semantic(
                 format!(
                     "`{variable}` is bound to {}, which is not a record to modify",
