@@ -311,9 +311,49 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
                 .push(at);
         }
     }
+    // A reused file's records are not in `planned`, but a re-analyzed file can call them.
+    // Resolving against `planned` alone would drop every cross-file edge out of an
+    // incremental build and put it back on the next full one, which is a graph that
+    // depends on how it was built rather than on what the source says.
+    let mut reused_by_name: BTreeMap<String, Vec<LocalNodeId>> = BTreeMap::new();
+    if !reused.is_empty() {
+        let owner = analyzer_owner();
+        let held: BTreeSet<SourceUnitId> = reused.iter().copied().collect();
+        for node in &graph.nodes {
+            if node.labels.iter().any(|held| held.as_str() == FILE_LABEL)
+                || node.labels.iter().any(|held| held.as_str() == "Impl")
+                || !node
+                    .contributions
+                    .iter()
+                    .any(|c| c.owner == owner && held.contains(&c.source_unit))
+            {
+                continue;
+            }
+            // Indexed under both names, but only once each: for a top-level item the two
+            // are the same string, and pushing twice would make one record look like two
+            // candidates and resolve to nothing.
+            let name = property(node, "name").map(str::to_owned);
+            let qualified = property(node, "qualified_name").map(str::to_owned);
+            for key in [name.clone(), qualified].into_iter().flatten() {
+                let entry = reused_by_name.entry(key).or_default();
+                if !entry.contains(&node.id) {
+                    entry.push(node.id);
+                }
+            }
+        }
+    }
+
     let resolve = |name: &str| -> Option<LocalNodeId> {
-        match by_name.get(name)?.as_slice() {
-            [only] => Some(planned[*only].id),
+        let fresh = by_name.get(name).map(Vec::as_slice).unwrap_or_default();
+        let held = reused_by_name
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        match (fresh, held) {
+            ([only], []) => Some(planned[*only].id),
+            ([], [only]) => Some(*only),
+            // Ambiguous across the two halves for the same reason it is ambiguous within
+            // one: picking either would be a guess.
             _ => None,
         }
     };
@@ -1381,6 +1421,32 @@ mod tests {
                 .filter(|edge| edge.relation.as_str() == CALLS)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn an_incremental_build_keeps_a_call_into_a_file_it_did_not_read() {
+        // A reused file's records are not in this build's plan, but a re-analyzed file can
+        // still call them. Resolving against the plan alone drops every cross-file edge out
+        // of an incremental build and puts it back on the next full one — a graph that
+        // depends on how it was built rather than on what the source says.
+        let dir = TempDir::new("incremental-cross-file");
+        let caller = dir.write("src/a.rs", "fn caller() { callee(); }\n");
+        let callee = dir.write("src/b.rs", "fn callee() {}\n");
+        let mut graph = Graph::default();
+        build(&dir, vec![caller, callee.clone()], &mut graph, 1);
+        let before = relations(&graph, CALLS);
+        assert_eq!(before, [("caller".to_owned(), "callee".to_owned())]);
+
+        // The body changes and the declared names do not, so `b.rs` is reused.
+        let edited = dir.write("src/a.rs", "fn caller() { let x = 1; callee(); }\n");
+        let draft = build(&dir, vec![edited, callee], &mut graph, 2);
+        assert_eq!(draft.analyzed_files, 1);
+        assert_eq!(draft.reused_files, 1);
+        assert_eq!(
+            relations(&graph, CALLS),
+            before,
+            "the edge survives a build that never read the file it points into"
         );
     }
 }
