@@ -62,6 +62,18 @@ pub enum DiagnosticCode {
     NostDuplicateDeclarationName,
     /// Two declarations claim the same record identifier.
     NostDuplicateId,
+    /// A stated record identifier is not a kind prefix followed by a canonical UUID.
+    NostInvalidId,
+    /// Two schema declarations share a name.
+    NostDuplicateSchemaName,
+    /// Two schemas named by one record declare a shared field key with different types.
+    NostSchemaConflict,
+    /// A record does not satisfy a schema it names.
+    ///
+    /// A warning, because schema validation is soft; an explicit Constraint is hard.
+    NostSchemaViolation,
+    /// A contribution or evidence block is missing, unknown, or malformed in some key.
+    NostInvalidEvidence,
     /// A property block sets the same key twice.
     NostDuplicatePropertyKey,
     /// An endpoint names a link alias or locator that is not declared.
@@ -105,13 +117,18 @@ impl DiagnosticCode {
     /// Every code, in registry order.
     ///
     /// The root workspace compares this against the `nostdb-spec` registry.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 25] = [
         Self::NostParseError,
         Self::NostVersionUnsupported,
         Self::NostDuplicateLinkAlias,
         Self::NostDuplicateLinkSource,
         Self::NostDuplicateDeclarationName,
         Self::NostDuplicateId,
+        Self::NostInvalidId,
+        Self::NostDuplicateSchemaName,
+        Self::NostSchemaConflict,
+        Self::NostSchemaViolation,
+        Self::NostInvalidEvidence,
         Self::NostDuplicatePropertyKey,
         Self::NostUnknownLinkAlias,
         Self::NostUnresolvedEndpoint,
@@ -138,6 +155,11 @@ impl DiagnosticCode {
             Self::NostDuplicateLinkSource => "NOST_DUPLICATE_LINK_SOURCE",
             Self::NostDuplicateDeclarationName => "NOST_DUPLICATE_DECLARATION_NAME",
             Self::NostDuplicateId => "NOST_DUPLICATE_ID",
+            Self::NostInvalidId => "NOST_INVALID_ID",
+            Self::NostDuplicateSchemaName => "NOST_DUPLICATE_SCHEMA_NAME",
+            Self::NostSchemaConflict => "NOST_SCHEMA_CONFLICT",
+            Self::NostSchemaViolation => "NOST_SCHEMA_VIOLATION",
+            Self::NostInvalidEvidence => "NOST_INVALID_EVIDENCE",
             Self::NostDuplicatePropertyKey => "NOST_DUPLICATE_PROPERTY_KEY",
             Self::NostUnknownLinkAlias => "NOST_UNKNOWN_LINK_ALIAS",
             Self::NostUnresolvedEndpoint => "NOST_UNRESOLVED_ENDPOINT",
@@ -162,7 +184,7 @@ impl DiagnosticCode {
     #[must_use]
     pub const fn default_severity(&self) -> Severity {
         match self {
-            Self::NostUnresolvedEndpoint => Severity::Warning,
+            Self::NostUnresolvedEndpoint | Self::NostSchemaViolation => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -312,8 +334,15 @@ mod tests {
             DiagnosticCode::NostUnresolvedEndpoint.default_severity(),
             Severity::Warning
         );
+        assert_eq!(
+            DiagnosticCode::NostSchemaViolation.default_severity(),
+            Severity::Warning
+        );
         for code in DiagnosticCode::ALL {
-            if code == DiagnosticCode::NostUnresolvedEndpoint {
+            if matches!(
+                code,
+                DiagnosticCode::NostUnresolvedEndpoint | DiagnosticCode::NostSchemaViolation
+            ) {
                 continue;
             }
             assert_eq!(code.default_severity(), Severity::Error, "{code}");

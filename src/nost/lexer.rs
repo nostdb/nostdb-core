@@ -23,6 +23,12 @@ pub enum TriviaKind {
 }
 
 /// A word the grammar reserves.
+///
+/// Version 2 dropped `id`, `source`, and `module`. The first two became ordinary
+/// property and evidence keys, and a key is an identifier; the third went with the
+/// declaration it introduced. A scalar type name such as `string` is deliberately not
+/// reserved either, because it is only ever read in a schema field's type position,
+/// where an identifier is not permitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Keyword {
     /// `as`
@@ -35,14 +41,10 @@ pub enum Keyword {
     Edge,
     /// `false`
     False,
-    /// `id`
-    Id,
-    /// `module`
-    Module,
     /// `node`
     Node,
-    /// `source`
-    Source,
+    /// `schema`
+    Schema,
     /// `true`
     True,
 }
@@ -55,10 +57,8 @@ impl Keyword {
             "datetime" => Self::Datetime,
             "edge" => Self::Edge,
             "false" => Self::False,
-            "id" => Self::Id,
-            "module" => Self::Module,
             "node" => Self::Node,
-            "source" => Self::Source,
+            "schema" => Self::Schema,
             "true" => Self::True,
             _ => return None,
         })
@@ -73,10 +73,8 @@ impl Keyword {
             Self::Datetime => "datetime",
             Self::Edge => "edge",
             Self::False => "false",
-            Self::Id => "id",
-            Self::Module => "module",
             Self::Node => "node",
-            Self::Source => "source",
+            Self::Schema => "schema",
             Self::True => "true",
         }
     }
@@ -105,6 +103,12 @@ pub enum TokenKind {
     NostDirective,
     /// `@link`
     LinkDirective,
+    /// `@by`, opening a contribution block.
+    ByDirective,
+    /// `@evidence`, opening an evidence block.
+    EvidenceDirective,
+    /// `?`, marking a schema field optional.
+    Question,
     /// `{`
     LeftBrace,
     /// `}`
@@ -343,10 +347,15 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
                 let kind = match word.as_str() {
                     "nost" => TokenKind::NostDirective,
                     "link" => TokenKind::LinkDirective,
+                    "by" => TokenKind::ByDirective,
+                    "evidence" => TokenKind::EvidenceDirective,
                     other => {
                         return Err(lexer.error(
                             start,
-                            format!("unknown directive `@{other}`, expected `@nost` or `@link`"),
+                            format!(
+                                "unknown directive `@{other}`, expected `@nost`, `@link`, `@by`, \
+                                 or `@evidence`"
+                            ),
                         ));
                     }
                 };
@@ -366,6 +375,17 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
                     kind: TokenKind::StringLiteral,
                     range,
                     text,
+                    bytes: Vec::new(),
+                    on_own_line: own_line,
+                }
+            }
+            '?' => {
+                lexer.advance();
+                lexer.at_line_start = false;
+                Token {
+                    kind: TokenKind::Question,
+                    range: lexer.range(start),
+                    text: String::new(),
                     bytes: Vec::new(),
                     on_own_line: own_line,
                 }
@@ -786,13 +806,11 @@ mod tests {
     #[test]
     fn a_reserved_word_is_not_an_identifier() {
         assert_eq!(
-            kinds("module node edge id source as true false"),
+            kinds("schema node edge as true false"),
             vec![
-                TokenKind::Keyword(Keyword::Module),
+                TokenKind::Keyword(Keyword::Schema),
                 TokenKind::Keyword(Keyword::Node),
                 TokenKind::Keyword(Keyword::Edge),
-                TokenKind::Keyword(Keyword::Id),
-                TokenKind::Keyword(Keyword::Source),
                 TokenKind::Keyword(Keyword::As),
                 TokenKind::Keyword(Keyword::True),
                 TokenKind::Keyword(Keyword::False),
@@ -800,25 +818,52 @@ mod tests {
             ]
         );
         assert_eq!(
-            kinds("Module nodes"),
+            kinds("Schema nodes"),
             vec![TokenKind::Identifier, TokenKind::Identifier, TokenKind::Eof]
         );
     }
 
     #[test]
+    fn version_2_unreserved_words_lex_as_identifiers() {
+        // `id` and `source` are ordinary keys now, and `module` is gone entirely.
+        // A scalar type name was never reserved, because it is only read in a schema
+        // field's type position.
+        assert_eq!(
+            kinds("id source module string integer double boolean"),
+            vec![TokenKind::Identifier; 7]
+                .into_iter()
+                .chain([TokenKind::Eof])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_contribution_directives_and_the_optional_marker_lex() {
+        assert_eq!(
+            kinds("@by @evidence ?"),
+            vec![
+                TokenKind::ByDirective,
+                TokenKind::EvidenceDirective,
+                TokenKind::Question,
+                TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
     fn every_token_carries_a_usable_range() {
-        let tokens = tokenize("@nost 1\nmodule m id \"x\" {}\n").unwrap();
+        let tokens = tokenize("@nost 2\nschema S {}\n").unwrap();
         for token in &tokens {
             assert!(token.range.start().line >= 1);
             assert!(token.range.start().column >= 1);
             assert!(token.range.end().offset >= token.range.start().offset);
         }
-        // The module keyword starts on line 2.
-        let module = tokens
+        // The schema keyword starts on line 2.
+        let schema = tokens
             .iter()
-            .find(|token| token.kind == TokenKind::Keyword(Keyword::Module))
+            .find(|token| token.kind == TokenKind::Keyword(Keyword::Schema))
             .unwrap();
-        assert_eq!(module.range.start().line, 2);
-        assert_eq!(module.range.start().column, 1);
+        assert_eq!(schema.range.start().line, 2);
+        assert_eq!(schema.range.start().column, 1);
     }
 }

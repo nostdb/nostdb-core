@@ -5,24 +5,37 @@
 //!
 //! # Ordering
 //!
-//! Links sort by locator, modules by name, and within a module nodes come before edges,
-//! each sorted by name. Labels and property keys sort by Unicode scalar value, not
-//! locale collation, so canonical output does not depend on the environment.
+//! Links sort by locator, then schemas and nodes by name, then edges by source endpoint,
+//! target endpoint, relation, and identifier. Field keys, property keys, and label values
+//! sort by Unicode scalar value, not locale collation, so canonical output does not
+//! depend on the environment.
+//!
+//! An edge has no declaration name to sort by, so its key is what identifies it: the two
+//! endpoints and the relation. Two edges may still agree on all three, which the language
+//! contract permits, so the identifier breaks the tie and keeps the order total.
 //!
 //! # Blank lines
 //!
-//! One blank line separates the version header, the link group, and each module; and
-//! one separates sibling declarations inside a module body. Link declarations are not
-//! separated from each other, because they are single-line directives forming one
-//! group. The contract's wording is ambiguous on that point, and the reading used here
-//! is recorded in the root progress file.
+//! One blank line separates the version header, the link group, and each schema, node, and
+//! edge declaration. Link declarations are not separated from each other, because they are
+//! single-line directives forming one group. The contract's wording is ambiguous on that
+//! point, and the reading used here is recorded in the root progress file.
+//!
+//! # Separators
+//!
+//! Fields and properties are separated by commas. A trailing comma is accepted on input
+//! and never written, so one set of records has one canonical spelling.
 
 use super::{
-    Comment, Comments, EdgeDeclaration, Endpoint, ModuleDeclaration, NodeDeclaration, Property,
-    SourceFile, Spanned, Value,
+    Comment, Comments, ContributionBlock, EdgeDeclaration, Endpoint, EvidenceBlock, EvidenceValue,
+    NodeDeclaration, OwnerDeclaration, Property, RecordBody, SchemaDeclaration, SourceFile,
+    Spanned, Value,
 };
 
 const INDENT: &str = "  ";
+
+/// The reserved key holding a record identifier, which sorts ahead of everything else.
+const ID_KEY: &str = "id";
 
 struct Writer {
     out: String,
@@ -94,20 +107,27 @@ fn escape_string(value: &str) -> String {
     out
 }
 
+fn render_number(text: &str, float: bool) -> String {
+    // A number is normalized when it can be read, and left as written when it cannot,
+    // because an out-of-range literal is a semantic diagnostic the caller still needs to
+    // see quoted exactly.
+    if float {
+        match text.parse::<f64>() {
+            Ok(number) if number.is_finite() => format!("{number:?}"),
+            _ => text.to_owned(),
+        }
+    } else {
+        text.parse::<i64>()
+            .map_or_else(|_| text.to_owned(), |number| number.to_string())
+    }
+}
+
 fn render_value(value: &Value) -> String {
     match value {
         Value::Boolean(true) => "true".to_owned(),
         Value::Boolean(false) => "false".to_owned(),
-        // A number is normalized when it can be read, and left as written when it
-        // cannot, because an out-of-range literal is a semantic diagnostic the caller
-        // still needs to see quoted exactly.
-        Value::Integer(text) => text
-            .parse::<i64>()
-            .map_or_else(|_| text.clone(), |number| number.to_string()),
-        Value::Float(text) => match text.parse::<f64>() {
-            Ok(number) if number.is_finite() => format!("{number:?}"),
-            _ => text.clone(),
-        },
+        Value::Integer(text) => render_number(text, false),
+        Value::Float(text) => render_number(text, true),
         Value::String(text) => escape_string(text),
         Value::Bytes { digits, .. } => format!("bytes\"{}\"", digits.to_lowercase()),
         Value::DateTime(text) => format!("datetime\"{text}\""),
@@ -129,10 +149,17 @@ fn render_endpoint(endpoint: &Endpoint) -> String {
     }
 }
 
-fn sorted_labels(labels: &[Spanned<String>]) -> Vec<&str> {
-    let mut sorted: Vec<&str> = labels.iter().map(|label| label.value.as_str()).collect();
-    sorted.sort_unstable();
-    sorted
+/// The identifier a record states, used only to break an ordering tie.
+fn stated_id(record: &RecordBody) -> &str {
+    record
+        .properties
+        .iter()
+        .find(|property| property.key.value == ID_KEY)
+        .and_then(|property| match &property.value.value {
+            Value::String(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .unwrap_or("")
 }
 
 fn sorted_properties(properties: &[Property]) -> Vec<&Property> {
@@ -141,118 +168,223 @@ fn sorted_properties(properties: &[Property]) -> Vec<&Property> {
     sorted
 }
 
-fn write_property_block(
+/// Writes a comma-separated block, or `{}` when there is nothing to put in it.
+///
+/// `body` renders the entries; it returns whether it wrote anything, which decides
+/// between the empty and the open form.
+fn write_block(
     writer: &mut Writer,
     depth: usize,
-    head: String,
+    head: &str,
     comments: &Comments,
-    properties: &[Property],
-    block_comments: &[Comment],
+    empty: bool,
+    body: impl FnOnce(&mut Writer),
 ) {
-    if properties.is_empty() && block_comments.is_empty() {
+    if empty {
         writer.line(depth, &with_trailing(format!("{head} {{}}"), comments));
         return;
     }
     writer.line(depth, &with_trailing(format!("{head} {{"), comments));
-    for property in sorted_properties(properties) {
-        writer.leading(depth + 1, &property.comments);
-        let text = format!(
-            "{}: {}",
-            property.key.value,
-            render_value(&property.value.value)
-        );
-        writer.line(depth + 1, &with_trailing(text, &property.comments));
-    }
-    writer.block_comments(depth + 1, block_comments);
+    body(writer);
     writer.line(depth, "}");
 }
 
-fn write_node(writer: &mut Writer, depth: usize, node: &NodeDeclaration) {
-    writer.leading(depth, &node.comments);
-    let labels = sorted_labels(&node.labels)
-        .into_iter()
-        .map(|label| format!(":{label}"))
-        .collect::<Vec<_>>()
-        .join(" ");
+fn write_record_body(writer: &mut Writer, depth: usize, head: &str, record: &RecordBody) {
+    let empty = record.properties.is_empty()
+        && record.contributions.is_empty()
+        && record.block_comments.is_empty();
+    write_block(writer, depth, head, &record.comments, empty, |writer| {
+        let properties = sorted_properties(&record.properties);
+        let last = properties.len().saturating_sub(1);
+        for (index, property) in properties.iter().enumerate() {
+            writer.leading(depth + 1, &property.comments);
+            let separator = if index == last { "" } else { "," };
+            let text = format!(
+                "{}: {}{separator}",
+                property.key.value,
+                render_value(&property.value.value)
+            );
+            writer.line(depth + 1, &with_trailing(text, &property.comments));
+        }
+
+        for contribution in sorted_contributions(&record.contributions) {
+            writer.blank();
+            write_contribution(writer, depth + 1, contribution);
+        }
+
+        if !record.block_comments.is_empty() {
+            if !record.contributions.is_empty() {
+                writer.blank();
+            }
+            writer.block_comments(depth + 1, &record.block_comments);
+        }
+    });
+}
+
+fn owner_key(owner: &OwnerDeclaration) -> (u8, String, String) {
+    match owner {
+        OwnerDeclaration::Analyzer { name, version } => {
+            (0, name.value.clone(), version.value.clone())
+        }
+        OwnerDeclaration::Ai { contract_digest } => {
+            (1, contract_digest.value.clone(), String::new())
+        }
+        OwnerDeclaration::User { .. } => (2, String::new(), String::new()),
+    }
+}
+
+fn sorted_contributions(contributions: &[ContributionBlock]) -> Vec<&ContributionBlock> {
+    let mut sorted: Vec<&ContributionBlock> = contributions.iter().collect();
+    sorted.sort_by(|left, right| {
+        owner_key(&left.owner)
+            .cmp(&owner_key(&right.owner))
+            .then_with(|| {
+                let left_unit = left.unit.as_ref().map(|u| u.value.as_str()).unwrap_or("");
+                let right_unit = right.unit.as_ref().map(|u| u.value.as_str()).unwrap_or("");
+                left_unit.cmp(right_unit)
+            })
+    });
+    sorted
+}
+
+fn render_owner(owner: &OwnerDeclaration) -> String {
+    match owner {
+        OwnerDeclaration::Analyzer { name, version } => format!(
+            "analyzer {} {}",
+            escape_string(&name.value),
+            escape_string(&version.value)
+        ),
+        OwnerDeclaration::Ai { contract_digest } => {
+            format!("ai {}", escape_string(&contract_digest.value))
+        }
+        OwnerDeclaration::User { .. } => "user".to_owned(),
+    }
+}
+
+fn write_contribution(writer: &mut Writer, depth: usize, contribution: &ContributionBlock) {
+    writer.leading(depth, &contribution.comments);
+    let mut head = format!("@by {}", render_owner(&contribution.owner));
+    if let Some(unit) = &contribution.unit {
+        head.push_str(&format!(" unit {}", escape_string(&unit.value)));
+    }
+
+    let empty = contribution.evidence.is_empty() && contribution.block_comments.is_empty();
+    write_block(
+        writer,
+        depth,
+        &head,
+        &contribution.comments,
+        empty,
+        |writer| {
+            for (index, evidence) in contribution.evidence.iter().enumerate() {
+                if index > 0 {
+                    writer.blank();
+                }
+                write_evidence(writer, depth + 1, evidence);
+            }
+            if !contribution.block_comments.is_empty() {
+                if !contribution.evidence.is_empty() {
+                    writer.blank();
+                }
+                writer.block_comments(depth + 1, &contribution.block_comments);
+            }
+        },
+    );
+}
+
+fn render_evidence_value(value: &EvidenceValue) -> String {
+    match value {
+        EvidenceValue::Text(text) => escape_string(text),
+        EvidenceValue::Enumerator { name, score } => match score {
+            Some(score) => format!("{name}({})", render_number(score, true)),
+            None => name.clone(),
+        },
+    }
+}
+
+fn write_evidence(writer: &mut Writer, depth: usize, evidence: &EvidenceBlock) {
+    writer.leading(depth, &evidence.comments);
+    let empty = evidence.fields.is_empty() && evidence.block_comments.is_empty();
+    write_block(
+        writer,
+        depth,
+        "@evidence",
+        &evidence.comments,
+        empty,
+        |writer| {
+            let mut fields: Vec<_> = evidence.fields.iter().collect();
+            fields.sort_by(|left, right| left.key.value.cmp(&right.key.value));
+            let last = fields.len().saturating_sub(1);
+            for (index, field) in fields.iter().enumerate() {
+                writer.leading(depth + 1, &field.comments);
+                let separator = if index == last { "" } else { "," };
+                let text = format!(
+                    "{}: {}{separator}",
+                    field.key.value,
+                    render_evidence_value(&field.value.value)
+                );
+                writer.line(depth + 1, &with_trailing(text, &field.comments));
+            }
+            writer.block_comments(depth + 1, &evidence.block_comments);
+        },
+    );
+}
+
+fn write_schema(writer: &mut Writer, schema: &SchemaDeclaration) {
+    writer.leading(0, &schema.comments);
+    let mut head = format!("schema {}", schema.name.value);
+    if let Some(constraint) = &schema.endpoints {
+        head.push_str(&format!(
+            " ({} -> {})",
+            constraint.source.value, constraint.target.value
+        ));
+    }
+
+    let empty = schema.fields.is_empty() && schema.block_comments.is_empty();
+    write_block(writer, 0, &head, &schema.comments, empty, |writer| {
+        let mut fields: Vec<_> = schema.fields.iter().collect();
+        fields.sort_by(|left, right| left.key.value.cmp(&right.key.value));
+        let last = fields.len().saturating_sub(1);
+        for (index, field) in fields.iter().enumerate() {
+            writer.leading(1, &field.comments);
+            let separator = if index == last { "" } else { "," };
+            let text = format!(
+                "{}{}: {}{separator}",
+                field.key.value,
+                if field.optional { "?" } else { "" },
+                field.field_type.value
+            );
+            writer.line(1, &with_trailing(text, &field.comments));
+        }
+        writer.block_comments(1, &schema.block_comments);
+    });
+}
+
+fn sorted_schema_names(schemas: &[Spanned<String>]) -> Vec<&str> {
+    let mut sorted: Vec<&str> = schemas.iter().map(|name| name.value.as_str()).collect();
+    sorted.sort_unstable();
+    sorted
+}
+
+fn write_node(writer: &mut Writer, node: &NodeDeclaration) {
+    writer.leading(0, &node.record.comments);
     let head = format!(
-        "node {} id {} {labels}",
+        "node {}: {}",
         node.name.value,
-        escape_string(&node.id.value)
+        sorted_schema_names(&node.schemas).join(", ")
     );
-    write_property_block(
-        writer,
-        depth,
-        head,
-        &node.comments,
-        &node.properties,
-        &node.block_comments,
-    );
+    write_record_body(writer, 0, &head, &node.record);
 }
 
-fn write_edge(writer: &mut Writer, depth: usize, edge: &EdgeDeclaration) {
-    writer.leading(depth, &edge.comments);
+fn write_edge(writer: &mut Writer, edge: &EdgeDeclaration) {
+    writer.leading(0, &edge.record.comments);
     let head = format!(
-        "edge {} id {} :{} ({} -> {})",
-        edge.name.value,
-        escape_string(&edge.id.value),
-        edge.relation.value,
+        "edge {} -> {} :{}",
         render_endpoint(&edge.source),
-        render_endpoint(&edge.target)
+        render_endpoint(&edge.target),
+        edge.relation.value
     );
-    write_property_block(
-        writer,
-        depth,
-        head,
-        &edge.comments,
-        &edge.properties,
-        &edge.block_comments,
-    );
-}
-
-fn write_module(writer: &mut Writer, module: &ModuleDeclaration) {
-    writer.leading(0, &module.comments);
-    let mut head = format!(
-        "module {} id {}",
-        module.name.value,
-        escape_string(&module.id.value)
-    );
-    if let Some(source) = &module.source {
-        head.push_str(&format!(" source {}", escape_string(&source.value)));
-    }
-
-    let mut nodes: Vec<&NodeDeclaration> = module.nodes.iter().collect();
-    nodes.sort_by(|left, right| left.name.value.cmp(&right.name.value));
-    let mut edges: Vec<&EdgeDeclaration> = module.edges.iter().collect();
-    edges.sort_by(|left, right| left.name.value.cmp(&right.name.value));
-
-    if nodes.is_empty() && edges.is_empty() && module.block_comments.is_empty() {
-        writer.line(0, &with_trailing(format!("{head} {{}}"), &module.comments));
-        return;
-    }
-
-    writer.line(0, &with_trailing(format!("{head} {{"), &module.comments));
-    let mut first = true;
-    for node in nodes {
-        if !first {
-            writer.blank();
-        }
-        first = false;
-        write_node(writer, 1, node);
-    }
-    for edge in edges {
-        if !first {
-            writer.blank();
-        }
-        first = false;
-        write_edge(writer, 1, edge);
-    }
-    if !module.block_comments.is_empty() {
-        if !first {
-            writer.blank();
-        }
-        writer.block_comments(1, &module.block_comments);
-    }
-    writer.line(0, "}");
+    write_record_body(writer, 0, &head, &edge.record);
 }
 
 /// Renders a parsed file in canonical form.
@@ -285,11 +417,31 @@ pub fn format(file: &SourceFile) -> String {
         }
     }
 
-    let mut modules: Vec<&ModuleDeclaration> = file.modules.iter().collect();
-    modules.sort_by(|left, right| left.name.value.cmp(&right.name.value));
-    for module in modules {
+    let mut schemas: Vec<&SchemaDeclaration> = file.schemas.iter().collect();
+    schemas.sort_by(|left, right| left.name.value.cmp(&right.name.value));
+    for schema in schemas {
         writer.blank();
-        write_module(&mut writer, module);
+        write_schema(&mut writer, schema);
+    }
+
+    let mut nodes: Vec<&NodeDeclaration> = file.nodes.iter().collect();
+    nodes.sort_by(|left, right| left.name.value.cmp(&right.name.value));
+    for node in nodes {
+        writer.blank();
+        write_node(&mut writer, node);
+    }
+
+    let mut edges: Vec<&EdgeDeclaration> = file.edges.iter().collect();
+    edges.sort_by(|left, right| {
+        render_endpoint(&left.source)
+            .cmp(&render_endpoint(&right.source))
+            .then_with(|| render_endpoint(&left.target).cmp(&render_endpoint(&right.target)))
+            .then_with(|| left.relation.value.cmp(&right.relation.value))
+            .then_with(|| stated_id(&left.record).cmp(stated_id(&right.record)))
+    });
+    for edge in edges {
+        writer.blank();
+        write_edge(&mut writer, edge);
     }
 
     if !file.trailing_comments.is_empty() {
@@ -312,51 +464,94 @@ mod tests {
     #[test]
     fn formatting_is_idempotent() {
         for source in [
-            "@nost 1\n",
-            "@nost 1\n@link \"./b\"\n@link \"./a\" as a\n",
-            "@nost 1\nmodule m id \"m_1\" source \"src/a.rs\" {\n node z id \"n_2\" :B :A { k: 1 }\n node a id \"n_1\" :L {}\n edge e id \"e_1\" :R (a -> z) { q: [1, 2] }\n}\n",
-            "// lead\n@nost 1 // trail\n\nmodule m id \"m_1\" {\n // about\n node n id \"n_1\" :L {\n  // key\n  k: \"v\" // after\n }\n}\n",
+            "@nost 2\n",
+            "@nost 2\n@link \"./b\"\n@link \"./a\" as a\n",
+            "@nost 2\nschema L {\n b?: integer,\n a: string,\n}\nnode z: B, A {\n k: 1,\n}\nnode a: L {}\nedge a -> z :R {\n q: [1, 2],\n}\n",
+            "// lead\n@nost 2 // trail\n\n// about\nnode n: L {\n // key\n k: \"v\", // after\n}\n",
+            "@nost 2\nnode n: L {\n k: 1,\n\n @by analyzer \"r\" \"1\" unit \"u_1\" {\n  @evidence {\n   source: \"./\",\n   confidence: inferred(0.5),\n  }\n }\n\n @by user {}\n}\n",
         ] {
             let once = round_trip(source);
             let twice = round_trip(&once);
-            assert_eq!(once, twice, "not idempotent for:\n{source}");
+            assert_eq!(once, twice, "not idempotent for:\n{source}\ngave:\n{once}");
         }
     }
 
     #[test]
     fn output_is_sorted_deterministically() {
         let formatted = round_trip(
-            "@nost 1\n@link \"./z\"\n@link \"./a\"\nmodule z id \"m_2\" {}\nmodule a id \"m_1\" {}\n",
+            "@nost 2\n@link \"./z\"\n@link \"./a\"\nnode z: L {}\nnode a: L {}\nschema L {}\n",
         );
-        let a_link = formatted.find("\"./a\"").unwrap();
-        let z_link = formatted.find("\"./z\"").unwrap();
-        assert!(a_link < z_link);
-        let a_module = formatted.find("module a").unwrap();
-        let z_module = formatted.find("module z").unwrap();
-        assert!(a_module < z_module);
+        assert!(formatted.find("\"./a\"").unwrap() < formatted.find("\"./z\"").unwrap());
+        assert!(formatted.find("node a").unwrap() < formatted.find("node z").unwrap());
+        // Schemas come before nodes regardless of where they were written.
+        assert!(formatted.find("schema L").unwrap() < formatted.find("node a").unwrap());
     }
 
     #[test]
-    fn labels_and_keys_are_sorted_and_nodes_precede_edges() {
-        let formatted = round_trip(
-            "@nost 1\nmodule m id \"m_1\" {\n edge e id \"e_1\" :R (a -> a) {}\n node a id \"n_1\" :Zed :Alpha { zz: 1 aa: 2 }\n}\n",
-        );
-        assert!(formatted.contains(":Alpha :Zed"));
+    fn schema_names_and_keys_are_sorted_and_nodes_precede_edges() {
+        let formatted =
+            round_trip("@nost 2\nedge a -> a :R {}\nnode a: Zed, Alpha {\n zz: 1,\n aa: 2,\n}\n");
+        assert!(formatted.contains("node a: Alpha, Zed"), "{formatted}");
         assert!(formatted.find("aa: 2").unwrap() < formatted.find("zz: 1").unwrap());
-        assert!(formatted.find("node a").unwrap() < formatted.find("edge e").unwrap());
+        assert!(formatted.find("node a").unwrap() < formatted.find("edge a").unwrap());
+    }
+
+    #[test]
+    fn edges_sort_by_endpoints_then_relation_then_identifier() {
+        let formatted =
+            round_trip("@nost 2\nedge b -> a :R {}\nedge a -> b :Z {}\nedge a -> b :A {}\n");
+        let first = formatted.find("edge a -> b :A").unwrap();
+        let second = formatted.find("edge a -> b :Z").unwrap();
+        let third = formatted.find("edge b -> a :R").unwrap();
+        assert!(first < second && second < third, "{formatted}");
+    }
+
+    #[test]
+    fn properties_are_comma_separated_with_no_trailing_comma() {
+        let formatted = round_trip("@nost 2\nnode n: L {\n a: 1,\n b: 2,\n}\n");
+        assert!(formatted.contains("a: 1,\n"), "{formatted}");
+        assert!(formatted.contains("b: 2\n"), "{formatted}");
+        assert!(!formatted.contains("b: 2,"), "{formatted}");
+    }
+
+    #[test]
+    fn an_optional_field_keeps_its_question_mark() {
+        let formatted = round_trip("@nost 2\nschema S {\n a?: string[],\n b: integer,\n}\n");
+        assert!(formatted.contains("a?: string[],"), "{formatted}");
+        assert!(formatted.contains("b: integer\n"), "{formatted}");
+    }
+
+    #[test]
+    fn an_endpoint_constraint_is_reproduced() {
+        let formatted = round_trip("@nost 2\nschema R (A -> B) {\n s?: datetime,\n}\n");
+        assert!(formatted.contains("schema R (A -> B) {"), "{formatted}");
     }
 
     #[test]
     fn an_empty_block_is_written_as_braces() {
-        let formatted =
-            round_trip("@nost 1\nmodule m id \"m_1\" {\n node a id \"n_1\" :L {\n }\n}\n");
-        assert!(formatted.contains("node a id \"n_1\" :L {}"), "{formatted}");
+        let formatted = round_trip("@nost 2\nnode a: L {\n}\nschema L {\n}\n");
+        assert!(formatted.contains("node a: L {}"), "{formatted}");
+        assert!(formatted.contains("schema L {}"), "{formatted}");
+    }
+
+    #[test]
+    fn contributions_sort_analyzer_then_ai_then_user() {
+        let formatted = round_trip(
+            "@nost 2\nnode n: L {\n @by user {}\n @by ai \"sha256:a\" {}\n @by analyzer \"z\" \"1\" {}\n @by analyzer \"a\" \"1\" {}\n}\n",
+        );
+        let analyzer_a = formatted.find("@by analyzer \"a\"").unwrap();
+        let analyzer_z = formatted.find("@by analyzer \"z\"").unwrap();
+        let ai = formatted.find("@by ai").unwrap();
+        let user = formatted.find("@by user").unwrap();
+        assert!(analyzer_a < analyzer_z, "{formatted}");
+        assert!(analyzer_z < ai, "{formatted}");
+        assert!(ai < user, "{formatted}");
     }
 
     #[test]
     fn every_comment_survives_a_round_trip() {
-        let source = "// one\n@nost 1 // two\n\n// three\n@link \"./a\"\n\n\
-            module m id \"m_1\" { // four\n // five\n node n id \"n_1\" :L {\n  k: 1 // six\n  // seven\n }\n // eight\n}\n";
+        let source = "// one\n@nost 2 // two\n\n// three\n@link \"./a\"\n\n\
+            // four\nnode n: L { // five\n k: 1, // six\n // seven\n}\n\n// eight\n";
         let parsed = parse(source).unwrap();
         let before = parsed.all_comments().len();
         assert_eq!(before, 8, "the fixture should carry eight comments");
@@ -368,10 +563,19 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_inside_a_contribution_survives() {
+        let source = "@nost 2\nnode n: L {\n @by user { // owner\n  // inside\n }\n}\n";
+        let parsed = parse(source).unwrap();
+        assert_eq!(parsed.all_comments().len(), 2);
+        let formatted = format(&parsed);
+        let reparsed = parse(&formatted).expect("formatted output must parse");
+        assert_eq!(reparsed.all_comments().len(), 2, "{formatted}");
+        assert_eq!(format(&reparsed), formatted);
+    }
+
+    #[test]
     fn a_number_is_normalized_when_it_can_be_read() {
-        let formatted = round_trip(
-            "@nost 1\nmodule m id \"m_1\" {\n node a id \"n_1\" :L { i: 007 f: 2E+1 }\n}\n",
-        );
+        let formatted = round_trip("@nost 2\nnode a: L {\n i: 007,\n f: 2E+1,\n}\n");
         assert!(formatted.contains("i: 7"), "{formatted}");
         assert!(formatted.contains("f: 20.0"), "{formatted}");
     }
@@ -380,24 +584,21 @@ mod tests {
     fn an_unreadable_number_is_left_exactly_as_written() {
         // An out-of-range integer is a semantic diagnostic, so the formatter must not
         // silently alter the text a diagnostic will quote.
-        let formatted = round_trip(
-            "@nost 1\nmodule m id \"m_1\" {\n node a id \"n_1\" :L { i: 9223372036854775808 }\n}\n",
-        );
+        let formatted = round_trip("@nost 2\nnode a: L {\n i: 9223372036854775808,\n}\n");
         assert!(formatted.contains("i: 9223372036854775808"), "{formatted}");
     }
 
     #[test]
     fn bytes_digits_are_lower_cased_and_strings_are_re_escaped() {
-        let formatted = round_trip(
-            "@nost 1\nmodule m id \"m_1\" {\n node a id \"n_1\" :L { b: bytes\"DEADbeef\" s: \"tab\\there\" }\n}\n",
-        );
+        let formatted =
+            round_trip("@nost 2\nnode a: L {\n b: bytes\"DEADbeef\",\n s: \"tab\\there\",\n}\n");
         assert!(formatted.contains("bytes\"deadbeef\""), "{formatted}");
         assert!(formatted.contains("\"tab\\there\""), "{formatted}");
     }
 
     #[test]
     fn the_file_ends_with_exactly_one_newline() {
-        for source in ["@nost 1\n", "@nost 1\nmodule m id \"m_1\" {}\n"] {
+        for source in ["@nost 2\n", "@nost 2\nnode a: L {}\n"] {
             let formatted = round_trip(source);
             assert!(formatted.ends_with('\n'));
             assert!(!formatted.ends_with("\n\n"), "{formatted:?}");

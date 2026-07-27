@@ -129,6 +129,12 @@ pub struct Spanned<T> {
     pub range: SourceRange,
 }
 
+/// The language version this build reads and writes.
+///
+/// Version 1 is refused rather than parsed best-effort, because it required a module
+/// declaration version 2 has no production for.
+pub const LANGUAGE_VERSION: u32 = 2;
+
 /// A parsed `.nost` file.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SourceFile {
@@ -138,10 +144,30 @@ pub struct SourceFile {
     pub version_comments: Comments,
     /// Link declarations, in source order.
     pub links: Vec<LinkDeclaration>,
-    /// Module declarations, in source order.
-    pub modules: Vec<ModuleDeclaration>,
+    /// Schema declarations, in source order.
+    pub schemas: Vec<SchemaDeclaration>,
+    /// Node declarations, in source order.
+    pub nodes: Vec<NodeDeclaration>,
+    /// Edge declarations, in source order.
+    pub edges: Vec<EdgeDeclaration>,
+    /// The order the schema, node, and edge declarations appeared in.
+    ///
+    /// Parsing keeps this so a round trip can reproduce the file as written, while the
+    /// three typed lists stay convenient for everything that does not care about order.
+    pub order: Vec<DeclarationRef>,
     /// Own-line comments after the last declaration.
     pub trailing_comments: Vec<Comment>,
+}
+
+/// Which declaration list an entry in [`SourceFile::order`] points into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeclarationRef {
+    /// An index into [`SourceFile::schemas`].
+    Schema(usize),
+    /// An index into [`SourceFile::nodes`].
+    Node(usize),
+    /// An index into [`SourceFile::edges`].
+    Edge(usize),
 }
 
 impl SourceFile {
@@ -157,32 +183,53 @@ impl SourceFile {
             found.extend(link.comments.leading.iter());
             found.extend(link.comments.trailing.iter());
         }
-        for module in &self.modules {
-            found.extend(module.comments.leading.iter());
-            found.extend(module.comments.trailing.iter());
-            for node in &module.nodes {
-                found.extend(node.comments.leading.iter());
-                found.extend(node.comments.trailing.iter());
-                for property in &node.properties {
-                    found.extend(property.comments.leading.iter());
-                    found.extend(property.comments.trailing.iter());
+        for entry in &self.order {
+            match *entry {
+                DeclarationRef::Schema(index) => {
+                    let schema = &self.schemas[index];
+                    found.extend(schema.comments.leading.iter());
+                    found.extend(schema.comments.trailing.iter());
+                    for field in &schema.fields {
+                        found.extend(field.comments.leading.iter());
+                        found.extend(field.comments.trailing.iter());
+                    }
+                    found.extend(schema.block_comments.iter());
                 }
-                found.extend(node.block_comments.iter());
-            }
-            for edge in &module.edges {
-                found.extend(edge.comments.leading.iter());
-                found.extend(edge.comments.trailing.iter());
-                for property in &edge.properties {
-                    found.extend(property.comments.leading.iter());
-                    found.extend(property.comments.trailing.iter());
+                DeclarationRef::Node(index) => {
+                    collect_record(&mut found, &self.nodes[index].record);
                 }
-                found.extend(edge.block_comments.iter());
+                DeclarationRef::Edge(index) => {
+                    collect_record(&mut found, &self.edges[index].record);
+                }
             }
-            found.extend(module.block_comments.iter());
         }
         found.extend(self.trailing_comments.iter());
         found
     }
+}
+
+fn collect_record<'a>(found: &mut Vec<&'a Comment>, record: &'a RecordBody) {
+    found.extend(record.comments.leading.iter());
+    found.extend(record.comments.trailing.iter());
+    for property in &record.properties {
+        found.extend(property.comments.leading.iter());
+        found.extend(property.comments.trailing.iter());
+    }
+    for contribution in &record.contributions {
+        found.extend(contribution.comments.leading.iter());
+        found.extend(contribution.comments.trailing.iter());
+        for evidence in &contribution.evidence {
+            found.extend(evidence.comments.leading.iter());
+            found.extend(evidence.comments.trailing.iter());
+            for field in &evidence.fields {
+                found.extend(field.comments.leading.iter());
+                found.extend(field.comments.trailing.iter());
+            }
+            found.extend(evidence.block_comments.iter());
+        }
+        found.extend(contribution.block_comments.iter());
+    }
+    found.extend(record.block_comments.iter());
 }
 
 /// A link declaration.
@@ -196,22 +243,122 @@ pub struct LinkDeclaration {
     pub comments: Comments,
 }
 
-/// A module declaration.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ModuleDeclaration {
-    /// The declaration name.
+/// A schema declaration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchemaDeclaration {
+    /// The schema name, which is also the label its records carry.
     pub name: Spanned<String>,
-    /// The opaque record identifier.
-    pub id: Spanned<String>,
-    /// The optional source locator.
-    pub source: Option<Spanned<String>>,
-    /// Node declarations, in source order.
-    pub nodes: Vec<NodeDeclaration>,
-    /// Edge declarations, in source order.
-    pub edges: Vec<EdgeDeclaration>,
+    /// The endpoint constraint, when this schema describes an edge.
+    pub endpoints: Option<EndpointConstraint>,
+    /// Fields, in source order.
+    pub fields: Vec<SchemaField>,
     /// Attached comments.
     pub comments: Comments,
-    /// Own-line comments left at the end of the block.
+    /// Own-line comments left at the end of the field block.
+    pub block_comments: Vec<Comment>,
+}
+
+/// The schemas an edge's endpoints must carry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EndpointConstraint {
+    /// The schema the source record must carry.
+    pub source: Spanned<String>,
+    /// The schema the target record must carry.
+    pub target: Spanned<String>,
+}
+
+/// One typed field of a schema.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchemaField {
+    /// The field key.
+    pub key: Spanned<String>,
+    /// Whether a record may omit it.
+    pub optional: bool,
+    /// The declared type.
+    pub field_type: Spanned<FieldType>,
+    /// Attached comments.
+    pub comments: Comments,
+}
+
+/// A declared field type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FieldType {
+    /// The scalar the field holds.
+    pub scalar: ScalarType,
+    /// Whether the field holds an array of that scalar rather than one value.
+    pub array: bool,
+}
+
+impl fmt::Display for FieldType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.scalar.as_str())?;
+        if self.array {
+            formatter.write_str("[]")?;
+        }
+        Ok(())
+    }
+}
+
+/// A scalar a schema field may declare.
+///
+/// There is exactly one spelling per model type, so a canonical writer never has to
+/// choose between two names for one thing. `double` rather than `float`, because the
+/// value is an IEEE 754 binary64.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ScalarType {
+    /// `boolean`
+    Boolean,
+    /// `integer`
+    Integer,
+    /// `double`
+    Double,
+    /// `string`
+    String,
+    /// `bytes`
+    Bytes,
+    /// `datetime`
+    DateTime,
+}
+
+impl ScalarType {
+    /// Reads a scalar type from its declared spelling.
+    #[must_use]
+    pub fn from_text(text: &str) -> Option<Self> {
+        Some(match text {
+            "boolean" => Self::Boolean,
+            "integer" => Self::Integer,
+            "double" => Self::Double,
+            "string" => Self::String,
+            "bytes" => Self::Bytes,
+            "datetime" => Self::DateTime,
+            _ => return None,
+        })
+    }
+
+    /// The declared spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Boolean => "boolean",
+            Self::Integer => "integer",
+            Self::Double => "double",
+            Self::String => "string",
+            Self::Bytes => "bytes",
+            Self::DateTime => "datetime",
+        }
+    }
+}
+
+/// The body every record declaration shares.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordBody {
+    /// Properties, in source order.
+    pub properties: Vec<Property>,
+    /// Contribution blocks, in source order.
+    pub contributions: Vec<ContributionBlock>,
+    /// Attached comments.
+    pub comments: Comments,
+    /// Own-line comments left at the end of the record block.
     pub block_comments: Vec<Comment>,
 }
 
@@ -220,37 +367,127 @@ pub struct ModuleDeclaration {
 pub struct NodeDeclaration {
     /// The declaration name.
     pub name: Spanned<String>,
-    /// The opaque record identifier.
-    pub id: Spanned<String>,
-    /// One or more labels.
-    pub labels: Vec<Spanned<String>>,
-    /// Properties, in source order.
-    pub properties: Vec<Property>,
-    /// Attached comments.
-    pub comments: Comments,
-    /// Own-line comments left at the end of the property block.
-    pub block_comments: Vec<Comment>,
+    /// One or more schema names, each of which is also a label.
+    pub schemas: Vec<Spanned<String>>,
+    /// Properties and contributions.
+    pub record: RecordBody,
 }
 
 /// An edge declaration.
+///
+/// An edge carries no declaration name, because nothing references one: an endpoint
+/// names a node.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EdgeDeclaration {
-    /// The declaration name.
-    pub name: Spanned<String>,
-    /// The opaque record identifier.
-    pub id: Spanned<String>,
-    /// The single relation type.
-    pub relation: Spanned<String>,
     /// Where the relation starts.
     pub source: Endpoint,
     /// Where the relation ends.
     pub target: Endpoint,
-    /// Properties, in source order.
-    pub properties: Vec<Property>,
+    /// The single relation type, which is also the edge's schema name.
+    pub relation: Spanned<String>,
+    /// Properties and contributions.
+    pub record: RecordBody,
+}
+
+/// One producer's contribution to a record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContributionBlock {
+    /// Who produced it.
+    pub owner: OwnerDeclaration,
+    /// The source unit it derives from, when stated.
+    pub unit: Option<Spanned<String>>,
+    /// Evidence blocks, in source order.
+    pub evidence: Vec<EvidenceBlock>,
     /// Attached comments.
     pub comments: Comments,
-    /// Own-line comments left at the end of the property block.
+    /// Own-line comments left at the end of the contribution block.
     pub block_comments: Vec<Comment>,
+}
+
+/// Who produced a contribution, as written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OwnerDeclaration {
+    /// `analyzer "<name>" "<version>"`
+    Analyzer {
+        /// The analyzer name.
+        name: Spanned<String>,
+        /// The analyzer version, which is part of its identity.
+        version: Spanned<String>,
+    },
+    /// `ai "<contract-digest>"`
+    Ai {
+        /// Digest of the analysis contract the run used.
+        contract_digest: Spanned<String>,
+    },
+    /// `user`
+    User {
+        /// Where the keyword appeared.
+        range: SourceRange,
+    },
+}
+
+impl OwnerDeclaration {
+    /// The keyword this owner is written with.
+    #[must_use]
+    pub const fn keyword(&self) -> &'static str {
+        match self {
+            Self::Analyzer { .. } => "analyzer",
+            Self::Ai { .. } => "ai",
+            Self::User { .. } => "user",
+        }
+    }
+
+    /// Where the owner was written.
+    #[must_use]
+    pub const fn range(&self) -> SourceRange {
+        match self {
+            Self::Analyzer { name, .. } => name.range,
+            Self::Ai { contract_digest } => contract_digest.range,
+            Self::User { range } => *range,
+        }
+    }
+}
+
+/// Provenance for one contribution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvidenceBlock {
+    /// Fields, in source order.
+    pub fields: Vec<EvidenceField>,
+    /// Where the block began.
+    pub range: SourceRange,
+    /// Attached comments.
+    pub comments: Comments,
+    /// Own-line comments left at the end of the evidence block.
+    pub block_comments: Vec<Comment>,
+}
+
+/// One key and value inside an evidence block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvidenceField {
+    /// The key.
+    pub key: Spanned<String>,
+    /// The value.
+    pub value: Spanned<EvidenceValue>,
+    /// Attached comments.
+    pub comments: Comments,
+}
+
+/// An evidence value as written.
+///
+/// The grammar admits a quoted string or a bare enumerator with an optional score. Which
+/// keys accept which is a semantic rule, so the shape here stays open and
+/// [`super::validate`] reports a mismatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EvidenceValue {
+    /// A quoted string.
+    Text(String),
+    /// A bare word, optionally carrying a score, such as `inferred(0.82)`.
+    Enumerator {
+        /// The word.
+        name: String,
+        /// The score, as written, when one was supplied.
+        score: Option<String>,
+    },
 }
 
 /// An edge endpoint.
