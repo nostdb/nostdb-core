@@ -282,6 +282,7 @@ pub fn draft(
     }
 
     let known_edges = existing_edges(graph);
+    let mut edges = Edges::default();
 
     // Containment: from the file to each top-level record, and from each record to its
     // children. Emitted after every node, so no edge can name an endpoint not yet drafted.
@@ -291,29 +292,13 @@ pub fn draft(
             .iter()
             .filter(|record| &record.path == path && !record.qualified.contains("::"))
         {
-            push_edge(
-                &mut change_set,
-                file_id,
-                record.id,
-                CONTAINS,
-                *unit,
-                &locator,
-                &known_edges,
-            );
+            edges.add(file_id, record.id, CONTAINS, *unit);
         }
     }
     for record in &planned {
         for child in &record.children {
             let child = &planned[*child];
-            push_edge(
-                &mut change_set,
-                record.id,
-                child.id,
-                CONTAINS,
-                record.unit,
-                &locator,
-                &known_edges,
-            );
+            edges.add(record.id, child.id, CONTAINS, record.unit);
         }
     }
 
@@ -324,15 +309,7 @@ pub fn draft(
             match resolve(&reference.name) {
                 Some(target) => {
                     resolved += 1;
-                    push_edge(
-                        &mut change_set,
-                        record.id,
-                        target,
-                        CALLS,
-                        record.unit,
-                        &locator,
-                        &known_edges,
-                    );
+                    edges.add(record.id, target, CALLS, record.unit);
                 }
                 // Counted, not invented. See the module documentation.
                 None => unresolved += 1,
@@ -342,15 +319,7 @@ pub fn draft(
             match resolve(name) {
                 Some(target) => {
                     resolved += 1;
-                    push_edge(
-                        &mut change_set,
-                        record.id,
-                        target,
-                        IMPLEMENTS,
-                        record.unit,
-                        &locator,
-                        &known_edges,
-                    );
+                    edges.add(record.id, target, IMPLEMENTS, record.unit);
                 }
                 None => unresolved += 1,
             }
@@ -361,20 +330,14 @@ pub fn draft(
             match resolve(name) {
                 Some(target) if target != record.id => {
                     resolved += 1;
-                    push_edge(
-                        &mut change_set,
-                        record.id,
-                        target,
-                        FOR_TYPE,
-                        record.unit,
-                        &locator,
-                        &known_edges,
-                    );
+                    edges.add(record.id, target, FOR_TYPE, record.unit);
                 }
                 _ => unresolved += 1,
             }
         }
     }
+
+    edges.drain_into(&mut change_set, &locator, &known_edges);
 
     coverage.unresolved_units = unresolved;
     coverage.structural = if coverage.skipped_sources.is_empty() {
@@ -541,12 +504,57 @@ fn plan_item(
     at
 }
 
+/// Collects the edges a build asserts, one per distinct relation.
+///
+/// A relation is a fact, not an occurrence. `main` calling `helper` twice is one edge
+/// carrying a count of two, and emitting two would be both wrong and impossible: two
+/// drafts of the same relation resolve to the same persisted identifier, and a change set
+/// with a repeated identifier is refused. Found by rebuilding this crate.
+#[derive(Default)]
+struct Edges {
+    order: Vec<(LocalNodeId, LocalNodeId, String, SourceUnitId)>,
+    counts: BTreeMap<(LocalNodeId, LocalNodeId, String), i64>,
+}
+
+impl Edges {
+    fn add(&mut self, from: LocalNodeId, to: LocalNodeId, relation: &str, unit: SourceUnitId) {
+        let key = (from, to, relation.to_owned());
+        let seen = self.counts.entry(key.clone()).or_insert(0);
+        if *seen == 0 {
+            self.order.push((from, to, relation.to_owned(), unit));
+        }
+        *seen += 1;
+    }
+
+    fn drain_into(
+        self,
+        change_set: &mut GraphChangeSet,
+        locator: &CanonicalSourceLocator,
+        known: &BTreeMap<(LocalNodeId, LocalNodeId, String), crate::id::LocalEdgeId>,
+    ) {
+        for (from, to, relation, unit) in self.order {
+            let count = self
+                .counts
+                .get(&(from, to, relation.clone()))
+                .copied()
+                .unwrap_or(1);
+            push_edge(change_set, from, to, &relation, unit, count, locator, known);
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every one names a distinct part of the edge, and grouping them into a struct \
+              used at a single call site would hide rather than clarify"
+)]
 fn push_edge(
     change_set: &mut GraphChangeSet,
     from: LocalNodeId,
     to: LocalNodeId,
     relation: &str,
     unit: SourceUnitId,
+    count: i64,
     locator: &CanonicalSourceLocator,
     known: &BTreeMap<(LocalNodeId, LocalNodeId, String), crate::id::LocalEdgeId>,
 ) {
@@ -564,7 +572,7 @@ fn push_edge(
         source: NodeReference::Local(from),
         target: NodeReference::Local(to),
         relation,
-        properties: Vec::new(),
+        properties: vec![integer_property("count", count)],
         source_unit: unit,
         // The evidence for an edge is the same file the endpoints came from, so it carries
         // no range: the relation is not at one position in the text.
@@ -1124,5 +1132,46 @@ mod tests {
             graph.edges.iter().map(|edge| edge.id).collect();
         after.sort();
         assert_eq!(before, after, "an unchanged relation is the same edge");
+    }
+
+    #[test]
+    fn calling_the_same_function_twice_is_one_edge_carrying_a_count() {
+        // A relation is a fact, not an occurrence. Emitting two would also be impossible:
+        // both drafts resolve to one persisted identifier, and a change set with a repeated
+        // identifier is refused. Found by rebuilding this crate.
+        let dir = TempDir::new("repeat-call");
+        let file = dir.write(
+            "src/main.rs",
+            "fn main() { helper(); helper(); helper(); }\nfn helper() {}\n",
+        );
+        let mut graph = Graph::default();
+        build(&dir, vec![file.clone()], &mut graph, 1);
+
+        let calls: Vec<&crate::graph::Edge> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.relation.as_str() == CALLS)
+            .collect();
+        assert_eq!(calls.len(), 1, "one relation, however many call sites");
+        assert_eq!(
+            calls[0]
+                .properties
+                .iter()
+                .find(|(key, _)| key.as_str() == "count")
+                .map(|(_, value)| value.clone()),
+            Some(PropertyValue::Integer(3)),
+            "how many times is a property of the relation, not more relations"
+        );
+
+        // The rebuild is what used to be refused.
+        build(&dir, vec![file], &mut graph, 2);
+        assert_eq!(
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.relation.as_str() == CALLS)
+                .count(),
+            1
+        );
     }
 }
