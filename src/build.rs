@@ -96,11 +96,20 @@ pub struct BuildDraft {
     pub resolved_references: u64,
 }
 
+/// What one file contributes to settling an item's identity.
+struct FileContext<'a> {
+    unit: SourceUnitId,
+    path: &'a str,
+    known: &'a BTreeMap<(String, i64), LocalNodeId>,
+}
+
 /// One record this build will assert, before it becomes a draft.
 struct Planned {
     id: LocalNodeId,
     kind: ItemKind,
     qualified: String,
+    /// Which occurrence of this qualified name within the file, from zero.
+    ordinal: i64,
     name: String,
     unit: SourceUnitId,
     path: String,
@@ -193,10 +202,16 @@ pub fn draft(
     let mut file_nodes: Vec<(usize, LocalNodeId)> = Vec::new();
     for (index, (path, unit, existing, analysis)) in units.iter().enumerate() {
         let known = existing_names(graph, *unit);
+        let context = FileContext {
+            unit: *unit,
+            path,
+            known: &known,
+        };
+        let mut seen: BTreeMap<String, i64> = BTreeMap::new();
         let file_id = existing.unwrap_or_else(|| minter.node());
         file_nodes.push((index, file_id));
         for item in &analysis.items {
-            plan_item(item, "", *unit, path, &known, minter, &mut planned);
+            plan_item(item, "", &context, &mut seen, minter, &mut planned);
         }
     }
 
@@ -257,6 +272,7 @@ pub fn draft(
                 text_property("name", &record.name),
                 text_property("qualified_name", &record.qualified),
                 text_property("path", &record.path),
+                integer_property("ordinal", record.ordinal),
                 integer_property("line", i64::from(record.line)),
                 integer_property("end_line", i64::from(record.end_line)),
             ],
@@ -397,8 +413,16 @@ fn existing_unit(graph: &Graph, path: &str) -> Option<(SourceUnitId, Option<Loca
     Some((unit, Some(node.id)))
 }
 
-/// Every identifier this analyzer already holds in one source unit, keyed by qualified name.
-fn existing_names(graph: &Graph, unit: SourceUnitId) -> BTreeMap<String, LocalNodeId> {
+/// Every identifier this analyzer already holds in one source unit.
+///
+/// Keyed by qualified name *and* occurrence, because a qualified name is not unique within
+/// a file. Rust allows several inherent `impl` blocks for one type, and two trait impls for
+/// one type each declare a method of the same name — `execute.rs` in this crate has three
+/// `impl Scoped` blocks. Keying by name alone made all three claim one persisted
+/// identifier, and the change set was refused for duplicate identifiers on the second
+/// build. The occurrence is stored on the record rather than inferred from position in the
+/// node list, so identity does not depend on the order storage happens to return.
+fn existing_names(graph: &Graph, unit: SourceUnitId) -> BTreeMap<(String, i64), LocalNodeId> {
     let owner = analyzer_owner();
     graph
         .nodes
@@ -408,8 +432,22 @@ fn existing_names(graph: &Graph, unit: SourceUnitId) -> BTreeMap<String, LocalNo
                 .iter()
                 .any(|held| held.owner == owner && held.source_unit == unit)
         })
-        .filter_map(|node| Some((property(node, "qualified_name")?.to_owned(), node.id)))
+        .filter_map(|node| {
+            let qualified = property(node, "qualified_name")?.to_owned();
+            let ordinal = integer(node, "ordinal").unwrap_or(0);
+            Some(((qualified, ordinal), node.id))
+        })
         .collect()
+}
+
+/// One property's integer value, when the node carries it as one.
+fn integer(node: &crate::graph::Node, key: &str) -> Option<i64> {
+    node.properties
+        .iter()
+        .find_map(|(held, value)| match value {
+            PropertyValue::Integer(number) if held.as_str() == key => Some(*number),
+            _ => None,
+        })
 }
 
 /// One property's text value, when the node carries it as text.
@@ -426,9 +464,8 @@ fn property<'a>(node: &'a crate::graph::Node, key: &str) -> Option<&'a str> {
 fn plan_item(
     item: &Item,
     prefix: &str,
-    unit: SourceUnitId,
-    path: &str,
-    known: &BTreeMap<String, LocalNodeId>,
+    file: &FileContext<'_>,
+    seen: &mut BTreeMap<String, i64>,
     minter: &mut Minter,
     planned: &mut Vec<Planned>,
 ) -> usize {
@@ -437,11 +474,18 @@ fn plan_item(
     } else {
         format!("{prefix}::{}", item.name)
     };
-    // The qualified name is what carries identity forward. Moving a function down a file
-    // keeps its identifier; renaming it mints a new one, which is correct — a renamed
-    // function is not the same function to anything that referred to it by name.
-    let id = known
-        .get(&qualified)
+    let ordinal = {
+        let counter = seen.entry(qualified.clone()).or_insert(0);
+        let ordinal = *counter;
+        *counter += 1;
+        ordinal
+    };
+    // The qualified name and occurrence are what carry identity forward. Moving a function
+    // down a file keeps its identifier; renaming it mints a new one, which is correct — a
+    // renamed function is not the same function to anything that referred to it by name.
+    let id = file
+        .known
+        .get(&(qualified.clone(), ordinal))
         .copied()
         .unwrap_or_else(|| minter.node());
 
@@ -450,9 +494,10 @@ fn plan_item(
         id,
         kind: item.kind,
         qualified: qualified.clone(),
+        ordinal,
         name: item.name.clone(),
-        unit,
-        path: path.to_owned(),
+        unit: file.unit,
+        path: file.path.to_owned(),
         line: item.range.start().line,
         end_line: item.range.end().line,
         children: Vec::new(),
@@ -463,9 +508,7 @@ fn plan_item(
 
     let mut children = Vec::with_capacity(item.children.len());
     for child in &item.children {
-        children.push(plan_item(
-            child, &qualified, unit, path, known, minter, planned,
-        ));
+        children.push(plan_item(child, &qualified, file, seen, minter, planned));
     }
     planned[at].children = children;
     at
@@ -870,6 +913,42 @@ mod tests {
             graph.nodes.iter().all(|node| node.id != old),
             "the old record is retired rather than renamed in place"
         );
+    }
+
+    #[test]
+    fn several_records_sharing_a_qualified_name_keep_distinct_identifiers() {
+        // Found by building this crate. Rust allows several inherent `impl` blocks for one
+        // type, and `execute.rs` has three for `Scoped`. Keying identity by name alone made
+        // all three claim one persisted identifier, and the second build was refused for
+        // duplicate identifiers.
+        let dir = TempDir::new("shared-name");
+        let file = dir.write(
+            "src/lib.rs",
+            "struct S;\nimpl S { fn a(&self) {} }\nimpl S { fn b(&self) {} }\nimpl S { fn c(&self) {} }\n",
+        );
+        let mut graph = Graph::default();
+        build(&dir, vec![file.clone()], &mut graph, 1);
+
+        let impls: Vec<LocalNodeId> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.labels.iter().any(|held| held.as_str() == "Impl"))
+            .map(|node| node.id)
+            .collect();
+        assert_eq!(impls.len(), 3);
+
+        // The rebuild is the half that used to fail.
+        build(&dir, vec![file], &mut graph, 2);
+        let mut after: Vec<LocalNodeId> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.labels.iter().any(|held| held.as_str() == "Impl"))
+            .map(|node| node.id)
+            .collect();
+        after.sort();
+        let mut before = impls;
+        before.sort();
+        assert_eq!(before, after, "each occurrence keeps its own identifier");
     }
 
     #[test]
