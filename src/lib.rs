@@ -65,6 +65,7 @@ pub mod name;
 pub mod nost;
 pub mod procedure;
 pub mod property;
+pub mod schema;
 pub mod storage;
 pub mod sync;
 pub mod text;
@@ -88,6 +89,10 @@ pub use mutate::WriteSummary;
 pub use name::{DeclarationName, Label, LinkAlias, PropertyKey, RelationName};
 pub use procedure::{FUNCTIONS, PROCEDURES};
 pub use property::{PropertyScalar, PropertyValue};
+pub use schema::{
+    EffectiveSchema, EndpointConstraint, FieldType, ScalarType, Schema, SchemaField,
+    SchemaViolation,
+};
 pub use storage::{Database, StorageError};
 pub use sync::{SyncBaseline, SyncOutcome, SyncState};
 pub use transaction::{Transaction, TransactionError, run_once};

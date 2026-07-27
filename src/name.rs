@@ -26,8 +26,13 @@ use std::str::FromStr;
 /// Words the `.nost` grammar reserves, which are therefore never identifiers.
 ///
 /// Matching is exact and case-sensitive.
-pub const RESERVED_WORDS: [&str; 10] = [
-    "as", "bytes", "datetime", "edge", "false", "id", "module", "node", "source", "true",
+///
+/// Language version 2 unreserved `id` and `source`, which became ordinary property and
+/// evidence keys, and dropped `module` with the declaration it introduced. `id` in
+/// particular must be a valid [`PropertyKey`] now, because it is how a record states its
+/// identifier.
+pub const RESERVED_WORDS: [&str; 8] = [
+    "as", "bytes", "datetime", "edge", "false", "node", "schema", "true",
 ];
 
 /// Why a name was rejected.

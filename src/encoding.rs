@@ -41,6 +41,7 @@ use crate::name::{Label, LinkAlias, NameError, PropertyKey, RelationName};
 use crate::property::{
     DateTime, DateTimeError, FiniteF64, NumberError, PropertyScalar, PropertyValue,
 };
+use crate::schema::{EndpointConstraint, FieldType, ScalarType, Schema, SchemaField};
 use crate::storage::{Database, StorageError};
 use crate::text::{NonEmptyText, TextError};
 use std::collections::BTreeMap;
@@ -81,13 +82,18 @@ pub struct Graph {
     pub edges: Vec<Edge>,
     /// Declared links.
     pub links: Vec<Link>,
+    /// Declared Schemas.
+    pub schemas: Vec<Schema>,
 }
 
 impl Graph {
     /// Reports whether the graph holds nothing.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty() && self.edges.is_empty() && self.links.is_empty()
+        self.nodes.is_empty()
+            && self.edges.is_empty()
+            && self.links.is_empty()
+            && self.schemas.is_empty()
     }
 }
 
@@ -440,6 +446,27 @@ pub fn encode_graph(graph: &Graph) -> Vec<Section> {
         );
     }
 
+    let mut schemas = Vec::new();
+    put_u32(&mut schemas, graph.schemas.len() as u32);
+    for schema in &graph.schemas {
+        put_u32(&mut schemas, strings.intern(schema.name.as_str()));
+        match &schema.endpoints {
+            None => put_u32(&mut schemas, 0),
+            Some(constraint) => {
+                put_u32(&mut schemas, 1);
+                put_u32(&mut schemas, strings.intern(constraint.source.as_str()));
+                put_u32(&mut schemas, strings.intern(constraint.target.as_str()));
+            }
+        }
+        put_u32(&mut schemas, schema.fields.len() as u32);
+        for field in &schema.fields {
+            put_u32(&mut schemas, strings.intern(field.key.as_str()));
+            put_u32(&mut schemas, field.field_type.scalar.raw());
+            put_u32(&mut schemas, u32::from(field.field_type.array));
+            put_u32(&mut schemas, u32::from(field.required));
+        }
+    }
+
     // The string table is built last because encoding the records is what populates it.
     let mut sections = vec![Section {
         kind: SectionKind::StringTable,
@@ -461,6 +488,12 @@ pub fn encode_graph(graph: &Graph) -> Vec<Section> {
         sections.push(Section {
             kind: SectionKind::Links,
             payload: links,
+        });
+    }
+    if !graph.schemas.is_empty() {
+        sections.push(Section {
+            kind: SectionKind::Schemas,
+            payload: schemas,
         });
     }
     sections
@@ -853,7 +886,64 @@ pub fn decode_graph(container: &Container) -> Result<Graph, DecodeError> {
         reader.finish()?;
     }
 
+    if let Some(payload) = container.section(SectionKind::Schemas) {
+        let mut reader = Reader::new(payload);
+        let count = reader.count(12)?;
+        graph.schemas.reserve(count);
+        for _ in 0..count {
+            let name = Label::new(table.get(reader.u32()?)?)?;
+            let endpoints = match reader.u32()? {
+                0 => None,
+                1 => Some(EndpointConstraint {
+                    source: Label::new(table.get(reader.u32()?)?)?,
+                    target: Label::new(table.get(reader.u32()?)?)?,
+                }),
+                tag => {
+                    return Err(DecodeError::UnknownTag {
+                        what: "schema endpoint constraint",
+                        tag,
+                    });
+                }
+            };
+            let field_count = reader.count(16)?;
+            let mut fields = Vec::with_capacity(field_count);
+            for _ in 0..field_count {
+                let key = PropertyKey::new(table.get(reader.u32()?)?)?;
+                let raw = reader.u32()?;
+                let scalar = ScalarType::from_raw(raw).ok_or(DecodeError::UnknownTag {
+                    what: "scalar type",
+                    tag: raw,
+                })?;
+                let array = read_flag(&mut reader, "schema field array marker")?;
+                let required = read_flag(&mut reader, "schema field required marker")?;
+                fields.push(SchemaField {
+                    key,
+                    field_type: FieldType { scalar, array },
+                    required,
+                });
+            }
+            graph.schemas.push(Schema {
+                name,
+                endpoints,
+                fields,
+            });
+        }
+        reader.finish()?;
+    }
+
     Ok(graph)
+}
+
+/// Reads a boolean stored as a `u32`, refusing any value but 0 and 1.
+///
+/// A hostile container could put anything there, and quietly reading it as truthy would
+/// let one set of bytes decode two ways.
+fn read_flag(reader: &mut Reader<'_>, what: &'static str) -> Result<bool, DecodeError> {
+    match reader.u32()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        tag => Err(DecodeError::UnknownTag { what, tag }),
+    }
 }
 
 /// Commits a graph, advancing the generation by one.
@@ -1053,6 +1143,22 @@ mod tests {
                     LinkAlias::new("shared").unwrap(),
                 ),
             ],
+            schemas: vec![Schema {
+                name: Label::new("Function").unwrap(),
+                endpoints: None,
+                fields: vec![
+                    SchemaField {
+                        key: PropertyKey::new("name").unwrap(),
+                        field_type: FieldType::scalar(ScalarType::String),
+                        required: true,
+                    },
+                    SchemaField {
+                        key: PropertyKey::new("tags").unwrap(),
+                        field_type: FieldType::array(ScalarType::String),
+                        required: false,
+                    },
+                ],
+            }],
         }
     }
 
@@ -1181,7 +1287,8 @@ mod tests {
         // A label that is a reserved word must be refused even though the bytes are
         // structurally fine.
         let mut strings = Strings::default();
-        let label = strings.intern("module");
+        // `schema` is reserved in language version 2; `module` no longer is.
+        let label = strings.intern("schema");
         let mut nodes = Vec::new();
         put_u32(&mut nodes, 1);
         nodes.extend_from_slice(&[1_u8; 16]);

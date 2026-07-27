@@ -13,6 +13,7 @@ use nostdb_core::link::Link;
 use nostdb_core::locator::CanonicalSourceLocator;
 use nostdb_core::name::{Label, LinkAlias, PropertyKey, RelationName};
 use nostdb_core::property::PropertyValue;
+use nostdb_core::schema::{FieldType, ScalarType, Schema, SchemaField};
 use nostdb_core::storage::Database;
 use std::fs;
 use std::path::PathBuf;
@@ -86,6 +87,22 @@ fn sample_graph() -> Graph {
                 LinkAlias::new("shared").unwrap(),
             ),
         ],
+        schemas: vec![Schema {
+            name: Label::new("Function").unwrap(),
+            endpoints: None,
+            fields: vec![
+                SchemaField {
+                    key: PropertyKey::new("name").unwrap(),
+                    field_type: FieldType::scalar(ScalarType::String),
+                    required: true,
+                },
+                SchemaField {
+                    key: PropertyKey::new("aliases").unwrap(),
+                    field_type: FieldType::array(ScalarType::String),
+                    required: false,
+                },
+            ],
+        }],
     }
 }
 
@@ -119,6 +136,7 @@ fn committing_a_second_graph_replaces_the_first() {
     let mut trimmed = sample_graph();
     trimmed.edges.clear();
     trimmed.links.clear();
+    trimmed.schemas.clear();
     let generation = commit_graph(&mut database, &trimmed).unwrap();
     assert_eq!(generation.get(), 3);
 
@@ -127,9 +145,11 @@ fn committing_a_second_graph_replaces_the_first() {
     assert_eq!(read, trimmed);
     assert!(read.edges.is_empty());
     assert!(read.links.is_empty());
+    assert!(read.schemas.is_empty());
     // A section that holds nothing is not written at all.
     assert_eq!(reopened.container().section(SectionKind::Edges), None);
     assert_eq!(reopened.container().section(SectionKind::Links), None);
+    assert_eq!(reopened.container().section(SectionKind::Schemas), None);
 }
 
 #[test]

@@ -441,6 +441,7 @@ mod tests {
                     LinkAlias::new("shared").unwrap(),
                 ),
             ],
+            schemas: Vec::new(),
         }
     }
 

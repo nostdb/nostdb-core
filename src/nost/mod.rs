@@ -28,6 +28,7 @@ pub mod validate;
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Severity};
 use crate::evidence::SourceRange;
+pub use crate::schema::{FieldType, ScalarType};
 use crate::text::NonEmptyText;
 use std::fmt;
 
@@ -278,75 +279,6 @@ pub struct SchemaField {
     pub field_type: Spanned<FieldType>,
     /// Attached comments.
     pub comments: Comments,
-}
-
-/// A declared field type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FieldType {
-    /// The scalar the field holds.
-    pub scalar: ScalarType,
-    /// Whether the field holds an array of that scalar rather than one value.
-    pub array: bool,
-}
-
-impl fmt::Display for FieldType {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.scalar.as_str())?;
-        if self.array {
-            formatter.write_str("[]")?;
-        }
-        Ok(())
-    }
-}
-
-/// A scalar a schema field may declare.
-///
-/// There is exactly one spelling per model type, so a canonical writer never has to
-/// choose between two names for one thing. `double` rather than `float`, because the
-/// value is an IEEE 754 binary64.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ScalarType {
-    /// `boolean`
-    Boolean,
-    /// `integer`
-    Integer,
-    /// `double`
-    Double,
-    /// `string`
-    String,
-    /// `bytes`
-    Bytes,
-    /// `datetime`
-    DateTime,
-}
-
-impl ScalarType {
-    /// Reads a scalar type from its declared spelling.
-    #[must_use]
-    pub fn from_text(text: &str) -> Option<Self> {
-        Some(match text {
-            "boolean" => Self::Boolean,
-            "integer" => Self::Integer,
-            "double" => Self::Double,
-            "string" => Self::String,
-            "bytes" => Self::Bytes,
-            "datetime" => Self::DateTime,
-            _ => return None,
-        })
-    }
-
-    /// The declared spelling.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Boolean => "boolean",
-            Self::Integer => "integer",
-            Self::Double => "double",
-            Self::String => "string",
-            Self::Bytes => "bytes",
-            Self::DateTime => "datetime",
-        }
-    }
 }
 
 /// The body every record declaration shares.

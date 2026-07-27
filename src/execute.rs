@@ -1699,6 +1699,7 @@ mod tests {
             links: vec![Link::new(
                 crate::locator::CanonicalSourceLocator::new("./packages/child").unwrap(),
             )],
+            schemas: Vec::new(),
         }
     }
 
