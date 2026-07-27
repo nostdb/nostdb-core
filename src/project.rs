@@ -762,6 +762,9 @@ impl Project {
         rebuild: bool,
     ) -> Result<BuildReport, ProjectError> {
         let scan = self.scan(options)?;
+        // Created up front so the first build of a project leaves entries behind rather
+        // than only the second.
+        self.prepare_cache()?;
         let plan = crate::plan::plan(&scan, registry, &self.settings.analysis);
         let revision = plan.plan.source_revision.clone();
 
@@ -779,6 +782,7 @@ impl Project {
                 revision: &revision,
                 base_generation: generation.get(),
                 rebuild,
+                cache: &crate::cache::ParseCache::new(self.cache_layout(None)),
             },
             &mut minter,
         );
@@ -792,6 +796,7 @@ impl Project {
                 coverage: draft.coverage,
                 analyzed_files: draft.analyzed_files,
                 reused_files: draft.reused_files,
+                cached_parses: draft.cached_parses,
                 resolved_references: draft.resolved_references,
                 plan,
             });
@@ -811,6 +816,7 @@ impl Project {
             coverage: draft.coverage,
             analyzed_files: draft.analyzed_files,
             reused_files: draft.reused_files,
+            cached_parses: draft.cached_parses,
             resolved_references: draft.resolved_references,
             plan,
         })
@@ -1142,6 +1148,8 @@ pub struct BuildReport {
     pub analyzed_files: u64,
     /// How many files were reused rather than re-read.
     pub reused_files: u64,
+    /// How many parses came from the cache rather than from the source.
+    pub cached_parses: u64,
     /// How many references matched a record in the build.
     pub resolved_references: u64,
     /// The plan the build ran against.
@@ -2009,5 +2017,58 @@ mod tests {
         let scan = project.scan(&crate::scan::ScanOptions::default()).unwrap();
         let paths: Vec<&str> = scan.files.iter().map(|file| file.path.as_str()).collect();
         assert_eq!(paths, ["real.rs"]);
+    }
+
+    #[test]
+    fn a_rebuild_after_an_edit_parses_only_the_file_that_changed() {
+        // The half of incremental work that was provably safe to keep. Every file still
+        // enters the build, so the name index is complete and resolution is unaffected;
+        // what the cache saves is the reading and the parsing.
+        let dir = TempDir::new("build-parse-cache");
+        let project = Project::initialize(dir.path()).unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/a.rs"), "fn a() { b(); }\n").unwrap();
+        fs::write(dir.path().join("src/b.rs"), "fn b() {}\n").unwrap();
+
+        let registry = crate::analyze::builtin_registry().unwrap();
+        let options = crate::scan::ScanOptions::default();
+        let first = project.build(&registry, &options, false).unwrap();
+        assert_eq!(first.analyzed_files, 2);
+        assert_eq!(first.cached_parses, 0, "nothing was stored yet");
+
+        fs::write(dir.path().join("src/a.rs"), "fn a() { let x = 1; b(); }\n").unwrap();
+        let second = project.build(&registry, &options, false).unwrap();
+        assert_eq!(second.analyzed_files, 2, "both files still enter the build");
+        assert_eq!(
+            second.cached_parses, 1,
+            "only the unchanged one came from cache"
+        );
+
+        // The cross-file edge is the thing per-file reuse could not promise.
+        let graph = project.read_graph().unwrap();
+        assert_eq!(
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.relation.as_str() == crate::build::CALLS)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_forced_rebuild_still_uses_the_parse_cache() {
+        // `--rebuild` bypasses reusing *recorded facts*. A parse of bytes that have not
+        // changed is not a fact about the database, so there is nothing there to distrust.
+        let dir = TempDir::new("build-forced-cache");
+        let project = Project::initialize(dir.path()).unwrap();
+        fs::write(dir.path().join("only.rs"), "fn only() {}\n").unwrap();
+
+        let registry = crate::analyze::builtin_registry().unwrap();
+        let options = crate::scan::ScanOptions::default();
+        project.build(&registry, &options, false).unwrap();
+        let forced = project.build(&registry, &options, true).unwrap();
+        assert_eq!(forced.analyzed_files, 1);
+        assert_eq!(forced.cached_parses, 1);
     }
 }

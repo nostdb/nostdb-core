@@ -260,6 +260,270 @@ impl CacheLayout {
     }
 }
 
+/// Version of the shape a stored artifact takes.
+///
+/// Part of a key rather than a compatibility problem. An artifact written under an older
+/// shape can never be *found* by a newer key, so there is no migration to write and no
+/// reader that has to understand two layouts — the entry simply misses and the work is
+/// redone. Bump this whenever the stored shape changes.
+pub const ARTIFACT_VERSION: u32 = 1;
+
+/// Why a cached artifact could not be stored.
+///
+/// Reading has no error type on purpose. A cache is derived data, and a build that refused
+/// to run because an entry was corrupt would be choosing the cache over the thing the cache
+/// exists to speed up. An unreadable entry is a miss.
+#[derive(Debug)]
+pub enum CacheError {
+    /// The entry could not be written.
+    Write {
+        /// Which path.
+        path: PathBuf,
+        /// Why.
+        error: std::io::Error,
+    },
+}
+
+impl fmt::Display for CacheError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Write { path, error } => {
+                write!(formatter, "cannot write {}: {error}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for CacheError {}
+
+/// Reads and writes parsed source, keyed by what the parse depended on.
+///
+/// # Reads both tiers, writes one
+///
+/// Lookup runs project then user, which section 17.7 fixes. Writing goes to the project
+/// tier alone. A shared user cache written to by every project is a trust surface the
+/// product contract has not designed — one project's build would be placing artifacts that
+/// another project's build reads — and section 17.7 says a remote or team cache "requires a
+/// separate trust and confidentiality design". The same reasoning applies one directory up.
+#[derive(Clone, Debug)]
+pub struct ParseCache {
+    layout: CacheLayout,
+}
+
+impl ParseCache {
+    /// A cache over the given tiers.
+    #[must_use]
+    pub const fn new(layout: CacheLayout) -> Self {
+        Self { layout }
+    }
+
+    /// A cache that stores nothing and finds nothing.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            layout: CacheLayout::none(),
+        }
+    }
+
+    /// Reports whether this cache can hold anything.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        !self.layout.tiers().is_empty()
+    }
+
+    /// The parse stored under this key, when one is there and readable.
+    ///
+    /// An entry that does not decode is a miss. It is also removed, so a truncated write
+    /// from an interrupted build does not cost every later build a failed read.
+    #[must_use]
+    pub fn get(&self, key: &StructuralParseCacheKey) -> Option<crate::analyze::FileAnalysis> {
+        let (_, path) = self.layout.find(&key.digest())?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        match decode_analysis(&text) {
+            Some(analysis) => Some(analysis),
+            None => {
+                let _ = std::fs::remove_file(&path);
+                None
+            }
+        }
+    }
+
+    /// Stores a parse under this key.
+    ///
+    /// Written to a staging file and renamed, so an interrupted write leaves no entry
+    /// rather than half of one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::Write`] when the entry cannot be written.
+    pub fn put(
+        &self,
+        key: &StructuralParseCacheKey,
+        analysis: &crate::analyze::FileAnalysis,
+    ) -> Result<(), CacheError> {
+        let Some(tier) = self.layout.project() else {
+            return Ok(());
+        };
+        let path = CacheLayout::entry(tier, &key.digest());
+        let failed = |path: &Path, error: std::io::Error| CacheError::Write {
+            path: path.to_path_buf(),
+            error,
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| failed(parent, error))?;
+        }
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(".staged");
+        let staged = path.with_file_name(name);
+        std::fs::write(&staged, encode_analysis(analysis))
+            .map_err(|error| failed(&staged, error))?;
+        std::fs::rename(&staged, &path).map_err(|error| {
+            let _ = std::fs::remove_file(&staged);
+            failed(&path, error)
+        })
+    }
+}
+
+/// Renders a parse as the document an entry holds.
+#[must_use]
+pub fn encode_analysis(analysis: &crate::analyze::FileAnalysis) -> String {
+    let document = serde_json::json!({
+        "artifact_version": ARTIFACT_VERSION,
+        "language": analysis.language,
+        "digest": analysis.digest.as_str(),
+        "items": analysis.items.iter().map(encode_item).collect::<Vec<_>>(),
+        "imports": analysis.imports.iter().map(|import| serde_json::json!({
+            "path": import.path,
+            "alias": import.alias,
+            "range": encode_range(&import.range),
+        })).collect::<Vec<_>>(),
+    });
+    document.to_string()
+}
+
+fn encode_item(item: &crate::analyze::Item) -> serde_json::Value {
+    serde_json::json!({
+        "kind": item.kind.to_string(),
+        "name": item.name,
+        "range": encode_range(&item.range),
+        "target": item.target,
+        "implements": item.implements,
+        "references": item.references.iter().map(|reference| serde_json::json!({
+            "name": reference.name,
+            "qualifier": reference.qualifier,
+            "is_method": reference.is_method,
+            "range": encode_range(&reference.range),
+        })).collect::<Vec<_>>(),
+        "children": item.children.iter().map(encode_item).collect::<Vec<_>>(),
+    })
+}
+
+fn encode_range(range: &crate::evidence::SourceRange) -> serde_json::Value {
+    let position =
+        |at: crate::evidence::SourcePosition| serde_json::json!([at.line, at.column, at.offset]);
+    serde_json::json!([position(range.start()), position(range.end())])
+}
+
+/// Reads a parse back, or `None` when the document is not one this build wrote.
+#[must_use]
+pub fn decode_analysis(text: &str) -> Option<crate::analyze::FileAnalysis> {
+    let document: serde_json::Value = serde_json::from_str(text).ok()?;
+    if document.get("artifact_version")?.as_u64()? != u64::from(ARTIFACT_VERSION) {
+        return None;
+    }
+    Some(crate::analyze::FileAnalysis {
+        language: document.get("language")?.as_str()?.to_owned(),
+        digest: ContentDigest::new(document.get("digest")?.as_str()?).ok()?,
+        items: document
+            .get("items")?
+            .as_array()?
+            .iter()
+            .map(decode_item)
+            .collect::<Option<Vec<_>>>()?,
+        imports: document
+            .get("imports")?
+            .as_array()?
+            .iter()
+            .map(|entry| {
+                Some(crate::analyze::Import {
+                    path: entry.get("path")?.as_str()?.to_owned(),
+                    alias: entry
+                        .get("alias")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned),
+                    range: decode_range(entry.get("range")?)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?,
+    })
+}
+
+fn decode_item(entry: &serde_json::Value) -> Option<crate::analyze::Item> {
+    use crate::analyze::ItemKind;
+    let kind = match entry.get("kind")?.as_str()? {
+        "module" => ItemKind::Module,
+        "struct" => ItemKind::Struct,
+        "enum" => ItemKind::Enum,
+        "union" => ItemKind::Union,
+        "trait" => ItemKind::Trait,
+        "type" => ItemKind::TypeAlias,
+        "function" => ItemKind::Function,
+        "method" => ItemKind::Method,
+        "field" => ItemKind::Field,
+        "constant" => ItemKind::Constant,
+        "impl" => ItemKind::Implementation,
+        _ => return None,
+    };
+    Some(crate::analyze::Item {
+        kind,
+        name: entry.get("name")?.as_str()?.to_owned(),
+        range: decode_range(entry.get("range")?)?,
+        target: entry
+            .get("target")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        implements: entry
+            .get("implements")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        references: entry
+            .get("references")?
+            .as_array()?
+            .iter()
+            .map(|reference| {
+                Some(crate::analyze::Reference {
+                    name: reference.get("name")?.as_str()?.to_owned(),
+                    qualifier: reference
+                        .get("qualifier")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned),
+                    is_method: reference.get("is_method")?.as_bool()?,
+                    range: decode_range(reference.get("range")?)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?,
+        children: entry
+            .get("children")?
+            .as_array()?
+            .iter()
+            .map(decode_item)
+            .collect::<Option<Vec<_>>>()?,
+    })
+}
+
+fn decode_range(entry: &serde_json::Value) -> Option<crate::evidence::SourceRange> {
+    let ends = entry.as_array()?;
+    let position = |at: &serde_json::Value| {
+        let parts = at.as_array()?;
+        Some(crate::evidence::SourcePosition {
+            line: u32::try_from(parts.first()?.as_u64()?).ok()?,
+            column: u32::try_from(parts.get(1)?.as_u64()?).ok()?,
+            offset: parts.get(2)?.as_u64()?,
+        })
+    };
+    crate::evidence::SourceRange::new(position(ends.first()?)?, position(ends.get(1)?)?).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,5 +743,161 @@ mod tests {
         assert!(layout.tiers().is_empty());
         assert!(layout.find(&parse_key().digest()).is_none());
         assert!(layout.project().is_none());
+    }
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let mut base = std::env::temp_dir();
+            base.push(format!("nostdb-core-cache-{label}"));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).expect("temporary directory");
+            Self(base)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn analysis() -> crate::analyze::FileAnalysis {
+        crate::analyze::rust::analyze(
+            "use std::fmt::{self, Display as D};\n\
+             /// A parser.\n\
+             pub struct Parser<'a> { source: &'a str, at: usize }\n\
+             impl<'a> Display for Parser<'a> { fn fmt(&self) { write!(f, \"{}\", self.at); } }\n\
+             enum Mode { Fast, Careful { retries: u8 } }\n\
+             mod inner { pub fn nested() { helper(); } }\n\
+             fn helper() {}\n",
+        )
+    }
+
+    #[test]
+    fn a_parse_round_trips_through_an_entry() {
+        // Every field the analyzer produces has to survive, including the ones nothing
+        // reads yet. A cache that drops a field silently changes what a build asserts.
+        let original = analysis();
+        let decoded = decode_analysis(&encode_analysis(&original)).expect("it decodes");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn a_stored_parse_is_found_again() {
+        let dir = TempDir::new("hit");
+        let cache = ParseCache::new(CacheLayout::none().with_project(&dir.0));
+        assert!(cache.is_enabled());
+        let key = parse_key();
+        assert!(cache.get(&key).is_none(), "nothing is stored yet");
+
+        cache.put(&key, &analysis()).expect("it stores");
+        assert_eq!(cache.get(&key), Some(analysis()));
+    }
+
+    #[test]
+    fn a_different_key_is_a_miss_rather_than_the_wrong_answer() {
+        let dir = TempDir::new("miss");
+        let cache = ParseCache::new(CacheLayout::none().with_project(&dir.0));
+        cache.put(&parse_key(), &analysis()).expect("it stores");
+
+        let other = StructuralParseCacheKey {
+            content_digest: digest_bytes(b"different bytes"),
+            ..parse_key()
+        };
+        assert!(cache.get(&other).is_none());
+    }
+
+    #[test]
+    fn a_new_analyzer_version_never_reads_the_previous_ones_work_back() {
+        let dir = TempDir::new("analyzer-version");
+        let cache = ParseCache::new(CacheLayout::none().with_project(&dir.0));
+        cache.put(&parse_key(), &analysis()).expect("it stores");
+
+        let upgraded = StructuralParseCacheKey {
+            analyzer_digest: "rust/2".to_owned(),
+            ..parse_key()
+        };
+        assert!(
+            cache.get(&upgraded).is_none(),
+            "an analyzer that reads differently must not adopt facts it did not produce"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_entry_is_a_miss_and_is_removed() {
+        // A cache is derived data. A build that refused to run because an entry was
+        // truncated would be choosing the cache over the thing it exists to speed up.
+        let dir = TempDir::new("corrupt");
+        let cache = ParseCache::new(CacheLayout::none().with_project(&dir.0));
+        let key = parse_key();
+        cache.put(&key, &analysis()).expect("it stores");
+
+        let entry = CacheLayout::entry(&dir.0.join(PROJECT_CACHE_DIRECTORY), &key.digest());
+        std::fs::write(&entry, "{ truncated").expect("write");
+        assert!(cache.get(&key).is_none());
+        assert!(
+            !entry.exists(),
+            "a broken entry is cleared rather than failing every later read"
+        );
+
+        cache.put(&key, &analysis()).expect("it stores again");
+        assert_eq!(cache.get(&key), Some(analysis()));
+    }
+
+    #[test]
+    fn an_artifact_from_another_shape_is_a_miss() {
+        let mut document: serde_json::Value =
+            serde_json::from_str(&encode_analysis(&analysis())).unwrap();
+        document["artifact_version"] = serde_json::json!(ARTIFACT_VERSION + 1);
+        assert!(decode_analysis(&document.to_string()).is_none());
+    }
+
+    #[test]
+    fn a_disabled_cache_stores_nothing_and_finds_nothing() {
+        let cache = ParseCache::disabled();
+        assert!(!cache.is_enabled());
+        cache
+            .put(&parse_key(), &analysis())
+            .expect("storing is a no-op");
+        assert!(cache.get(&parse_key()).is_none());
+    }
+
+    #[test]
+    fn a_write_goes_to_the_project_tier_and_never_the_users() {
+        // A shared user cache written to by every project is a trust surface the contract
+        // has not designed: one project's build would place artifacts another project's
+        // build reads.
+        let dir = TempDir::new("tiers");
+        let project = dir.0.join("project");
+        let user = dir.0.join("user");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+
+        let cache = ParseCache::new(CacheLayout::none().with_project(&project).with_user(&user));
+        cache.put(&parse_key(), &analysis()).expect("it stores");
+        assert!(
+            project.join(PROJECT_CACHE_DIRECTORY).is_dir(),
+            "the project tier holds it"
+        );
+        assert!(
+            !user.join(USER_CACHE_DIRECTORY).exists(),
+            "the user tier was not written to"
+        );
+    }
+
+    #[test]
+    fn an_entry_only_the_user_tier_holds_is_still_found() {
+        let dir = TempDir::new("user-hit");
+        let project = dir.0.join("project");
+        let user = dir.0.join("user");
+
+        // Written as if by a build whose project tier was this directory.
+        let writer = ParseCache::new(CacheLayout::none().with_project(&user));
+        writer.put(&parse_key(), &analysis()).expect("it stores");
+
+        let reader = ParseCache::new(CacheLayout::none().with_project(&project).with_user(&user));
+        assert_eq!(reader.get(&parse_key()), Some(analysis()));
     }
 }

@@ -65,6 +65,13 @@ pub const IMPLEMENTS: &str = "IMPLEMENTS";
 /// Relation from an implementation to the type it is for.
 pub const FOR_TYPE: &str = "FOR_TYPE";
 
+/// Version of the record shape this module produces.
+///
+/// Part of every parse cache key, so changing a label, a property, or a relation makes
+/// every stored artifact miss instead of being read back into a shape that no longer
+/// matches. Bump it whenever what a build asserts about a file changes.
+pub const GRAPH_SCHEMA_VERSION: u32 = 1;
+
 /// The label a kind of item carries.
 #[must_use]
 pub fn label_for(kind: ItemKind) -> &'static str {
@@ -100,6 +107,8 @@ pub struct BuildRequest<'a> {
     pub base_generation: u64,
     /// Whether to re-read every file rather than reusing what is already recorded.
     pub rebuild: bool,
+    /// Where a parse may be read from and stored.
+    pub cache: &'a crate::cache::ParseCache,
 }
 
 /// What building produced, before anything was applied.
@@ -115,6 +124,8 @@ pub struct BuildDraft {
     pub resolved_references: u64,
     /// Files whose recorded facts were reused rather than re-read.
     pub reused_files: u64,
+    /// Files whose parse came from the cache rather than from the source.
+    pub cached_parses: u64,
 }
 
 /// What one file contributes to settling an item's identity.
@@ -157,8 +168,38 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
     let mut coverage = BuildCoverage::empty();
     let mut planned: Vec<Planned> = Vec::new();
     let mut units: Vec<(String, SourceUnitId, Option<LocalNodeId>, FileAnalysis)> = Vec::new();
-    let mut reused: Vec<SourceUnitId> = Vec::new();
-    let mut reused_files = 0_u64;
+    let mut cached_parses = 0_u64;
+
+    // Reuse is decided before anything is read, and it is all or nothing.
+    //
+    // A finer rule was tried — reuse per file, with references resolved against reused
+    // records as well as fresh ones — and it lost edges. Building this crate and then
+    // editing one comment produced 1275 `CALLS` edges where a full build of the same source
+    // produces 1308, and a forced rebuild immediately after created exactly the 33 that
+    // were missing. The cause is a difference between resolving against one index and
+    // resolving against two, and it is not yet understood.
+    //
+    // Until it is, the finer rule is not worth having: a graph that depends on how it was
+    // built is worse than one that took longer to build. What survives is the case that
+    // matters most and is provably safe — a tree where nothing changed is not read at all.
+    // The parse cache below recovers most of the rest, without touching resolution.
+    if !request.rebuild
+        && let Some(unchanged) = every_file_unchanged(scan, graph, registry)
+    {
+        return BuildDraft {
+            change_set: GraphChangeSet::new(
+                analyzer_owner(),
+                NonEmptyText::new(request.revision)
+                    .unwrap_or_else(|_| NonEmptyText::literal("tree:unknown")),
+                request.base_generation,
+            ),
+            coverage,
+            analyzed_files: 0,
+            resolved_references: 0,
+            reused_files: unchanged,
+            cached_parses: 0,
+        };
+    }
 
     // Pass one: read and analyze, and settle each file's persisted identity.
     for file in &scan.files {
@@ -171,15 +212,15 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
             continue;
         }
         let held = existing_unit(graph, &file.path);
-        // A file whose bytes are the digest already recorded is a file whose facts are
-        // already in the database. Section 17.8 makes reuse the default; `--rebuild` is
-        // what asks for the work to be redone.
-        if !request.rebuild
-            && let Some((unit, Some(node))) = held
-            && stored_digest(graph, node) == Some(file.digest.as_str())
-        {
-            reused.push(unit);
-            reused_files += 1;
+        // The parse cache is orthogonal to reuse, and deliberately so. A cached parse
+        // still enters `units`, so the name index this build resolves against is complete;
+        // what is saved is the reading and the parsing, not the resolving. That is the
+        // half of incremental work that was provably safe to keep.
+        let parse_key = parse_cache_key(file);
+        if let Some(analysis) = request.cache.get(&parse_key) {
+            cached_parses += 1;
+            let (unit, existing) = held.unwrap_or_else(|| (minter.source_unit(), None));
+            units.push((file.path.clone(), unit, existing, analysis));
             continue;
         }
         let Ok(source) = std::fs::read_to_string(root.join(&file.path)) else {
@@ -205,16 +246,16 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
             // persists on the File node's contribution.
             (minter.source_unit(), None)
         });
+        // Stored before the build commits anything. A parse depends on the bytes and the
+        // analyzer, not on whether the transaction that follows succeeds, so an abandoned
+        // build still leaves work its successor can use.
+        let _ = request.cache.put(&parse_key, &analysis);
         units.push((file.path.clone(), unit, existing, analysis));
     }
 
     // A file the source no longer holds must take its records with it. Nothing else would
     // ever remove them: they belong to a unit no scan will name again.
-    let present: BTreeSet<SourceUnitId> = units
-        .iter()
-        .map(|(_, unit, _, _)| *unit)
-        .chain(reused.iter().copied())
-        .collect();
+    let present: BTreeSet<SourceUnitId> = units.iter().map(|(_, unit, _, _)| *unit).collect();
     let departed: Vec<SourceUnitId> = analyzed_units(graph)
         .into_iter()
         .filter(|unit| !present.contains(unit))
@@ -225,29 +266,6 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
     // build never read may have become right or wrong, and the only honest answer at
     // syntactic precision is to read them all. That is the "affected context-resolution
     // units" half of section 17.8, taken conservatively rather than approximately.
-    //
-    // Taken all the way: if *anything* was re-read, everything is. A finer rule was tried —
-    // reuse per file, with references resolved against reused records as well as fresh ones
-    // — and it lost edges. Building this crate and then editing one comment produced 1275
-    // `CALLS` edges where a full build of the same source produces 1308, and a forced
-    // rebuild immediately after created exactly the 33 that were missing.
-    //
-    // The cause is a difference between resolving against one index and resolving against
-    // two, and it is not yet understood. Until it is, the finer rule is not worth having: a
-    // graph that depends on how it was built is worse than one that took longer to build.
-    // What survives is the case that matters most and is provably safe — a tree where
-    // nothing changed is not read at all.
-    let names_moved = !departed.is_empty() || !units.is_empty();
-    if names_moved && !reused.is_empty() {
-        return draft(
-            &BuildRequest {
-                rebuild: true,
-                ..*request
-            },
-            minter,
-        );
-    }
-
     let mut change_set = GraphChangeSet::new(
         analyzer_owner(),
         NonEmptyText::new(request.revision)
@@ -320,49 +338,9 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
                 .push(at);
         }
     }
-    // A reused file's records are not in `planned`, but a re-analyzed file can call them.
-    // Resolving against `planned` alone would drop every cross-file edge out of an
-    // incremental build and put it back on the next full one, which is a graph that
-    // depends on how it was built rather than on what the source says.
-    let mut reused_by_name: BTreeMap<String, Vec<LocalNodeId>> = BTreeMap::new();
-    if !reused.is_empty() {
-        let owner = analyzer_owner();
-        let held: BTreeSet<SourceUnitId> = reused.iter().copied().collect();
-        for node in &graph.nodes {
-            if node.labels.iter().any(|held| held.as_str() == FILE_LABEL)
-                || node.labels.iter().any(|held| held.as_str() == "Impl")
-                || !node
-                    .contributions
-                    .iter()
-                    .any(|c| c.owner == owner && held.contains(&c.source_unit))
-            {
-                continue;
-            }
-            // Indexed under both names, but only once each: for a top-level item the two
-            // are the same string, and pushing twice would make one record look like two
-            // candidates and resolve to nothing.
-            let name = property(node, "name").map(str::to_owned);
-            let qualified = property(node, "qualified_name").map(str::to_owned);
-            for key in [name.clone(), qualified].into_iter().flatten() {
-                let entry = reused_by_name.entry(key).or_default();
-                if !entry.contains(&node.id) {
-                    entry.push(node.id);
-                }
-            }
-        }
-    }
-
     let resolve = |name: &str| -> Option<LocalNodeId> {
-        let fresh = by_name.get(name).map(Vec::as_slice).unwrap_or_default();
-        let held = reused_by_name
-            .get(name)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        match (fresh, held) {
-            ([only], []) => Some(planned[*only].id),
-            ([], [only]) => Some(*only),
-            // Ambiguous across the two halves for the same reason it is ambiguous within
-            // one: picking either would be a guess.
+        match by_name.get(name)?.as_slice() {
+            [only] => Some(planned[*only].id),
             _ => None,
         }
     };
@@ -464,7 +442,58 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
         coverage,
         analyzed_files: units.len() as u64,
         resolved_references: resolved,
-        reused_files,
+        reused_files: 0,
+        cached_parses,
+    }
+}
+
+/// How many files are already recorded exactly as they are on disk, when every one is.
+///
+/// Returns `None` the moment anything differs — a changed file, a new file, a file the
+/// database holds that the scan no longer names — because reuse is all or nothing and
+/// there is nothing to gain from counting further.
+fn every_file_unchanged(scan: &Scan, graph: &Graph, registry: &CapabilityRegistry) -> Option<u64> {
+    let mut present: BTreeSet<SourceUnitId> = BTreeSet::new();
+    let mut count = 0_u64;
+    for file in &scan.files {
+        if !registry.precision(&file.language).is_deterministic() {
+            continue;
+        }
+        let (unit, Some(node)) = existing_unit(graph, &file.path)? else {
+            return None;
+        };
+        if stored_digest(graph, node) != Some(file.digest.as_str()) {
+            return None;
+        }
+        present.insert(unit);
+        count += 1;
+    }
+    // A unit the database holds and the scan no longer names is a deleted file, which is a
+    // change even though no file this scan saw differs.
+    if analyzed_units(graph)
+        .iter()
+        .any(|unit| !present.contains(unit))
+    {
+        return None;
+    }
+    (count > 0).then_some(count)
+}
+
+/// The key a file's parse is stored under.
+#[must_use]
+pub fn parse_cache_key(file: &crate::scan::ScannedFile) -> crate::cache::StructuralParseCacheKey {
+    crate::cache::StructuralParseCacheKey {
+        content_digest: file.digest.clone(),
+        language: file.language.clone(),
+        // The analyzer's version is part of its identity, so a new analyzer never reads an
+        // old one's work back as its own.
+        analyzer_digest: format!(
+            "{}/{}",
+            crate::analyze::rust::LANGUAGE,
+            crate::analyze::rust::VERSION
+        ),
+        analyzer_config_digest: "default".to_owned(),
+        graph_schema_version: GRAPH_SCHEMA_VERSION,
     }
 }
 
@@ -853,8 +882,13 @@ mod tests {
             revision: "tree:sha256:test",
             base_generation: generation,
             rebuild,
+            // Off by default here: a test that means to exercise parsing should not have
+            // its second call quietly served from a cache the first one filled.
+            cache: CACHE.get_or_init(crate::cache::ParseCache::disabled),
         }
     }
+
+    static CACHE: std::sync::OnceLock<crate::cache::ParseCache> = std::sync::OnceLock::new();
 
     fn build_with(
         dir: &TempDir,
