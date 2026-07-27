@@ -281,6 +281,24 @@ impl Project {
         crate::encoding::read_graph(&database).map_err(ProjectError::Decode)
     }
 
+    /// Resolves every link reachable from this project's database.
+    ///
+    /// Never fails because a link does: an unreachable target becomes a status and a
+    /// warning, which is what the product contract requires of a broken link.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Project::read_graph`] reports for the *root*. A root that
+    /// cannot be read is a different problem from a link that cannot be reached.
+    pub fn resolve_links(&self) -> Result<crate::federation::Federation, ProjectError> {
+        let graph = self.read_graph()?;
+        Ok(crate::federation::resolve(
+            graph,
+            &self.database_path(),
+            &self.settings.federation,
+        ))
+    }
+
     /// Reports every settings link entry that mirrors no link the graph declares.
     #[must_use]
     pub fn orphan_link_settings(&self, graph: &Graph) -> Vec<crate::diagnostic::Diagnostic> {
