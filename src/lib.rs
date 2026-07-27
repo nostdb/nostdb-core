@@ -64,6 +64,7 @@ pub mod mutate;
 pub mod name;
 pub mod nost;
 pub mod procedure;
+pub mod project;
 pub mod property;
 pub mod schema;
 pub mod settings;
@@ -89,6 +90,7 @@ pub use locator::CanonicalSourceLocator;
 pub use mutate::WriteSummary;
 pub use name::{DeclarationName, Label, LinkAlias, PropertyKey, RelationName};
 pub use procedure::{FUNCTIONS, PROCEDURES};
+pub use project::{Project, ProjectError};
 pub use property::{PropertyScalar, PropertyValue};
 pub use schema::{
     EffectiveSchema, EndpointConstraint, FieldType, ScalarType, Schema, SchemaField,
