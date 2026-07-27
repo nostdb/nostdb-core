@@ -66,6 +66,7 @@ pub mod nost;
 pub mod procedure;
 pub mod property;
 pub mod schema;
+pub mod settings;
 pub mod storage;
 pub mod sync;
 pub mod text;
@@ -92,6 +93,10 @@ pub use property::{PropertyScalar, PropertyValue};
 pub use schema::{
     EffectiveSchema, EndpointConstraint, FieldType, ScalarType, Schema, SchemaField,
     SchemaViolation,
+};
+pub use settings::{
+    AiMode, AnalysisSettings, BudgetAction, DatabaseSettings, FederationSettings, LinkSettings,
+    RefreshPolicy, Settings, SettingsDocument, SettingsError,
 };
 pub use storage::{Database, StorageError};
 pub use sync::{SyncBaseline, SyncOutcome, SyncState};

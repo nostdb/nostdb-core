@@ -31,6 +31,14 @@ missing_panics_doc = "deny"
 #                hand-rolling one would be reimplementing cryptography for no gain.
 #                Maintenance: active, RustCrypto/hashes.
 #                License: MIT OR Apache-2.0.
+# serde_json     Purpose: reading and writing the settings document, which the
+#                settings contract in nostdb-spec defines as JSON. The parsed
+#                `Value` is kept alongside the typed view, which is what lets an
+#                unknown field survive a write; a derive-based reader would have to
+#                be told to keep one. Hand-rolling a JSON reader would be
+#                reimplementing a specification for no gain.
+#                Maintenance: active, serde-rs/json.
+#                License: MIT OR Apache-2.0.
 # uuid           Purpose: minting a UUID version 7 record identifier, which the root
 #                PRD section 11.2 requires. Only generation is taken from the crate;
 #                this crate parses and formats the canonical text itself, because the
@@ -40,6 +48,7 @@ missing_panics_doc = "deny"
 #                Maintenance: active, uuid-rs/uuid.
 #                License: MIT OR Apache-2.0.
 [dependencies]
+serde_json = "1"
 sha2 = "0.10"
 unicode-ident = "1"
 uuid = { version = "1", features = ["v7"] }

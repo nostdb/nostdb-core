@@ -76,6 +76,15 @@ pub enum DiagnosticCode {
     NostInvalidEvidence,
     /// A property block sets the same key twice.
     NostDuplicatePropertyKey,
+    /// A settings link entry names a source no link declaration carries.
+    ///
+    /// A warning: the entry is ignored, and refusing to open the project over a stale
+    /// operational entry would be worse than reporting it.
+    OrphanLinkSettings,
+    /// A settings document is malformed.
+    SettingsInvalid,
+    /// A settings document names a version this build cannot read or safely write.
+    SettingsVersionUnsupported,
     /// An endpoint names a link alias or locator that is not declared.
     NostUnknownLinkAlias,
     /// An endpoint resolves to nothing, so a Placeholder is created.
@@ -117,7 +126,7 @@ impl DiagnosticCode {
     /// Every code, in registry order.
     ///
     /// The root workspace compares this against the `nostdb-spec` registry.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 28] = [
         Self::NostParseError,
         Self::NostVersionUnsupported,
         Self::NostDuplicateLinkAlias,
@@ -130,6 +139,9 @@ impl DiagnosticCode {
         Self::NostSchemaViolation,
         Self::NostInvalidEvidence,
         Self::NostDuplicatePropertyKey,
+        Self::OrphanLinkSettings,
+        Self::SettingsInvalid,
+        Self::SettingsVersionUnsupported,
         Self::NostUnknownLinkAlias,
         Self::NostUnresolvedEndpoint,
         Self::NostIntegerOutOfRange,
@@ -161,6 +173,9 @@ impl DiagnosticCode {
             Self::NostSchemaViolation => "NOST_SCHEMA_VIOLATION",
             Self::NostInvalidEvidence => "NOST_INVALID_EVIDENCE",
             Self::NostDuplicatePropertyKey => "NOST_DUPLICATE_PROPERTY_KEY",
+            Self::OrphanLinkSettings => "ORPHAN_LINK_SETTINGS",
+            Self::SettingsInvalid => "SETTINGS_INVALID",
+            Self::SettingsVersionUnsupported => "SETTINGS_VERSION_UNSUPPORTED",
             Self::NostUnknownLinkAlias => "NOST_UNKNOWN_LINK_ALIAS",
             Self::NostUnresolvedEndpoint => "NOST_UNRESOLVED_ENDPOINT",
             Self::NostIntegerOutOfRange => "NOST_INTEGER_OUT_OF_RANGE",
@@ -184,7 +199,9 @@ impl DiagnosticCode {
     #[must_use]
     pub const fn default_severity(&self) -> Severity {
         match self {
-            Self::NostUnresolvedEndpoint | Self::NostSchemaViolation => Severity::Warning,
+            Self::NostUnresolvedEndpoint | Self::NostSchemaViolation | Self::OrphanLinkSettings => {
+                Severity::Warning
+            }
             _ => Severity::Error,
         }
     }
@@ -341,7 +358,9 @@ mod tests {
         for code in DiagnosticCode::ALL {
             if matches!(
                 code,
-                DiagnosticCode::NostUnresolvedEndpoint | DiagnosticCode::NostSchemaViolation
+                DiagnosticCode::NostUnresolvedEndpoint
+                    | DiagnosticCode::NostSchemaViolation
+                    | DiagnosticCode::OrphanLinkSettings
             ) {
                 continue;
             }
