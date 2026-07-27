@@ -1,0 +1,2 @@
+outcome = reject
+note = A path alternates, so it has exactly one fewer relationship than nodes.

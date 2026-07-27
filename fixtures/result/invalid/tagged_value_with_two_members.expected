@@ -1,0 +1,2 @@
+outcome = reject
+note = A consumer tells the tagged forms apart by the single member's name, so a second member makes the form ambiguous.

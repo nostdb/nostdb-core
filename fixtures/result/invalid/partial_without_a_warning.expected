@@ -1,0 +1,2 @@
+outcome = reject
+note = A partial result says a source was unreachable, so it must say which.

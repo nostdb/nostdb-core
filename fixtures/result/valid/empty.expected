@@ -1,0 +1,2 @@
+outcome = accept
+note = An empty result states every member rather than omitting one, so a consumer never distinguishes absent from empty.

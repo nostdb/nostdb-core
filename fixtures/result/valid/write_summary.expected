@@ -1,0 +1,2 @@
+outcome = accept
+note = A write query reports what it changed; a read omits the object entirely.

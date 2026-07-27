@@ -1,0 +1,2 @@
+outcome = reject
+note = Every row has exactly as many entries as there are columns.

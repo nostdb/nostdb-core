@@ -1,0 +1,26 @@
+{
+  "result_version": 1,
+  "columns": [
+    "flag",
+    "count",
+    "ratio",
+    "name",
+    "nothing"
+  ],
+  "rows": [
+    [
+      true,
+      42,
+      0.75,
+      "login",
+      null
+    ]
+  ],
+  "summary": {
+    "rows": 1,
+    "database_generation": 1,
+    "linked_databases_opened": 0,
+    "partial": false
+  },
+  "warnings": []
+}

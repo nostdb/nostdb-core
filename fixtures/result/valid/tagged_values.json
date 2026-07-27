@@ -1,0 +1,32 @@
+{
+  "result_version": 1,
+  "columns": [
+    "payload",
+    "seen_at",
+    "who",
+    "how"
+  ],
+  "rows": [
+    [
+      {
+        "bytes": "deadbeef"
+      },
+      {
+        "datetime": "2026-07-27T00:00:00Z"
+      },
+      {
+        "node": "n_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+      },
+      {
+        "relationship": "e_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c"
+      }
+    ]
+  ],
+  "summary": {
+    "rows": 1,
+    "database_generation": 1,
+    "linked_databases_opened": 0,
+    "partial": false
+  },
+  "warnings": []
+}

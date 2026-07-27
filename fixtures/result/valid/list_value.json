@@ -1,0 +1,24 @@
+{
+  "result_version": 1,
+  "columns": [
+    "tags"
+  ],
+  "rows": [
+    [
+      [
+        "auth",
+        "entry"
+      ]
+    ],
+    [
+      []
+    ]
+  ],
+  "summary": {
+    "rows": 2,
+    "database_generation": 1,
+    "linked_databases_opened": 0,
+    "partial": false
+  },
+  "warnings": []
+}

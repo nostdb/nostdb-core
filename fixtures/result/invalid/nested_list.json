@@ -1,0 +1,22 @@
+{
+  "result_version": 1,
+  "columns": [
+    "v"
+  ],
+  "rows": [
+    [
+      [
+        [
+          "nested"
+        ]
+      ]
+    ]
+  ],
+  "summary": {
+    "rows": 1,
+    "database_generation": 1,
+    "linked_databases_opened": 0,
+    "partial": false
+  },
+  "warnings": []
+}

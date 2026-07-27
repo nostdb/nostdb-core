@@ -1,0 +1,2 @@
+outcome = reject
+note = A warning without a registered code is prose a caller cannot branch on.

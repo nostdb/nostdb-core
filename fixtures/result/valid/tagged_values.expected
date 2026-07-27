@@ -1,0 +1,2 @@
+outcome = accept
+note = Each tagged form carries exactly one member, which is how a consumer tells them apart.

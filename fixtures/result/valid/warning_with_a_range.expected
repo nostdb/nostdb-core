@@ -1,0 +1,2 @@
+outcome = accept
+note = A warning may carry a source range, and omits the source locator when it has none.

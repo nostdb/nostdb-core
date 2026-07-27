@@ -1,0 +1,24 @@
+{
+  "result_version": 1,
+  "columns": [
+    "name"
+  ],
+  "rows": [
+    [
+      "authorize"
+    ]
+  ],
+  "summary": {
+    "rows": 1,
+    "database_generation": 42,
+    "linked_databases_opened": 2,
+    "partial": true
+  },
+  "warnings": [
+    {
+      "code": "LINK_UNAVAILABLE",
+      "source": "./packages/legacy",
+      "message": "The declared target could not be opened."
+    }
+  ]
+}

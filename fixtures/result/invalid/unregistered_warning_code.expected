@@ -1,0 +1,2 @@
+outcome = reject
+note = A code the registry does not carry cannot be looked up by any implementation.

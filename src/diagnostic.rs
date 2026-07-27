@@ -85,6 +85,15 @@ pub enum DiagnosticCode {
     SettingsInvalid,
     /// A settings document names a version this build cannot read or safely write.
     SettingsVersionUnsupported,
+    /// A declared link could not be opened.
+    ///
+    /// A warning: the declaration stays, the reachable results are returned, and the
+    /// result summary reports itself partial.
+    LinkUnavailable,
+    /// Recursive traversal reached a canonical source it had already opened.
+    LinkCycle,
+    /// Recursive traversal reached a configured depth or database limit.
+    LinkLimitExceeded,
     /// An endpoint names a link alias or locator that is not declared.
     NostUnknownLinkAlias,
     /// An endpoint resolves to nothing, so a Placeholder is created.
@@ -126,7 +135,7 @@ impl DiagnosticCode {
     /// Every code, in registry order.
     ///
     /// The root workspace compares this against the `nostdb-spec` registry.
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 31] = [
         Self::NostParseError,
         Self::NostVersionUnsupported,
         Self::NostDuplicateLinkAlias,
@@ -142,6 +151,9 @@ impl DiagnosticCode {
         Self::OrphanLinkSettings,
         Self::SettingsInvalid,
         Self::SettingsVersionUnsupported,
+        Self::LinkUnavailable,
+        Self::LinkCycle,
+        Self::LinkLimitExceeded,
         Self::NostUnknownLinkAlias,
         Self::NostUnresolvedEndpoint,
         Self::NostIntegerOutOfRange,
@@ -176,6 +188,9 @@ impl DiagnosticCode {
             Self::OrphanLinkSettings => "ORPHAN_LINK_SETTINGS",
             Self::SettingsInvalid => "SETTINGS_INVALID",
             Self::SettingsVersionUnsupported => "SETTINGS_VERSION_UNSUPPORTED",
+            Self::LinkUnavailable => "LINK_UNAVAILABLE",
+            Self::LinkCycle => "LINK_CYCLE",
+            Self::LinkLimitExceeded => "LINK_LIMIT_EXCEEDED",
             Self::NostUnknownLinkAlias => "NOST_UNKNOWN_LINK_ALIAS",
             Self::NostUnresolvedEndpoint => "NOST_UNRESOLVED_ENDPOINT",
             Self::NostIntegerOutOfRange => "NOST_INTEGER_OUT_OF_RANGE",
@@ -361,6 +376,9 @@ mod tests {
                 DiagnosticCode::NostUnresolvedEndpoint
                     | DiagnosticCode::NostSchemaViolation
                     | DiagnosticCode::OrphanLinkSettings
+                    | DiagnosticCode::LinkUnavailable
+                    | DiagnosticCode::LinkCycle
+                    | DiagnosticCode::LinkLimitExceeded
             ) {
                 continue;
             }

@@ -1,0 +1,2 @@
+outcome = reject
+note = A version above the highest supported is refused rather than read best-effort.

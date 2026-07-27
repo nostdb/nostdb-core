@@ -1,0 +1,2 @@
+outcome = accept
+note = Every untagged value form: boolean, integer, double, string, and null.

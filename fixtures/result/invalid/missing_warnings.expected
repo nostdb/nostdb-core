@@ -1,0 +1,2 @@
+outcome = reject
+note = Every member is required, so an empty list is written rather than omitted.

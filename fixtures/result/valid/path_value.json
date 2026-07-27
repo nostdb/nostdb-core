@@ -1,0 +1,28 @@
+{
+  "result_version": 1,
+  "columns": [
+    "p"
+  ],
+  "rows": [
+    [
+      {
+        "path": {
+          "nodes": [
+            "n_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+            "n_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c"
+          ],
+          "relationships": [
+            "e_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d"
+          ]
+        }
+      }
+    ]
+  ],
+  "summary": {
+    "rows": 1,
+    "database_generation": 1,
+    "linked_databases_opened": 0,
+    "partial": false
+  },
+  "warnings": []
+}

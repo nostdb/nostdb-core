@@ -1,0 +1,2 @@
+outcome = reject
+note = A read omits writes entirely: changed nothing and could not change anything are different claims, and this fixture is the shape that blurs them.

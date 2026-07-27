@@ -1,0 +1,2 @@
+outcome = accept
+note = A partial result still carries everything that was reachable, which is what an unavailable link requires.

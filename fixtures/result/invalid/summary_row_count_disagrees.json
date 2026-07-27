@@ -1,0 +1,18 @@
+{
+  "result_version": 1,
+  "columns": [
+    "a"
+  ],
+  "rows": [
+    [
+      "one"
+    ]
+  ],
+  "summary": {
+    "rows": 7,
+    "database_generation": 1,
+    "linked_databases_opened": 0,
+    "partial": false
+  },
+  "warnings": []
+}
