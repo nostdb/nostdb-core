@@ -44,6 +44,7 @@
 //! ordinary failures.
 
 pub mod analysis;
+pub mod analyze;
 pub mod change;
 pub mod container;
 pub mod contribution;
