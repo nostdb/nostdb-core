@@ -35,6 +35,9 @@
 use crate::crc::crc32c;
 use crate::generation::Generation;
 use std::fmt;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 
 const KIND_BEGIN: u32 = 1;
 const KIND_PROMOTE: u32 = 2;
@@ -324,6 +327,173 @@ impl fmt::Display for JournalError {
 
 impl std::error::Error for JournalError {}
 
+/// A change spanning several files, staged and then promoted as one.
+///
+/// A single file needs no journal: a staged write followed by a rename is already
+/// all-or-nothing. This exists for the case that is not, which is what adding a link is —
+/// the declaration lives in the database, its operational mirror in the settings, and the
+/// canonical `.nost` and the synchronization baseline both follow from the pair.
+///
+/// A crash is safe at every point. Before the journal is committed, nothing has moved and
+/// the staged files are abandoned. After it is committed, every promotion is recorded and
+/// replay finishes them; re-applying a rename that already happened is a no-op, which is
+/// what makes replay idempotent.
+#[derive(Debug)]
+pub struct FileTransaction {
+    journal_path: PathBuf,
+    generation: Generation,
+    actions: Vec<JournalRecord>,
+    staged: Vec<PathBuf>,
+}
+
+impl FileTransaction {
+    /// Opens a transaction whose journal lives at `journal_path`.
+    #[must_use]
+    pub fn begin(journal_path: PathBuf, generation: Generation) -> Self {
+        Self {
+            journal_path,
+            generation,
+            actions: Vec::new(),
+            staged: Vec::new(),
+        }
+    }
+
+    /// Writes `contents` to a staging file that will replace `destination` on commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever writing the staging file reports.
+    pub fn stage(&mut self, destination: &Path, contents: &[u8]) -> io::Result<()> {
+        let staged = staging_path(destination);
+        fs::write(&staged, contents)?;
+        sync_file(&staged);
+        self.actions.push(JournalRecord::Promote {
+            staged: staged.to_string_lossy().into_owned(),
+            destination: destination.to_string_lossy().into_owned(),
+        });
+        self.staged.push(staged);
+        Ok(())
+    }
+
+    /// Records that `path` is removed on commit.
+    pub fn remove(&mut self, path: &Path) {
+        self.actions.push(JournalRecord::Remove {
+            path: path.to_string_lossy().into_owned(),
+        });
+    }
+
+    /// Reports whether anything was staged.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.actions.is_empty()
+    }
+
+    /// Commits: records the intent durably, then carries it out.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever writing the journal or promoting a file reports. A failure after
+    /// the journal is durable leaves the transaction replayable rather than half done.
+    pub fn commit(self) -> io::Result<()> {
+        if self.actions.is_empty() {
+            return Ok(());
+        }
+        if let Some(parent) = self.journal_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bytes = encode_transaction(self.generation, &self.actions);
+        fs::write(&self.journal_path, &bytes)?;
+        sync_file(&self.journal_path);
+
+        apply(&self.actions)?;
+
+        // The journal is removed last. Until it is gone the transaction is replayable,
+        // and replaying a finished one changes nothing.
+        let _ = fs::remove_file(&self.journal_path);
+        Ok(())
+    }
+
+    /// Discards the transaction, removing whatever it staged.
+    pub fn abandon(self) {
+        for staged in &self.staged {
+            let _ = fs::remove_file(staged);
+        }
+    }
+}
+
+/// Carries out one set of journalled actions.
+///
+/// Idempotent: promoting a file that was already promoted finds no staging file and does
+/// nothing, and removing a file that is already gone does nothing.
+fn apply(actions: &[JournalRecord]) -> io::Result<()> {
+    for action in actions {
+        match action {
+            JournalRecord::Promote {
+                staged,
+                destination,
+            } => {
+                let staged = Path::new(staged);
+                if staged.exists() {
+                    fs::rename(staged, Path::new(destination))?;
+                }
+            }
+            JournalRecord::Remove { path } => {
+                let path = Path::new(path);
+                if path.exists() {
+                    fs::remove_file(path)?;
+                }
+            }
+            JournalRecord::Begin { .. } | JournalRecord::Commit => {}
+        }
+    }
+    Ok(())
+}
+
+/// Finishes or discards whatever a journal at `journal_path` describes.
+///
+/// Called before reading a project, so a crash mid-transaction is resolved rather than
+/// observed. A journal with no commit record is discarded along with its staged files:
+/// the intent was never made durable, so carrying it out would be inventing a decision.
+///
+/// # Errors
+///
+/// Returns whatever reading the journal or promoting a file reports.
+pub fn recover_at(journal_path: &Path) -> io::Result<Recovery> {
+    if !journal_path.is_file() {
+        return Ok(Recovery {
+            committed: Vec::new(),
+            abandoned_staged: Vec::new(),
+            truncated: false,
+        });
+    }
+    let bytes = fs::read(journal_path)?;
+    let recovery = replay(&bytes);
+
+    apply(&recovery.committed)?;
+    for staged in &recovery.abandoned_staged {
+        let _ = fs::remove_file(Path::new(staged));
+    }
+    let _ = fs::remove_file(journal_path);
+    Ok(recovery)
+}
+
+/// The staging sibling of a destination.
+fn staging_path(destination: &Path) -> PathBuf {
+    let mut name = destination.file_name().unwrap_or_default().to_os_string();
+    name.push(".staged");
+    destination.with_file_name(name)
+}
+
+/// Flushes a file to disk, best effort.
+///
+/// Not every platform and filesystem supports it, and treating that as a failure would
+/// break commits on systems where the rename is already durable.
+fn sync_file(path: &Path) {
+    if let Ok(file) = fs::File::open(path) {
+        let _ = file.sync_all();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,5 +656,98 @@ mod tests {
             recovery.committed_generation(),
             Some(Generation::from_raw(2))
         );
+    }
+
+    fn scratch(label: &str) -> PathBuf {
+        let mut base = std::env::temp_dir();
+        base.push(format!("nostdb-core-journal-{label}"));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("temporary directory");
+        base
+    }
+
+    #[test]
+    fn a_committed_transaction_moves_every_file_and_removes_its_journal() {
+        let base = scratch("commit");
+        let first = base.join("first");
+        let second = base.join("second");
+        let doomed = base.join("doomed");
+        fs::write(&first, "old").unwrap();
+        fs::write(&doomed, "goes away").unwrap();
+
+        let journal_path = base.join("journal");
+        let mut transaction = FileTransaction::begin(journal_path.clone(), Generation::from_raw(4));
+        transaction.stage(&first, b"new").unwrap();
+        transaction.stage(&second, b"created").unwrap();
+        transaction.remove(&doomed);
+        transaction.commit().unwrap();
+
+        assert_eq!(fs::read_to_string(&first).unwrap(), "new");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "created");
+        assert!(!doomed.exists());
+        assert!(!journal_path.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn replaying_a_finished_transaction_changes_nothing() {
+        // Recovery cannot know how far the crash got, so it re-applies every recorded
+        // action. That is only safe because applying one twice is the same as once.
+        let base = scratch("idempotent");
+        let destination = base.join("destination");
+        fs::write(&destination, "old").unwrap();
+        let journal_path = base.join("journal");
+
+        let mut transaction = FileTransaction::begin(journal_path.clone(), Generation::from_raw(1));
+        transaction.stage(&destination, b"new").unwrap();
+        let actions = transaction.actions.clone();
+        transaction.commit().unwrap();
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "new");
+
+        fs::write(
+            &journal_path,
+            encode_transaction(Generation::from_raw(1), &actions),
+        )
+        .unwrap();
+        let recovery = recover_at(&journal_path).unwrap();
+        assert!(!recovery.truncated);
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            "new",
+            "the destination is not clobbered by a rename with nothing left to move"
+        );
+        assert!(!journal_path.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn abandoning_removes_what_was_staged_and_promotes_nothing() {
+        let base = scratch("abandon");
+        let destination = base.join("destination");
+        fs::write(&destination, "untouched").unwrap();
+        let journal_path = base.join("journal");
+
+        let mut transaction = FileTransaction::begin(journal_path.clone(), Generation::from_raw(2));
+        transaction.stage(&destination, b"never arrives").unwrap();
+        let staged = staging_path(&destination);
+        assert!(staged.exists());
+        transaction.abandon();
+
+        assert!(!staged.exists());
+        assert!(
+            !journal_path.exists(),
+            "no journal is written before commit"
+        );
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "untouched");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recovering_where_there_is_no_journal_does_nothing() {
+        let base = scratch("absent");
+        let recovery = recover_at(&base.join("journal")).unwrap();
+        assert!(recovery.committed.is_empty());
+        assert!(!recovery.truncated);
+        let _ = fs::remove_dir_all(&base);
     }
 }

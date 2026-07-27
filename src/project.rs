@@ -16,10 +16,21 @@
 //! [`Project::initialize`], which is what `nostdb init` calls. A read-only command that
 //! quietly wrote settings would violate the rule in the settings contract that a
 //! read-only open never fills in a missing entry.
+//!
+//! Recovery is the one exception, and it is not a counterexample. [`Project::open`]
+//! finishes a committed multi-file transaction before reading anything, because a crash
+//! partway through four renames can leave the database, the settings mirror, the `.nost`,
+//! and the baseline disagreeing. Finishing it is not inventing a decision: the decision
+//! was made durable before the first rename, and replay only carries out what the journal
+//! already records. Nothing happens in the ordinary case, where there is no journal.
 
 use crate::encoding::{DecodeError, Graph};
 use crate::evidence::ContentDigest;
 use crate::generation::Generation;
+use crate::journal;
+use crate::link::Link;
+use crate::locator::CanonicalSourceLocator;
+use crate::name::LinkAlias;
 use crate::settings::{Settings, SettingsDocument, SettingsError};
 use crate::storage::{Database, StorageError};
 use crate::sync::{SyncBaseline, SyncState};
@@ -53,6 +64,9 @@ pub const BASELINE_FILE: &str = "sync.json";
 /// The baseline document's own version.
 const BASELINE_VERSION: u64 = 1;
 
+/// The multi-file journal, inside the state directory.
+const JOURNAL_FILE: &str = "journal";
+
 /// Why a project could not be found, opened, or created.
 #[derive(Debug)]
 pub enum ProjectError {
@@ -72,6 +86,20 @@ pub enum ProjectError {
         path: PathBuf,
         /// Why.
         error: SettingsError,
+    },
+    /// A link declaration was refused.
+    Link {
+        /// The locator the command named.
+        source: String,
+        /// Why it was refused.
+        reason: String,
+    },
+    /// The materialized `.nost` holds changes the database has not adopted.
+    NostUnsynchronized {
+        /// The file that would have been overwritten.
+        path: PathBuf,
+        /// What the synchronization state machine decided.
+        reason: String,
     },
     /// A filesystem step failed.
     Io {
@@ -120,6 +148,15 @@ impl fmt::Display for ProjectError {
             Self::Settings { path, error } => {
                 write!(formatter, "{}: {error}", path.display())
             }
+            Self::Link { source, reason } => {
+                write!(formatter, "link `{source}` was refused: {reason}")
+            }
+            Self::NostUnsynchronized { path, reason } => write!(
+                formatter,
+                "{} holds changes the database has not adopted ({reason}); \
+                 run `nostdb sync` before changing a link",
+                path.display()
+            ),
             Self::Io { path, error } => write!(formatter, "{}: {error}", path.display()),
             Self::Storage(error) => write!(formatter, "{error}"),
             Self::Nost { path, reason } => write!(formatter, "{}: {reason}", path.display()),
@@ -289,6 +326,8 @@ impl Project {
                 from: root.to_path_buf(),
             });
         }
+        Self::recover(root)?;
+
         let project_document = read_document(&settings_path)?;
         let global_document = match global {
             Some(path) if path.is_file() => Some(read_document(path)?),
@@ -458,15 +497,7 @@ impl Project {
     ///
     /// Returns [`ProjectError::Io`] when the file cannot be written.
     pub fn write_baseline(&self, baseline: &SyncBaseline) -> Result<(), ProjectError> {
-        let document = serde_json::json!({
-            "baseline_version": BASELINE_VERSION,
-            "database_generation": baseline.database_generation.get(),
-            "database_digest": baseline.database_digest.as_str(),
-            "nost_content_digest": baseline.nost_content_digest.as_str(),
-        });
-        let text =
-            serde_json::to_string_pretty(&document).unwrap_or_else(|_| document.to_string()) + "\n";
-        write_atomically(&self.baseline_path(), text.as_bytes())
+        write_atomically(&self.baseline_path(), baseline_json(baseline).as_bytes())
     }
 
     /// The state both representations are in now.
@@ -657,6 +688,296 @@ impl Project {
             .collect();
         self.settings.orphan_link_settings(declared)
     }
+
+    /// Where the multi-file journal lives.
+    #[must_use]
+    pub fn journal_path(&self) -> PathBuf {
+        Self::state_directory(&self.root).join(JOURNAL_FILE)
+    }
+
+    /// Finishes or discards a multi-file transaction left by a crash.
+    ///
+    /// Called by [`Project::open`], so a caller does not have to remember to. Does nothing
+    /// when there is no journal, which is every ordinary open.
+    ///
+    /// A journal with no commit record is discarded along with its staging files: the
+    /// intent was never made durable, so the last valid generation is the one on disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::Io`] when the journal cannot be read or a recorded rename
+    /// cannot be carried out.
+    pub fn recover(root: &Path) -> Result<(), ProjectError> {
+        let path = Self::state_directory(root).join(JOURNAL_FILE);
+        journal::recover_at(&path)
+            .map(|_| ())
+            .map_err(|error| ProjectError::Io { path, error })
+    }
+
+    /// Declares a link and mirrors it into the settings.
+    ///
+    /// The declaration is semantic and goes into the database; the settings entry carries
+    /// only the operational detail a graph file must not hold. The alias goes into the
+    /// database alone, because an alias in settings would make one link mean two things on
+    /// two checkouts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::Link`] when the locator or alias is malformed, when the
+    /// source is already declared, or when the alias is already in use;
+    /// [`ProjectError::NostUnsynchronized`] when the materialized `.nost` holds unadopted
+    /// changes; and the usual I/O and storage failures otherwise. Every refusal happens
+    /// before anything is written.
+    pub fn add_link(&self, source: &str, alias: Option<&str>) -> Result<LinkChange, ProjectError> {
+        let refuse = |reason: String| ProjectError::Link {
+            source: source.to_owned(),
+            reason,
+        };
+        let locator =
+            CanonicalSourceLocator::new(source).map_err(|error| refuse(error.to_string()))?;
+        let alias = match alias {
+            Some(text) => Some(LinkAlias::new(text).map_err(|error| refuse(error.to_string()))?),
+            None => None,
+        };
+
+        let mut graph = self.read_graph()?;
+        if graph.links.iter().any(|link| link.source == locator) {
+            return Err(refuse("it is already declared".to_owned()));
+        }
+        if let Some(alias) = &alias
+            && let Some(existing) = graph
+                .links
+                .iter()
+                .find(|link| link.alias.as_ref() == Some(alias))
+        {
+            return Err(refuse(format!(
+                "the alias `{alias}` already names `{}`",
+                existing.source
+            )));
+        }
+
+        let link = Link {
+            source: locator,
+            alias,
+        };
+        graph.links.push(link.clone());
+        let outcome = self.commit_link_change(&graph)?;
+        Ok(LinkChange {
+            link,
+            generation: outcome.0,
+            settings_updated: outcome.1,
+            nost_updated: outcome.2,
+        })
+    }
+
+    /// Removes a declared link and its settings mirror.
+    ///
+    /// Removing a link removes a declaration, never data. Nothing reached through the link
+    /// was ever part of this database, so there is nothing here to delete.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::Link`] when the locator is malformed or names no declared
+    /// link, [`ProjectError::NostUnsynchronized`] when the materialized `.nost` holds
+    /// unadopted changes, and the usual I/O and storage failures otherwise.
+    pub fn remove_link(&self, source: &str) -> Result<LinkChange, ProjectError> {
+        let refuse = |reason: String| ProjectError::Link {
+            source: source.to_owned(),
+            reason,
+        };
+        let locator =
+            CanonicalSourceLocator::new(source).map_err(|error| refuse(error.to_string()))?;
+
+        let mut graph = self.read_graph()?;
+        let Some(at) = graph.links.iter().position(|link| link.source == locator) else {
+            return Err(refuse("no such link is declared".to_owned()));
+        };
+        let link = graph.links.remove(at);
+        let outcome = self.commit_link_change(&graph)?;
+        Ok(LinkChange {
+            link,
+            generation: outcome.0,
+            settings_updated: outcome.1,
+            nost_updated: outcome.2,
+        })
+    }
+
+    /// Commits a graph whose links changed, together with every file that follows from it.
+    ///
+    /// Four files can move at once: the database, the settings mirror, the materialized
+    /// `.nost`, and the baseline recording that the two agree. A rename is atomic on its
+    /// own but four renames are not, so the whole set goes through the journal and a crash
+    /// between any two of them is finished by the next open.
+    ///
+    /// Returns the new generation and whether the settings and `.nost` moved.
+    fn commit_link_change(&self, graph: &Graph) -> Result<(Generation, bool, bool), ProjectError> {
+        let database_path = self.database_path();
+        let generation = Database::open(&database_path)?
+            .generation()
+            .next()
+            .map_err(|error| ProjectError::Storage(StorageError::from(error)))?;
+
+        // Everything that can be refused is refused before the first byte is staged.
+        let nost = self.nost_to_write(graph)?;
+        let settings = self.mirror_to_write(graph)?;
+
+        let mut builder = crate::container::ContainerBuilder::new(generation);
+        for section in crate::encoding::encode_graph(graph) {
+            builder
+                .push_section(section.kind, section.payload)
+                .map_err(StorageError::from)?;
+        }
+        let bytes = builder.build().map_err(StorageError::from)?;
+
+        let mut transaction = journal::FileTransaction::begin(self.journal_path(), generation);
+        let staged = (|| -> io::Result<()> {
+            transaction.stage(&database_path, &bytes)?;
+            if let Some(settings) = &settings {
+                transaction.stage(&Self::settings_path(&self.root), settings.as_bytes())?;
+            }
+            if let Some(nost) = &nost {
+                transaction.stage(&self.nost_path(), nost.as_bytes())?;
+                let baseline = crate::sync::baseline_from(generation, &bytes, nost);
+                transaction.stage(&self.baseline_path(), baseline_json(&baseline).as_bytes())?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = staged {
+            // Nothing was promoted and no journal was written, so discarding the staging
+            // files leaves the project exactly as it was.
+            transaction.abandon();
+            return Err(ProjectError::Io {
+                path: Self::state_directory(&self.root),
+                error,
+            });
+        }
+        transaction.commit().map_err(|error| ProjectError::Io {
+            path: self.journal_path(),
+            error,
+        })?;
+        Ok((generation, settings.is_some(), nost.is_some()))
+    }
+
+    /// The `.nost` text to write beside a changed graph, or `None` when none is materialized.
+    ///
+    /// Refuses when the file on disk holds changes the database has not adopted.
+    /// Regenerating it would overwrite what somebody wrote, which is the one thing an
+    /// edit to an unrelated part of the project must never do.
+    fn nost_to_write(&self, graph: &Graph) -> Result<Option<String>, ProjectError> {
+        if !self.settings.database.nost {
+            return Ok(None);
+        }
+        if self.read_nost()?.is_some() {
+            // A file with no baseline is not known to be safe. It may be the Engine's own
+            // output from before baselines were recorded, or it may be hand-written.
+            let Some(baseline) = self.read_baseline()? else {
+                return Err(ProjectError::NostUnsynchronized {
+                    path: self.nost_path(),
+                    reason: "no baseline records what the two last agreed on".to_owned(),
+                });
+            };
+            let outcome = crate::sync::decide(&baseline, &self.sync_state()?);
+            if matches!(
+                outcome,
+                crate::sync::SyncOutcome::AdoptNost | crate::sync::SyncOutcome::Conflict
+            ) {
+                return Err(ProjectError::NostUnsynchronized {
+                    path: self.nost_path(),
+                    reason: outcome.to_diagnostic().map_or_else(
+                        || "the file changed since the baseline".to_owned(),
+                        |diagnostic| diagnostic.code.as_str().to_owned(),
+                    ),
+                });
+            }
+        }
+        Ok(Some(crate::nost::format(&crate::nost::from_graph(graph))))
+    }
+
+    /// The settings text to write beside a changed graph, or `None` when it already agrees.
+    ///
+    /// Every unknown field is preserved: this rewrites the document the user has, rather
+    /// than rendering a fresh one from the fields this build happens to know.
+    fn mirror_to_write(&self, graph: &Graph) -> Result<Option<String>, ProjectError> {
+        let path = Self::settings_path(&self.root);
+        let text = std::fs::read_to_string(&path).map_err(|error| ProjectError::Io {
+            path: path.clone(),
+            error,
+        })?;
+        let document = SettingsDocument::parse(&text).map_err(|error| ProjectError::Settings {
+            path: path.clone(),
+            error,
+        })?;
+        let mut value = document.to_json().clone();
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| ProjectError::Settings {
+                path: path.clone(),
+                error: SettingsError::Invalid {
+                    field: "<root>".to_owned(),
+                    reason: "the document is not an object".to_owned(),
+                },
+            })?;
+
+        let existing: Vec<serde_json::Value> = object
+            .get("links")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let declared: Vec<&str> = graph
+            .links
+            .iter()
+            .map(|link| link.source.as_str())
+            .collect();
+
+        // Kept in the graph's declaration order, with each surviving entry's operational
+        // fields exactly as the user left them.
+        let mut mirrored: Vec<serde_json::Value> = Vec::with_capacity(declared.len());
+        for source in &declared {
+            let entry = existing
+                .iter()
+                .find(|entry| {
+                    entry.get("source").and_then(serde_json::Value::as_str) == Some(*source)
+                })
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({ "source": source }));
+            mirrored.push(entry);
+        }
+
+        if existing == mirrored && (!mirrored.is_empty() || object.contains_key("links")) {
+            return Ok(None);
+        }
+        if mirrored.is_empty() && !object.contains_key("links") {
+            return Ok(None);
+        }
+        object.insert("links".to_owned(), serde_json::Value::Array(mirrored));
+        Ok(Some(
+            serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()) + "\n",
+        ))
+    }
+}
+
+/// A committed link change.
+#[derive(Clone, Debug)]
+pub struct LinkChange {
+    /// The link that was added or removed.
+    pub link: Link,
+    /// The generation the database now holds.
+    pub generation: Generation,
+    /// Whether the settings mirror was rewritten.
+    pub settings_updated: bool,
+    /// Whether the materialized `.nost` was rewritten.
+    pub nost_updated: bool,
+}
+
+/// Renders a baseline as the document `sync.json` holds.
+fn baseline_json(baseline: &SyncBaseline) -> String {
+    let document = serde_json::json!({
+        "baseline_version": BASELINE_VERSION,
+        "database_generation": baseline.database_generation.get(),
+        "database_digest": baseline.database_digest.as_str(),
+        "nost_content_digest": baseline.nost_content_digest.as_str(),
+    });
+    serde_json::to_string_pretty(&document).unwrap_or_else(|_| document.to_string()) + "\n"
 }
 
 #[cfg(test)]
@@ -1032,5 +1353,271 @@ mod tests {
                 .section(crate::container::SectionKind::SyncMetadata),
             None
         );
+    }
+
+    /// A project with `nost` materialized and a baseline already recorded.
+    fn materialized_project(dir: &TempDir) -> Project {
+        Project::initialize(dir.path()).unwrap();
+        fs::write(
+            Project::settings_path(dir.path()),
+            r#"{"settings_version": 1, "database": {"nost": true}}"#,
+        )
+        .unwrap();
+        let project = Project::open(dir.path(), None).unwrap();
+        project.export_nost().unwrap();
+        project
+    }
+
+    fn links_in_settings(project: &Project) -> Vec<String> {
+        let text = fs::read_to_string(Project::settings_path(project.root())).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&text).unwrap();
+        document["links"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry["source"].as_str().unwrap().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn adding_a_link_declares_it_in_the_database_and_mirrors_it_into_the_settings() {
+        let dir = TempDir::new("link-add");
+        let project = Project::initialize(dir.path()).unwrap();
+
+        let change = project.add_link("./packages/child", Some("child")).unwrap();
+        assert_eq!(change.link.source.as_str(), "./packages/child");
+        assert_eq!(change.link.alias.as_ref().unwrap().as_str(), "child");
+        assert!(change.settings_updated);
+        assert!(!change.nost_updated, "nothing is materialized here");
+
+        let graph = project.read_graph().unwrap();
+        assert_eq!(graph.links.len(), 1);
+        assert_eq!(
+            graph.links[0].alias.as_ref().map(|alias| alias.as_str()),
+            Some("child")
+        );
+        assert_eq!(links_in_settings(&project), vec!["./packages/child"]);
+    }
+
+    #[test]
+    fn the_alias_stays_out_of_the_settings() {
+        // The settings contract forbids it: an alias in a machine-local operational file
+        // would make one link mean two different things on two checkouts.
+        let dir = TempDir::new("link-alias-not-mirrored");
+        let project = Project::initialize(dir.path()).unwrap();
+        project.add_link("./child", Some("child")).unwrap();
+
+        let text = fs::read_to_string(Project::settings_path(dir.path())).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let entry = document["links"][0].as_object().unwrap();
+        assert_eq!(entry["source"], "./child");
+        assert_eq!(
+            entry.keys().collect::<Vec<_>>(),
+            vec!["source"],
+            "the mirror carries the identity and nothing the contract forbids"
+        );
+        assert!(
+            SettingsDocument::parse(&text).is_ok(),
+            "an entry carrying an alias is rejected outright, so a mirror this build \
+             writes must be one it accepts"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_source_or_alias_is_refused_and_changes_nothing() {
+        let dir = TempDir::new("link-duplicate");
+        let project = Project::initialize(dir.path()).unwrap();
+        project.add_link("./child", Some("child")).unwrap();
+        let generation = project.open_database().unwrap().generation();
+
+        assert!(matches!(
+            project.add_link("./child", None),
+            Err(ProjectError::Link { .. })
+        ));
+        assert!(matches!(
+            project.add_link("./other", Some("child")),
+            Err(ProjectError::Link { .. })
+        ));
+        assert!(matches!(
+            project.remove_link("./nothing"),
+            Err(ProjectError::Link { .. })
+        ));
+
+        assert_eq!(
+            project.open_database().unwrap().generation(),
+            generation,
+            "a refused link leaves the last valid generation in place"
+        );
+        assert_eq!(project.read_graph().unwrap().links.len(), 1);
+        assert_eq!(links_in_settings(&project), vec!["./child"]);
+    }
+
+    #[test]
+    fn removing_a_link_removes_the_declaration_and_its_mirror() {
+        let dir = TempDir::new("link-remove");
+        let project = Project::initialize(dir.path()).unwrap();
+        project.add_link("./first", None).unwrap();
+        project.add_link("./second", Some("second")).unwrap();
+
+        let change = project.remove_link("./first").unwrap();
+        assert_eq!(change.link.source.as_str(), "./first");
+        assert_eq!(
+            project.read_graph().unwrap().links,
+            vec![Link::with_alias(
+                CanonicalSourceLocator::new("./second").unwrap(),
+                LinkAlias::new("second").unwrap()
+            )]
+        );
+        assert_eq!(links_in_settings(&project), vec!["./second"]);
+    }
+
+    #[test]
+    fn the_mirror_keeps_operational_fields_and_unknown_fields_the_user_wrote() {
+        let dir = TempDir::new("link-preserve");
+        Project::initialize(dir.path()).unwrap();
+        fs::write(
+            Project::settings_path(dir.path()),
+            r#"{
+  "settings_version": 1,
+  "links": [{"source": "./keep", "timeout_ms": 42000, "credential_ref": "ci"}],
+  "experimental_field_a_newer_build_wrote": {"nested": true}
+}"#,
+        )
+        .unwrap();
+        // Reopened so the link the settings already mirror is also declared.
+        let project = Project::open(dir.path(), None).unwrap();
+        project.add_link("./keep", None).unwrap();
+        project.add_link("./added", None).unwrap();
+
+        let text = fs::read_to_string(Project::settings_path(dir.path())).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(document["links"][0]["timeout_ms"], 42000);
+        assert_eq!(document["links"][0]["credential_ref"], "ci");
+        assert_eq!(document["links"][1]["source"], "./added");
+        assert_eq!(
+            document["experimental_field_a_newer_build_wrote"]["nested"], true,
+            "an unknown field must survive a write, or downgrading is lossy"
+        );
+    }
+
+    #[test]
+    fn a_materialized_project_rewrites_the_nost_and_the_baseline_together() {
+        let dir = TempDir::new("link-materialized");
+        let project = materialized_project(&dir);
+
+        let change = project.add_link("./child", Some("child")).unwrap();
+        assert!(change.nost_updated);
+        let nost = project.read_nost().unwrap().unwrap();
+        assert!(nost.contains("@link \"./child\" as child"), "{nost}");
+
+        assert_eq!(
+            project.synchronize().unwrap().action,
+            SyncAction::UpToDate,
+            "the baseline must describe the files the change left behind"
+        );
+    }
+
+    #[test]
+    fn a_nost_holding_unadopted_edits_is_never_overwritten() {
+        let dir = TempDir::new("link-unsynchronized");
+        let project = materialized_project(&dir);
+        let edited = format!(
+            "{}\n// a line somebody wrote by hand\n",
+            project.read_nost().unwrap().unwrap()
+        );
+        fs::write(project.nost_path(), &edited).unwrap();
+        let generation = project.open_database().unwrap().generation();
+
+        assert!(matches!(
+            project.add_link("./child", None),
+            Err(ProjectError::NostUnsynchronized { .. })
+        ));
+        assert_eq!(
+            project.read_nost().unwrap().unwrap(),
+            edited,
+            "the hand-written line survives the refusal"
+        );
+        assert_eq!(project.open_database().unwrap().generation(), generation);
+        assert!(project.read_graph().unwrap().links.is_empty());
+    }
+
+    #[test]
+    fn a_crash_after_the_journal_commits_is_finished_by_the_next_open() {
+        let dir = TempDir::new("link-recovery");
+        let project = materialized_project(&dir);
+        project.add_link("./child", None).unwrap();
+
+        // Reconstruct the state a crash between two renames leaves: the journal is
+        // durable, one destination is stale, and its staging file is still present.
+        let nost = project.nost_path();
+        let finished = fs::read_to_string(&nost).unwrap();
+        fs::write(&nost, "// the state before the change\n").unwrap();
+        let staged = {
+            let mut name = nost.file_name().unwrap().to_os_string();
+            name.push(".staged");
+            nost.with_file_name(name)
+        };
+        fs::write(&staged, &finished).unwrap();
+        fs::write(
+            Project::state_directory(dir.path()).join(JOURNAL_FILE),
+            journal::encode_transaction(
+                project.open_database().unwrap().generation(),
+                &[journal::JournalRecord::Promote {
+                    staged: staged.to_string_lossy().into_owned(),
+                    destination: nost.to_string_lossy().into_owned(),
+                }],
+            ),
+        )
+        .unwrap();
+
+        let project = Project::open(dir.path(), None).unwrap();
+        assert_eq!(
+            project.read_nost().unwrap().unwrap(),
+            finished,
+            "a committed rename is carried out rather than lost"
+        );
+        assert!(!staged.exists(), "the staging file is consumed");
+        assert!(
+            !Project::state_directory(dir.path())
+                .join(JOURNAL_FILE)
+                .exists(),
+            "a finished journal is removed"
+        );
+    }
+
+    #[test]
+    fn a_journal_with_no_commit_record_is_discarded() {
+        let dir = TempDir::new("link-uncommitted");
+        let project = Project::initialize(dir.path()).unwrap();
+        let settings = Project::settings_path(dir.path());
+        let before = fs::read_to_string(&settings).unwrap();
+
+        let mut name = settings.file_name().unwrap().to_os_string();
+        name.push(".staged");
+        let staged = settings.with_file_name(name);
+        fs::write(&staged, "{\"settings_version\": 1, \"links\": []}").unwrap();
+        let mut bytes = journal::JournalRecord::Begin {
+            generation: Generation::from_raw(9),
+        }
+        .encode();
+        bytes.extend(
+            journal::JournalRecord::Promote {
+                staged: staged.to_string_lossy().into_owned(),
+                destination: settings.to_string_lossy().into_owned(),
+            }
+            .encode(),
+        );
+        fs::write(project.journal_path(), bytes).unwrap();
+
+        Project::open(dir.path(), None).unwrap();
+        assert_eq!(
+            fs::read_to_string(&settings).unwrap(),
+            before,
+            "an intent that was never committed is not carried out"
+        );
+        assert!(!staged.exists(), "its staging file is discarded");
     }
 }
