@@ -444,10 +444,17 @@ mod tests {
     }
 
     #[test]
-    fn identifiers_a_write_mints_are_reproducible_across_two_identical_databases() {
-        // The same write against the same database produces the same file, which is what
-        // lets synchronization compare content digests rather than wall-clock time.
-        let dir = TempDir::new("reproducible");
+    fn identifiers_a_write_mints_differ_across_two_identical_databases() {
+        // This asserts the opposite of what an earlier revision asserted. Minting used to
+        // derive an identifier from the generation and a counter, so the same write
+        // against two identical databases produced byte-identical files. A minted
+        // identifier is now a UUID version 7, so it does not.
+        //
+        // Synchronization is unaffected: it compares one file against its own recorded
+        // baseline, never two independently produced databases. What is given up is
+        // reproducible building, which the root product contract never asked for. The
+        // reversal is recorded in the root IMPLEMENTATION_PROGRESS.md.
+        let dir = TempDir::new("distinct-minting");
         let mut left = Database::create(dir.database("left.nostdb")).unwrap();
         let mut right = Database::create(dir.database("right.nostdb")).unwrap();
         for database in [&mut left, &mut right] {
@@ -456,6 +463,25 @@ mod tests {
                 "CREATE (a:Service {name: \"alpha\"})-[:CALLS]->(b:Database {name: \"primary\"})",
             );
         }
+        assert_ne!(
+            fs::read(dir.database("left.nostdb")).unwrap(),
+            fs::read(dir.database("right.nostdb")).unwrap()
+        );
+    }
+
+    #[test]
+    fn committing_identical_content_still_produces_identical_bytes() {
+        // The property synchronization actually depends on, which minting does not touch:
+        // two databases holding the same records, identifiers included, serialize the
+        // same way. Only the choice of a new identifier is unpredictable.
+        let dir = TempDir::new("identical-content");
+        let mut left = Database::create(dir.database("left.nostdb")).unwrap();
+        let mut right = Database::create(dir.database("right.nostdb")).unwrap();
+        run(&mut left, "CREATE (a:Service {name: \"alpha\"})");
+
+        let graph = read_graph(&left).unwrap();
+        commit_graph(&mut right, &graph).unwrap();
+
         assert_eq!(
             fs::read(dir.database("left.nostdb")).unwrap(),
             fs::read(dir.database("right.nostdb")).unwrap()

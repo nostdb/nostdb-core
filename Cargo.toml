@@ -31,6 +31,15 @@ missing_panics_doc = "deny"
 #                hand-rolling one would be reimplementing cryptography for no gain.
 #                Maintenance: active, RustCrypto/hashes.
 #                License: MIT OR Apache-2.0.
+# uuid           Purpose: minting a UUID version 7 record identifier, which the root
+#                PRD section 11.2 requires. Only generation is taken from the crate;
+#                this crate parses and formats the canonical text itself, because the
+#                accepted form is a NostDB contract rather than the crate's permissive
+#                set of spellings. Laying out the version and variant bits by hand
+#                would be reimplementing a specification whose mistakes surface late.
+#                Maintenance: active, uuid-rs/uuid.
+#                License: MIT OR Apache-2.0.
 [dependencies]
 sha2 = "0.10"
 unicode-ident = "1"
+uuid = { version = "1", features = ["v7"] }

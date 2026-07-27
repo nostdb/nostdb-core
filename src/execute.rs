@@ -1356,13 +1356,9 @@ pub fn execute(
     parameters: &Parameters,
     context: &DatabaseContext,
 ) -> Result<QueryResult, QueryError> {
-    // Records this query creates are committed at the next generation, so that is what
-    // their identifiers are derived from.
-    let pending = context
-        .generation
-        .and_then(|generation| generation.next().ok())
-        .map_or(0, Generation::get);
-    let mut minter = Minter::new(pending);
+    // Records this query creates receive a minted UUID version 7. The generation they
+    // commit at no longer takes part, because an identifier is no longer derived from it.
+    let mut minter = Minter::new();
     let mut writes = WriteSummary::default();
 
     let mut columns: Vec<String> = Vec::new();
@@ -2484,7 +2480,7 @@ mod tests {
                 steps: vec![(relationship, labelled("Database"))],
             };
             let mut target = Graph::default();
-            let mut minter = Minter::new(1);
+            let mut minter = Minter::sequential(1);
             let mut summary = WriteSummary::default();
             let mut writer = Writer::new(&mut target, &mut minter, &mut summary);
             let error = writer
@@ -2755,7 +2751,7 @@ mod tests {
     }
 
     #[test]
-    fn minted_identifiers_are_derived_from_the_generation_being_written() {
+    fn minted_identifiers_are_distinct_version_7_uuids() {
         let mut target = Graph::default();
         let query = parse("CREATE (a:A {n: 1}), (b:B {n: 2})").unwrap();
         let context = DatabaseContext {
@@ -2764,28 +2760,52 @@ mod tests {
         };
         execute(&query, &mut target, &Parameters::new(), &context).unwrap();
 
-        // Committed at generation 5, so that is what the identifiers carry.
-        let mut expected = Minter::new(5);
-        assert_eq!(target.nodes[0].id, expected.node());
-        assert_eq!(target.nodes[1].id, expected.node());
+        // The generation no longer takes part, so there is no exact value to assert.
+        // What the caller relies on is that each record gets its own well-formed one.
+        assert_ne!(target.nodes[0].id, target.nodes[1].id);
+        for node in &target.nodes {
+            let bytes = node.id.to_bytes();
+            assert_eq!(bytes[6] >> 4, 0x7, "version nibble must be 7");
+            assert_eq!(bytes[8] >> 6, 0b10, "variant bits must be 0b10");
+        }
     }
 
     #[test]
     fn minting_skips_an_identifier_a_stated_record_already_uses() {
+        // Driven through a sequential minter rather than through `execute`, because the
+        // default minter's next value is unpredictable, and a test cannot occupy a value
+        // it cannot name. The skip path is the same one either minter feeds.
         let mut target = Graph::default();
-        let mut taken = Minter::new(5);
-        let occupied = taken.node();
+        let mut probe = Minter::sequential(5);
+        let occupied = probe.node();
         target.nodes.push(node(0x0, &["Existing"], &[]));
         target.nodes[0].id = occupied;
 
-        let query = parse("CREATE (n:Created {n: 1})").unwrap();
-        let context = DatabaseContext {
-            generation: Some(Generation::from_raw(4)),
-            source: None,
-        };
-        execute(&query, &mut target, &Parameters::new(), &context).unwrap();
-        assert_ne!(target.nodes[1].id, occupied);
+        let mut minter = Minter::sequential(5);
+        let mut summary = WriteSummary::default();
+        let mut writer = Writer::new(&mut target, &mut minter, &mut summary);
+        writer
+            .create(
+                &Pattern {
+                    path_variable: None,
+                    start: NodePattern {
+                        variable: None,
+                        labels: vec!["Created".to_owned()],
+                        properties: Vec::new(),
+                    },
+                    steps: Vec::new(),
+                },
+                &mut Bindings::new(),
+                &PatternValues {
+                    start: Vec::new(),
+                    steps: Vec::new(),
+                },
+                SourceRange::ORIGIN,
+            )
+            .unwrap();
+
         assert_eq!(target.nodes.len(), 2);
+        assert_ne!(target.nodes[1].id, occupied);
     }
 
     #[test]

@@ -81,7 +81,7 @@ pub use evidence::{Confidence, Evidence, EvidenceMethod, Score, SourceRange};
 pub use execute::{DatabaseContext, Parameters, QueryResult, QueryValue, execute};
 pub use generation::Generation;
 pub use graph::{Edge, Node, NodeReference, ScopedNodeId};
-pub use id::{LocalEdgeId, LocalNodeId, Minter, SourceUnitId, StableModuleId};
+pub use id::{LocalEdgeId, LocalNodeId, Minter, SourceUnitId};
 pub use link::Link;
 pub use locator::CanonicalSourceLocator;
 pub use mutate::WriteSummary;
