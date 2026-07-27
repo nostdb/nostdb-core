@@ -204,6 +204,30 @@ enum Target {
 /// relative path resolves from the file that declared the link, which is why `base` is a
 /// parameter rather than the working directory: a link declared two hops away must not
 /// silently re-anchor to wherever the command was run.
+/// What a relative locator in a database at `database_path` is relative to.
+///
+/// A configured project keeps its database inside `.nostdb`, which is opaque and holds
+/// nothing a person arranges. Resolving `@link "./packages/child"` against that directory
+/// would look for `.nostdb/packages/child`, which is not where anybody puts a sibling
+/// package — so the base steps back out of the state directory to the project root.
+///
+/// A bare database file that is not inside a project keeps the directory holding it, which
+/// is the only reading available and the one `nostdb convert` output gets.
+///
+/// The rule is derived from the path rather than passed in, so it holds identically for the
+/// root database and for every database reached through a link.
+fn link_base(database_path: &Path) -> PathBuf {
+    let directory = database_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    if directory.file_name() == Some(std::ffi::OsStr::new(STATE_DIRECTORY)) {
+        if let Some(project_root) = directory.parent() {
+            return project_root.to_path_buf();
+        }
+    }
+    directory
+}
+
 fn resolve_target(base: &Path, locator: &CanonicalSourceLocator) -> Option<Target> {
     let candidate = base.join(locator.as_str());
 
@@ -277,9 +301,7 @@ fn open_target(target: &Target) -> Result<Graph, Unreachable> {
 /// product contract requires a query over a broken link to return what it can reach.
 #[must_use]
 pub fn resolve(root: Graph, root_path: &Path, limits: &FederationSettings) -> Federation {
-    let root_directory = root_path
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let root_directory = link_base(root_path);
 
     let mut sources = vec![FederatedSource {
         locator: None,
@@ -403,9 +425,7 @@ fn follow(
             let path = match &target {
                 Target::Database(path) | Target::Document(path) => path.clone(),
             };
-            let directory = path
-                .parent()
-                .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+            let directory = link_base(&path);
             sources.push(FederatedSource {
                 locator: Some(link.source.clone()),
                 path,
@@ -927,6 +947,88 @@ mod tests {
         assert_ne!(
             resolved.sources[0].locator, resolved.sources[1].locator,
             "and the locators are what tell them apart"
+        );
+    }
+
+    #[test]
+    fn a_relative_locator_is_relative_to_the_project_root_not_the_state_directory() {
+        // The layout every configured project has, which the tests above did not use:
+        // the root database lives inside `.nostdb`. `@link "./packages/child"` — the
+        // example in the product contract — must mean a sibling package, not something
+        // buried inside the opaque state directory.
+        let dir = TempDir::new("project-layout");
+        let child = dir.path().join("packages").join("child");
+        write_database(
+            &child.join(STATE_DIRECTORY),
+            "root.nostdb",
+            &graph(2, "Child", Vec::new()),
+        );
+
+        let root = graph(1, "Root", vec![Link::new(locator("./packages/child"))]);
+        let path = write_database(&dir.path().join(STATE_DIRECTORY), "root.nostdb", &root);
+
+        let resolved = resolve(root, &path, &limits());
+        assert_eq!(
+            resolved.linked_databases_opened(),
+            1,
+            "{:?}",
+            resolved.statuses
+        );
+        assert_eq!(
+            resolved.sources[1].graph.nodes[0].labels[0].as_str(),
+            "Child"
+        );
+    }
+
+    #[test]
+    fn a_nested_link_uses_the_same_rule_as_the_root() {
+        // A child reached through a link is itself a project, so its own relative links
+        // resolve against its root rather than against its state directory.
+        let dir = TempDir::new("project-layout-nested");
+        let grandchild = dir.path().join("child").join("sibling");
+        write_database(
+            &grandchild.join(STATE_DIRECTORY),
+            "root.nostdb",
+            &graph(3, "Grandchild", Vec::new()),
+        );
+        write_database(
+            &dir.path().join("child").join(STATE_DIRECTORY),
+            "root.nostdb",
+            &graph(2, "Child", vec![Link::new(locator("./sibling"))]),
+        );
+
+        let root = graph(1, "Root", vec![Link::new(locator("./child"))]);
+        let path = write_database(&dir.path().join(STATE_DIRECTORY), "root.nostdb", &root);
+
+        let resolved = resolve(root, &path, &limits());
+        assert_eq!(
+            resolved.linked_databases_opened(),
+            2,
+            "{:?}",
+            resolved.statuses
+        );
+    }
+
+    #[test]
+    fn a_database_outside_a_project_still_resolves_beside_itself() {
+        // `nostdb convert` writes a bare `.nostdb` anywhere. There is no project root to
+        // step back to, so the directory holding it is the only reading available.
+        let dir = TempDir::new("bare-layout");
+        write_database(
+            &dir.path().join("child").join(STATE_DIRECTORY),
+            "root.nostdb",
+            &graph(2, "Child", Vec::new()),
+        );
+
+        let root = graph(1, "Root", vec![Link::new(locator("./child"))]);
+        let path = write_database(dir.path(), "root.nostdb", &root);
+
+        let resolved = resolve(root, &path, &limits());
+        assert_eq!(
+            resolved.linked_databases_opened(),
+            1,
+            "{:?}",
+            resolved.statuses
         );
     }
 }
