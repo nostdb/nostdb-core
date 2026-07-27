@@ -63,7 +63,7 @@ fn every_accepted_fixture_is_read() {
         }
     }
     println!(
-        "change set conformance: {} accepted fixtures read",
+        "change set conformance: {} accepted fixtures verified",
         paths.len()
     );
 }
@@ -104,7 +104,7 @@ fn every_rejected_fixture_is_refused_with_the_declared_code() {
         );
     }
     println!(
-        "change set conformance: {} rejected fixtures refused",
+        "change set conformance: {} rejected fixtures verified",
         paths.len()
     );
 }
