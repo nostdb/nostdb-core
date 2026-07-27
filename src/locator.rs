@@ -49,6 +49,31 @@ impl CanonicalSourceLocator {
     }
 
     /// Borrows the locator.
+    /// Wraps a locator the caller knows is valid.
+    ///
+    /// This exists so an infallible construction can be written without `unwrap`, keeping
+    /// the crate's no-panic guarantee. The debug assertion catches a mistaken caller
+    /// during development.
+    pub(crate) fn literal(value: impl Into<String>) -> Self {
+        let value = value.into();
+        debug_assert!(
+            Self::new(value.clone()).is_ok(),
+            "a locator passed to `literal` must be valid"
+        );
+        Self(value)
+    }
+
+    /// The locator naming the project being analyzed itself.
+    ///
+    /// A federated build gives each linked source its own locator; this is the root's, and
+    /// it is what a coverage record or a piece of evidence names when the fact came from
+    /// the project rather than from something it links to.
+    #[must_use]
+    pub fn root() -> Self {
+        Self::literal(".")
+    }
+
+    /// The locator as written.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0

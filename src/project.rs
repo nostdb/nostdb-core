@@ -87,6 +87,11 @@ pub enum ProjectError {
         /// Why.
         error: SettingsError,
     },
+    /// A build produced a change set the graph would not accept.
+    Build {
+        /// Why.
+        reason: String,
+    },
     /// A link declaration was refused.
     Link {
         /// The locator the command named.
@@ -148,6 +153,7 @@ impl fmt::Display for ProjectError {
             Self::Settings { path, error } => {
                 write!(formatter, "{}: {error}", path.display())
             }
+            Self::Build { reason } => write!(formatter, "the build was refused: {reason}"),
             Self::Link { source, reason } => {
                 write!(formatter, "link `{source}` was refused: {reason}")
             }
@@ -730,6 +736,76 @@ impl Project {
         Ok(crate::plan::plan(&scan, registry, &self.settings.analysis))
     }
 
+    /// Analyzes this project's source and commits what it found.
+    ///
+    /// The structural generation is committed before any optional enrichment, which root
+    /// PRD section 17.1 requires: AI failure must not be able to erase structural facts,
+    /// and the only way to guarantee that is for the structural database to exist first.
+    ///
+    /// A failure leaves the previous generation exactly as it was. Nothing is written until
+    /// the change set has been built, validated, and applied to a copy of the graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::Io`] when the tree cannot be scanned, [`ProjectError::Decode`]
+    /// when the database does not hold a readable graph, and [`ProjectError::Storage`] when
+    /// the commit fails. A change set that cannot be applied is reported as
+    /// [`ProjectError::Build`].
+    pub fn build(
+        &self,
+        registry: &crate::analysis::CapabilityRegistry,
+        options: &crate::scan::ScanOptions,
+    ) -> Result<BuildReport, ProjectError> {
+        let scan = self.scan(options)?;
+        let plan = crate::plan::plan(&scan, registry, &self.settings.analysis);
+        let revision = plan.plan.source_revision.clone();
+
+        let mut database = self.open_database()?;
+        let generation = database.generation();
+        let mut graph = crate::encoding::read_graph(&database).map_err(ProjectError::Decode)?;
+        let mut minter = crate::id::Minter::new();
+
+        let draft = crate::build::draft(
+            &self.root,
+            &scan,
+            &graph,
+            registry,
+            &revision,
+            generation.get(),
+            &mut minter,
+        );
+        // An empty set is refused by contract, and a project with no analyzable source is
+        // not an error. Saying so beats reporting a failure the user cannot act on.
+        if draft.change_set.operations.is_empty() {
+            return Ok(BuildReport {
+                generation,
+                revision,
+                summary: crate::apply::ApplySummary::default(),
+                coverage: draft.coverage,
+                analyzed_files: draft.analyzed_files,
+                resolved_references: draft.resolved_references,
+                plan,
+            });
+        }
+
+        let summary =
+            crate::apply::apply(&mut graph, &draft.change_set, generation.get(), &mut minter)
+                .map_err(|error| ProjectError::Build {
+                    reason: error.to_string(),
+                })?;
+
+        let generation = crate::encoding::commit_graph(&mut database, &graph)?;
+        Ok(BuildReport {
+            generation,
+            revision,
+            summary,
+            coverage: draft.coverage,
+            analyzed_files: draft.analyzed_files,
+            resolved_references: draft.resolved_references,
+            plan,
+        })
+    }
+
     /// Where the multi-file journal lives.
     #[must_use]
     pub fn journal_path(&self) -> PathBuf {
@@ -995,6 +1071,25 @@ impl Project {
             serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()) + "\n",
         ))
     }
+}
+
+/// What a build did.
+#[derive(Clone, Debug)]
+pub struct BuildReport {
+    /// The generation the database now holds.
+    pub generation: Generation,
+    /// The immutable snapshot the facts were derived from.
+    pub revision: String,
+    /// What applying the change set did.
+    pub summary: crate::apply::ApplySummary,
+    /// What the build covered.
+    pub coverage: crate::coverage::BuildCoverage,
+    /// How many files were read and analyzed.
+    pub analyzed_files: u64,
+    /// How many references matched a record in the build.
+    pub resolved_references: u64,
+    /// The plan the build ran against.
+    pub plan: crate::plan::PlanReport,
 }
 
 /// A committed link change.
@@ -1660,5 +1755,131 @@ mod tests {
             "an intent that was never committed is not carried out"
         );
         assert!(!staged.exists(), "its staging file is discarded");
+    }
+
+    #[test]
+    fn building_a_project_commits_a_generation_holding_what_the_analyzer_found() {
+        let dir = TempDir::new("build");
+        let project = Project::initialize(dir.path()).unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main() { helper(); }\nfn helper() {}\n",
+        )
+        .unwrap();
+
+        let registry = crate::analyze::builtin_registry().unwrap();
+        let before = project.open_database().unwrap().generation();
+        let report = project
+            .build(&registry, &crate::scan::ScanOptions::default())
+            .unwrap();
+
+        assert!(report.generation > before);
+        assert_eq!(report.analyzed_files, 1);
+        assert!(report.summary.nodes_created >= 3, "{:?}", report.summary);
+        assert_eq!(report.resolved_references, 1);
+        assert!(report.revision.starts_with("tree:"));
+
+        let graph = project.read_graph().unwrap();
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.labels.iter().any(|label| label.as_str() == "Function")),
+            "the committed generation holds the facts"
+        );
+    }
+
+    #[test]
+    fn a_project_with_no_analyzable_source_is_not_a_failure() {
+        let dir = TempDir::new("build-empty");
+        let project = Project::initialize(dir.path()).unwrap();
+        fs::write(dir.path().join("notes.txt"), "nothing to analyze\n").unwrap();
+
+        let registry = crate::analyze::builtin_registry().unwrap();
+        let before = project.open_database().unwrap().generation();
+        let report = project
+            .build(&registry, &crate::scan::ScanOptions::default())
+            .unwrap();
+
+        assert_eq!(report.analyzed_files, 0);
+        assert!(report.summary.is_empty());
+        assert_eq!(
+            report.generation, before,
+            "nothing was found, so nothing is committed"
+        );
+    }
+
+    #[test]
+    fn rebuilding_after_an_edit_replaces_only_what_changed() {
+        let dir = TempDir::new("build-rebuild");
+        let project = Project::initialize(dir.path()).unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/a.rs"), "fn kept() {}\n").unwrap();
+        fs::write(dir.path().join("src/b.rs"), "fn removed() {}\n").unwrap();
+
+        let registry = crate::analyze::builtin_registry().unwrap();
+        let options = crate::scan::ScanOptions::default();
+        project.build(&registry, &options).unwrap();
+
+        let kept = project
+            .read_graph()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|node| {
+                node.properties.iter().any(|(key, value)| {
+                    key.as_str() == "name"
+                        && *value == crate::property::PropertyValue::String("kept".to_owned())
+                })
+            })
+            .expect("the record")
+            .id;
+
+        fs::write(dir.path().join("src/b.rs"), "fn replaced() {}\n").unwrap();
+        project.build(&registry, &options).unwrap();
+
+        let graph = project.read_graph().unwrap();
+        let names: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                node.properties.iter().find_map(|(key, value)| match value {
+                    crate::property::PropertyValue::String(text) if key.as_str() == "name" => {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
+        assert!(names.contains(&"kept".to_owned()), "{names:?}");
+        assert!(names.contains(&"replaced".to_owned()), "{names:?}");
+        assert!(!names.contains(&"removed".to_owned()), "{names:?}");
+        assert!(
+            graph.nodes.iter().any(|node| node.id == kept),
+            "the untouched file's records keep their identifiers"
+        );
+    }
+
+    #[test]
+    fn a_build_never_analyzes_the_state_directory() {
+        // Feeding the database's own bytes back into itself would be a loop that grows
+        // every generation.
+        let dir = TempDir::new("build-state");
+        let project = Project::initialize(dir.path()).unwrap();
+        fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+        let registry = crate::analyze::builtin_registry().unwrap();
+        let report = project
+            .build(&registry, &crate::scan::ScanOptions::default())
+            .unwrap();
+        assert_eq!(report.analyzed_files, 1);
+        assert!(
+            report
+                .plan
+                .skipped
+                .iter()
+                .any(|(reason, _)| *reason == crate::coverage::SkipReason::Ignored)
+        );
     }
 }

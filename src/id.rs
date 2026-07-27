@@ -331,6 +331,15 @@ impl Minter {
         LocalEdgeId::from_bytes(self.next_bytes())
     }
 
+    /// The next source-unit identifier.
+    ///
+    /// Minted once per file the first time anything analyzes it, and then persisted on
+    /// that file's record. A build finds it again through the record rather than deriving
+    /// it from the path, because a path is a location and not an identity.
+    pub fn source_unit(&mut self) -> SourceUnitId {
+        SourceUnitId::from_bytes(self.next_bytes())
+    }
+
     /// How many identifiers this minter has issued.
     #[must_use]
     pub const fn issued(&self) -> u64 {
