@@ -186,6 +186,10 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
     if !request.rebuild
         && let Some(unchanged) = every_file_unchanged(scan, graph, registry)
     {
+        // Complete, not skipped. Everything is covered — it was covered by an earlier
+        // build and nothing has changed since. Reporting `skipped` would say the opposite
+        // of what happened.
+        coverage.structural = CoverageState::Complete;
         return BuildDraft {
             change_set: GraphChangeSet::new(
                 analyzer_owner(),

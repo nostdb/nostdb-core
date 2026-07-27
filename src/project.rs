@@ -1964,6 +1964,11 @@ mod tests {
         assert_eq!(second.reused_files, 1);
         assert_eq!(second.analyzed_files, 0);
         assert_eq!(
+            second.coverage.structural,
+            crate::coverage::CoverageState::Complete,
+            "everything is covered; it was covered earlier and nothing changed"
+        );
+        assert_eq!(
             second.generation, first.generation,
             "nothing changed, so nothing is committed"
         );
