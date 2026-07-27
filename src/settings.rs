@@ -236,6 +236,18 @@ pub struct AnalysisSettings {
     pub on_budget_exceeded: BudgetAction,
 }
 
+/// Which cache tiers a project reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheSettings {
+    /// Whether the user-global tier is read.
+    ///
+    /// The project tier has no field. A project that could not cache its own derived work
+    /// would have nothing to turn off — that tier lives inside the project and is discarded
+    /// with it. The user tier is shared across every project the same operating-system user
+    /// builds, which is the thing a project might have reason not to read from.
+    pub user: bool,
+}
+
 /// Safety limits on recursive federation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FederationSettings {
@@ -260,6 +272,8 @@ pub struct Settings {
     pub links: Vec<LinkSettings>,
     /// Federation limits.
     pub federation: FederationSettings,
+    /// Which cache tiers are read.
+    pub cache: CacheSettings,
     /// Action name to plugin name.
     pub plugins: BTreeMap<String, String>,
 }
@@ -280,6 +294,7 @@ impl Default for Settings {
                 on_budget_exceeded: BudgetAction::default(),
             },
             links: Vec::new(),
+            cache: CacheSettings { user: true },
             federation: FederationSettings {
                 max_link_depth: DEFAULT_MAX_LINK_DEPTH,
                 max_link_databases: DEFAULT_MAX_LINK_DATABASES,
@@ -340,6 +355,10 @@ impl Settings {
                 "max_link_databases": self.federation.max_link_databases,
                 "link_open_timeout_ms": self.federation.link_open_timeout_ms,
             }),
+        );
+        root.insert(
+            "cache".to_owned(),
+            serde_json::json!({ "user": self.cache.user }),
         );
         root.insert(
             "plugins".to_owned(),
@@ -406,6 +425,7 @@ pub struct SettingsDocument {
     max_link_depth: Option<u64>,
     max_link_databases: Option<u64>,
     link_open_timeout_ms: Option<u64>,
+    cache_user: Option<bool>,
     plugins: Option<BTreeMap<String, String>>,
     original: Value,
 }
@@ -562,6 +582,7 @@ impl SettingsDocument {
             max_link_depth: None,
             max_link_databases: None,
             link_open_timeout_ms: None,
+            cache_user: None,
             plugins: None,
             original: original.clone(),
         };
@@ -636,6 +657,10 @@ impl SettingsDocument {
                 "federation.link_open_timeout_ms",
                 read_positive,
             )?;
+        }
+
+        if let Some(cache) = read_object(root, "cache", "cache")? {
+            document.cache_user = optional(cache, "user", "cache.user", read_bool)?;
         }
 
         document.links = match root.get("links") {
@@ -728,6 +753,11 @@ impl SettingsDocument {
             && let Some(limit) = &source.max_cost_usd
         {
             settings.analysis.max_cost_usd.clone_from(limit);
+        }
+        if let Some(source) = pick(&|d| d.cache_user.is_some())
+            && let Some(user) = source.cache_user
+        {
+            settings.cache.user = user;
         }
         if let Some(source) = pick(&|d| d.links.is_some())
             && let Some(links) = &source.links
@@ -1077,5 +1107,49 @@ mod tests {
         }
         assert_eq!(rendered["analysis"]["max_input_tokens"], Value::Null);
         assert_eq!(rendered["links"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn the_user_cache_tier_is_read_unless_a_project_declines_it() {
+        assert!(Settings::default().cache.user);
+        // The effective document states the default; a parsed document preserves only
+        // what was written, which is a different question and a different method.
+        let effective = resolve(r#"{"settings_version": 1}"#, r#"{"settings_version": 1}"#);
+        assert_eq!(effective.to_json()["cache"]["user"], true);
+        assert!(
+            parse(r#"{"settings_version": 1}"#)
+                .unwrap()
+                .to_json()
+                .get("cache")
+                .is_none()
+        );
+
+        let declined = resolve(
+            r#"{"settings_version": 1}"#,
+            r#"{"settings_version": 1, "cache": {"user": false}}"#,
+        );
+        assert!(!declined.cache.user);
+
+        // By defined field, like every other section: a project saying `false` overrides a
+        // global saying `true`, and a project saying nothing keeps the global.
+        let inherited = resolve(
+            r#"{"settings_version": 1, "cache": {"user": false}}"#,
+            r#"{"settings_version": 1}"#,
+        );
+        assert!(!inherited.cache.user);
+    }
+
+    #[test]
+    fn a_cache_field_of_the_wrong_type_is_refused_rather_than_guessed() {
+        // Guessing that the string "no" means false is how a typo becomes a silent
+        // behavior change.
+        assert!(matches!(
+            parse(r#"{"settings_version": 1, "cache": {"user": "no"}}"#),
+            Err(SettingsError::Invalid { .. })
+        ));
+        assert!(matches!(
+            parse(r#"{"settings_version": 1, "cache": true}"#),
+            Err(SettingsError::Invalid { .. })
+        ));
     }
 }

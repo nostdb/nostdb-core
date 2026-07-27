@@ -273,6 +273,8 @@ impl SyncReport {
 pub struct Project {
     root: PathBuf,
     settings: Settings,
+    /// The user's own `~/.nostdb`, when one was supplied to [`Project::open`].
+    user_directory: Option<PathBuf>,
 }
 
 impl Project {
@@ -342,6 +344,10 @@ impl Project {
         Ok(Self {
             root: root.to_path_buf(),
             settings: SettingsDocument::resolve(global_document.as_ref(), Some(&project_document)),
+            // The global settings file lives in the user's `.nostdb`, which is also where
+            // their cache tier is. Deriving it from the path already supplied beats asking
+            // a caller for the same directory twice.
+            user_directory: global.and_then(|path| path.parent()).map(Path::to_path_buf),
         })
     }
 
@@ -392,6 +398,9 @@ impl Project {
         Ok(Self {
             root: root.to_path_buf(),
             settings,
+            // A project being created has read no global settings, so it knows of no user
+            // directory. Reopening it is what supplies one.
+            user_directory: None,
         })
     }
 
@@ -782,7 +791,7 @@ impl Project {
                 revision: &revision,
                 base_generation: generation.get(),
                 rebuild,
-                cache: &crate::cache::ParseCache::new(self.cache_layout(None)),
+                cache: &crate::cache::ParseCache::new(self.cache_layout()),
             },
             &mut minter,
         );
@@ -824,16 +833,17 @@ impl Project {
 
     /// The caches this project may read, in the order the contract fixes.
     ///
-    /// `user_directory` names the user's own `~/.nostdb`. Passing `None` disables the user
-    /// tier, which section 17.7 permits a project to do; the project tier is always
-    /// present, because it is where this project's own artifacts belong.
+    /// The project tier is always present, because it is where this project's own artifacts
+    /// belong. The user tier is present when the settings ask for it and a user directory
+    /// is known — `cache.user` is how a project declines to read a tier shared with every
+    /// other project the same operating-system user builds.
     #[must_use]
-    pub fn cache_layout(&self, user_directory: Option<&Path>) -> crate::cache::CacheLayout {
+    pub fn cache_layout(&self) -> crate::cache::CacheLayout {
         let layout =
             crate::cache::CacheLayout::none().with_project(&Self::state_directory(&self.root));
-        match user_directory {
-            Some(path) => layout.with_user(path),
-            None => layout,
+        match self.user_directory.as_deref() {
+            Some(path) if self.settings.cache.user => layout.with_user(path),
+            _ => layout,
         }
     }
 
@@ -1998,15 +2008,28 @@ mod tests {
         let project = Project::initialize(dir.path()).unwrap();
         let home = dir.path().join("home").join(".nostdb");
 
-        let both = project.cache_layout(Some(&home));
-        let tiers = both.tiers();
+        let global = home.join("settings.json");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(&global, "{\"settings_version\": 1}").unwrap();
+
+        let with_user = Project::open(dir.path(), Some(&global)).unwrap();
+        let layout = with_user.cache_layout();
+        let tiers = layout.tiers();
         assert_eq!(tiers.len(), 2);
         assert_eq!(tiers[0].0, crate::cache::CacheTier::Project);
         assert!(tiers[0].1.starts_with(dir.path()));
 
-        let project_only = project.cache_layout(None);
-        assert_eq!(project_only.tiers().len(), 1);
-        assert!(!project_only.uses_user_tier());
+        // A project that declines the shared tier reads only its own.
+        fs::write(
+            Project::settings_path(dir.path()),
+            "{\"settings_version\": 1, \"cache\": {\"user\": false}}",
+        )
+        .unwrap();
+        let declined = Project::open(dir.path(), Some(&global)).unwrap();
+        let layout = declined.cache_layout();
+        assert_eq!(layout.tiers().len(), 1);
+        assert!(!layout.uses_user_tier());
+        let _ = project;
     }
 
     #[test]
