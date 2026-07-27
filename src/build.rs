@@ -225,10 +225,19 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
     // build never read may have become right or wrong, and the only honest answer at
     // syntactic precision is to read them all. That is the "affected context-resolution
     // units" half of section 17.8, taken conservatively rather than approximately.
-    let names_moved = !departed.is_empty()
-        || units
-            .iter()
-            .any(|(_, unit, _, analysis)| declared_names(analysis) != recorded_names(graph, *unit));
+    //
+    // Taken all the way: if *anything* was re-read, everything is. A finer rule was tried —
+    // reuse per file, with references resolved against reused records as well as fresh ones
+    // — and it lost edges. Building this crate and then editing one comment produced 1275
+    // `CALLS` edges where a full build of the same source produces 1308, and a forced
+    // rebuild immediately after created exactly the 33 that were missing.
+    //
+    // The cause is a difference between resolving against one index and resolving against
+    // two, and it is not yet understood. Until it is, the finer rule is not worth having: a
+    // graph that depends on how it was built is worse than one that took longer to build.
+    // What survives is the case that matters most and is provably safe — a tree where
+    // nothing changed is not read at all.
+    let names_moved = !departed.is_empty() || !units.is_empty();
     if names_moved && !reused.is_empty() {
         return draft(
             &BuildRequest {
@@ -547,37 +556,6 @@ fn analyzed_units(graph: &Graph) -> BTreeSet<SourceUnitId> {
         .flat_map(|node| node.contributions.iter())
         .filter(|held| held.owner == owner)
         .map(|held| held.source_unit)
-        .collect()
-}
-
-/// The names one analysis declares, at every depth.
-///
-/// This is what a reference from another file could resolve to, so a change to it is what
-/// makes reuse unsound. An implementation is excluded for the same reason it is excluded
-/// from the resolution index: nothing can refer to one.
-fn declared_names(analysis: &FileAnalysis) -> BTreeSet<String> {
-    analysis
-        .walk()
-        .filter(|item| item.kind != ItemKind::Implementation)
-        .map(|item| item.name.clone())
-        .collect()
-}
-
-/// The names already recorded for one source unit.
-fn recorded_names(graph: &Graph, unit: SourceUnitId) -> BTreeSet<String> {
-    let owner = analyzer_owner();
-    graph
-        .nodes
-        .iter()
-        .filter(|node| {
-            !node.labels.iter().any(|held| held.as_str() == FILE_LABEL)
-                && !node.labels.iter().any(|held| held.as_str() == "Impl")
-                && node
-                    .contributions
-                    .iter()
-                    .any(|held| held.owner == owner && held.source_unit == unit)
-        })
-        .filter_map(|node| property(node, "name").map(str::to_owned))
         .collect()
 }
 
@@ -1089,42 +1067,26 @@ mod tests {
     }
 
     #[test]
-    fn only_the_file_that_changed_is_re_read() {
+    fn one_changed_file_makes_the_whole_build_read_again() {
+        // Reuse is all or nothing. A finer rule lost edges — see the comment beside the
+        // decision in `draft` — and a graph that depends on how it was built is worse than
+        // one that took longer to build.
         let dir = TempDir::new("rebuild-partial");
         let one = dir.write("src/a.rs", "fn a_one() {}\nfn a_two() {}\n");
-        let two = dir.write("src/b.rs", "fn b_one() {}\n");
+        let two = dir.write("src/b.rs", "fn b_one() { a_two(); }\n");
         let mut graph = Graph::default();
         build(&dir, vec![one, two.clone()], &mut graph, 1);
+        let before = relations(&graph, CALLS);
+        assert_eq!(before, [("b_one".to_owned(), "a_two".to_owned())]);
 
-        // Only the body moves, so the names this file declares are unchanged and the
-        // other file's edges cannot have been affected.
         let edited = dir.write("src/a.rs", "fn a_one() { let x = 1; }\nfn a_two() {}\n");
         let draft = build(&dir, vec![edited, two], &mut graph, 2);
-        assert_eq!(draft.analyzed_files, 1, "one file changed");
-        assert_eq!(draft.reused_files, 1, "the other did not");
-    }
-
-    #[test]
-    fn a_changed_declaration_makes_the_whole_build_read_again() {
-        // Reuse is only sound while the names an unchanged file could refer to have not
-        // moved. Adding one means an edge from a file this build never read may have
-        // become right, and the only honest answer at syntactic precision is to read them
-        // all.
-        let dir = TempDir::new("rebuild-names-moved");
-        let one = dir.write("src/a.rs", "fn a_one() {}\n");
-        let two = dir.write("src/b.rs", "fn b_one() { added(); }\n");
-        let mut graph = Graph::default();
-        build(&dir, vec![one, two.clone()], &mut graph, 1);
-        assert!(relations(&graph, CALLS).is_empty());
-
-        let edited = dir.write("src/a.rs", "fn a_one() {}\nfn added() {}\n");
-        let draft = build(&dir, vec![edited, two], &mut graph, 2);
-        assert_eq!(draft.analyzed_files, 2, "a declared name moved");
+        assert_eq!(draft.analyzed_files, 2, "one changed, so both are read");
         assert_eq!(draft.reused_files, 0);
         assert_eq!(
             relations(&graph, CALLS),
-            [("b_one".to_owned(), "added".to_owned())],
-            "the unchanged file's call now resolves, and would not have if it were skipped"
+            before,
+            "the cross-file edge survives, which is what the finer rule could not promise"
         );
     }
 
@@ -1425,11 +1387,10 @@ mod tests {
     }
 
     #[test]
-    fn an_incremental_build_keeps_a_call_into_a_file_it_did_not_read() {
-        // A reused file's records are not in this build's plan, but a re-analyzed file can
-        // still call them. Resolving against the plan alone drops every cross-file edge out
-        // of an incremental build and puts it back on the next full one — a graph that
-        // depends on how it was built rather than on what the source says.
+    fn a_cross_file_call_survives_every_rebuild() {
+        // The property the whole reuse question is about. It holds now because a build
+        // that reads anything reads everything; the finer rule that would have made this
+        // interesting is the one that lost edges.
         let dir = TempDir::new("incremental-cross-file");
         let caller = dir.write("src/a.rs", "fn caller() { callee(); }\n");
         let callee = dir.write("src/b.rs", "fn callee() {}\n");
@@ -1438,15 +1399,132 @@ mod tests {
         let before = relations(&graph, CALLS);
         assert_eq!(before, [("caller".to_owned(), "callee".to_owned())]);
 
-        // The body changes and the declared names do not, so `b.rs` is reused.
         let edited = dir.write("src/a.rs", "fn caller() { let x = 1; callee(); }\n");
-        let draft = build(&dir, vec![edited, callee], &mut graph, 2);
-        assert_eq!(draft.analyzed_files, 1);
-        assert_eq!(draft.reused_files, 1);
+        build(&dir, vec![edited, callee], &mut graph, 2);
         assert_eq!(
             relations(&graph, CALLS),
             before,
-            "the edge survives a build that never read the file it points into"
+            "the edge survives an edit to the file it points out of"
         );
+    }
+
+    /// A graph reduced to what it says, with identifiers removed.
+    ///
+    /// Two independent builds mint different identifiers, so comparing them directly would
+    /// only ever prove they are not the same object. What has to match is what they
+    /// *assert*: which records exist, what each one says about itself, and which relations
+    /// connect which of them.
+    fn described(graph: &Graph) -> (Vec<String>, Vec<String>) {
+        let describe_node = |node: &crate::graph::Node| {
+            let mut labels: Vec<&str> =
+                node.labels.iter().map(crate::name::Label::as_str).collect();
+            labels.sort_unstable();
+            let mut properties: Vec<String> = node
+                .properties
+                .iter()
+                .map(|(key, value)| format!("{}={value:?}", key.as_str()))
+                .collect();
+            properties.sort();
+            format!("[{}] {}", labels.join(","), properties.join(" "))
+        };
+        let node_of = |reference: &NodeReference| match reference {
+            NodeReference::Local(id) => graph
+                .nodes
+                .iter()
+                .find(|node| node.id == *id)
+                .map_or_else(|| "?".to_owned(), &describe_node),
+            NodeReference::External(scoped) => format!("external:{scoped}"),
+        };
+
+        let mut nodes: Vec<String> = graph.nodes.iter().map(&describe_node).collect();
+        nodes.sort();
+        let mut edges: Vec<String> = graph
+            .edges
+            .iter()
+            .map(|edge| {
+                let mut properties: Vec<String> = edge
+                    .properties
+                    .iter()
+                    .map(|(key, value)| format!("{}={value:?}", key.as_str()))
+                    .collect();
+                properties.sort();
+                format!(
+                    "{} -[{} {}]-> {}",
+                    node_of(&edge.source),
+                    edge.relation.as_str(),
+                    properties.join(" "),
+                    node_of(&edge.target)
+                )
+            })
+            .collect();
+        edges.sort();
+        (nodes, edges)
+    }
+
+    /// A tree with cross-file calls, a trait, an impl, and a repeated call.
+    fn fixture(dir: &TempDir, body: &str) -> Vec<ScannedFile> {
+        vec![
+            dir.write(
+                "src/a.rs",
+                &format!("fn caller() {{ {body} callee(); callee(); }}\nfn only_here() {{}}\n"),
+            ),
+            dir.write(
+                "src/b.rs",
+                "pub fn callee() {}\nstruct Cursor;\ntrait Read {{ fn read(&self); }}\n",
+            ),
+            dir.write(
+                "src/c.rs",
+                "mod inner { pub fn nested() { super::super::callee(); } }\n",
+            ),
+        ]
+    }
+
+    #[test]
+    fn an_incremental_build_and_a_fresh_one_produce_the_same_graph() {
+        // The property the reuse work is answerable for, and the one a comment-only edit
+        // reporting deletions with no creations put in doubt. Identifiers are dropped
+        // before comparing: two independent builds mint different ones, and what has to
+        // match is what the graphs assert rather than which objects they are.
+        let incremental = TempDir::new("same-graph-incremental");
+        let mut built = Graph::default();
+        build(&incremental, fixture(&incremental, ""), &mut built, 1);
+        let edited = fixture(&incremental, "let x = 1;");
+        let draft = build(&incremental, edited, &mut built, 2);
+        assert_eq!(
+            draft.analyzed_files, 3,
+            "one file changed, so all three are read"
+        );
+
+        let fresh_dir = TempDir::new("same-graph-fresh");
+        let mut fresh = Graph::default();
+        build(&fresh_dir, fixture(&fresh_dir, "let x = 1;"), &mut fresh, 1);
+
+        let (built_nodes, built_edges) = described(&built);
+        let (fresh_nodes, fresh_edges) = described(&fresh);
+        assert_eq!(built_nodes, fresh_nodes, "the records must agree");
+        assert_eq!(built_edges, fresh_edges, "the relations must agree");
+    }
+
+    #[test]
+    fn a_forced_rebuild_and_an_incremental_one_produce_the_same_graph() {
+        // The same property from the other side: reuse must not be the reason a graph
+        // differs, so redoing the work over the same source must reach the same place.
+        let dir = TempDir::new("same-graph-forced");
+        let mut incremental = Graph::default();
+        build(&dir, fixture(&dir, ""), &mut incremental, 1);
+        build(&dir, fixture(&dir, "let x = 1;"), &mut incremental, 2);
+
+        let forced_dir = TempDir::new("same-graph-forced-full");
+        let mut forced = Graph::default();
+        build(&forced_dir, fixture(&forced_dir, ""), &mut forced, 1);
+        build_with(
+            &forced_dir,
+            fixture(&forced_dir, "let x = 1;"),
+            &mut forced,
+            2,
+            true,
+        );
+
+        assert_eq!(described(&incremental), described(&forced));
     }
 }
