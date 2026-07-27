@@ -90,6 +90,10 @@ pub enum DiagnosticCode {
     /// A warning: the declaration stays, the reachable results are returned, and the
     /// result summary reports itself partial.
     LinkUnavailable,
+    /// A change set breaks a rule decidable without a database.
+    ChangeSetInvalid,
+    /// The `change_set_version` is not one this build reads.
+    ChangeSetVersionUnsupported,
     /// Recursive traversal reached a canonical source it had already opened.
     LinkCycle,
     /// Recursive traversal reached a configured depth or database limit.
@@ -135,7 +139,7 @@ impl DiagnosticCode {
     /// Every code, in registry order.
     ///
     /// The root workspace compares this against the `nostdb-spec` registry.
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 33] = [
         Self::NostParseError,
         Self::NostVersionUnsupported,
         Self::NostDuplicateLinkAlias,
@@ -152,6 +156,8 @@ impl DiagnosticCode {
         Self::SettingsInvalid,
         Self::SettingsVersionUnsupported,
         Self::LinkUnavailable,
+        Self::ChangeSetInvalid,
+        Self::ChangeSetVersionUnsupported,
         Self::LinkCycle,
         Self::LinkLimitExceeded,
         Self::NostUnknownLinkAlias,
@@ -189,6 +195,8 @@ impl DiagnosticCode {
             Self::SettingsInvalid => "SETTINGS_INVALID",
             Self::SettingsVersionUnsupported => "SETTINGS_VERSION_UNSUPPORTED",
             Self::LinkUnavailable => "LINK_UNAVAILABLE",
+            Self::ChangeSetInvalid => "CHANGE_SET_INVALID",
+            Self::ChangeSetVersionUnsupported => "CHANGE_SET_VERSION_UNSUPPORTED",
             Self::LinkCycle => "LINK_CYCLE",
             Self::LinkLimitExceeded => "LINK_LIMIT_EXCEEDED",
             Self::NostUnknownLinkAlias => "NOST_UNKNOWN_LINK_ALIAS",

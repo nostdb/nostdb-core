@@ -49,6 +49,7 @@ pub mod apply;
 pub mod build;
 pub mod cache;
 pub mod change;
+pub mod change_document;
 pub mod container;
 pub mod contribution;
 pub mod coverage;
