@@ -816,6 +816,50 @@ impl Project {
         })
     }
 
+    /// The caches this project may read, in the order the contract fixes.
+    ///
+    /// `user_directory` names the user's own `~/.nostdb`. Passing `None` disables the user
+    /// tier, which section 17.7 permits a project to do; the project tier is always
+    /// present, because it is where this project's own artifacts belong.
+    #[must_use]
+    pub fn cache_layout(&self, user_directory: Option<&Path>) -> crate::cache::CacheLayout {
+        let layout =
+            crate::cache::CacheLayout::none().with_project(&Self::state_directory(&self.root));
+        match user_directory {
+            Some(path) => layout.with_user(path),
+            None => layout,
+        }
+    }
+
+    /// Creates the project cache directory and keeps it out of version control.
+    ///
+    /// `.nostdb` as a whole is not excluded — the database inside it is meant to be shared
+    /// — so the cache needs its own exclusion, and section 17.7 requires that neither cache
+    /// is committed by default. Writing the file is what makes that true rather than
+    /// advisory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::Io`] when the directory or the file cannot be written.
+    pub fn prepare_cache(&self) -> Result<PathBuf, ProjectError> {
+        let directory =
+            Self::state_directory(&self.root).join(crate::cache::PROJECT_CACHE_DIRECTORY);
+        std::fs::create_dir_all(&directory).map_err(|error| ProjectError::Io {
+            path: directory.clone(),
+            error,
+        })?;
+        let ignore = directory.join(crate::cache::CACHE_IGNORE_FILE);
+        if !ignore.exists() {
+            std::fs::write(&ignore, crate::cache::CACHE_IGNORE_CONTENTS).map_err(|error| {
+                ProjectError::Io {
+                    path: ignore.clone(),
+                    error,
+                }
+            })?;
+        }
+        Ok(directory)
+    }
+
     /// Where the multi-file journal lives.
     #[must_use]
     pub fn journal_path(&self) -> PathBuf {
@@ -1915,5 +1959,55 @@ mod tests {
             second.generation, first.generation,
             "nothing changed, so nothing is committed"
         );
+    }
+
+    #[test]
+    fn a_cache_is_kept_out_of_version_control_by_the_engine_rather_than_by_advice() {
+        // `.nostdb` as a whole is not excluded — the database inside it is meant to be
+        // shared — so the cache needs its own exclusion.
+        let dir = TempDir::new("cache-ignore");
+        let project = Project::initialize(dir.path()).unwrap();
+        let directory = project.prepare_cache().unwrap();
+
+        let ignore = directory.join(crate::cache::CACHE_IGNORE_FILE);
+        assert!(ignore.is_file());
+        assert!(fs::read_to_string(&ignore).unwrap().contains('*'));
+
+        // A second call must not overwrite a file somebody edited.
+        fs::write(&ignore, "*\n!keep-this\n").unwrap();
+        project.prepare_cache().unwrap();
+        assert!(fs::read_to_string(&ignore).unwrap().contains("keep-this"));
+    }
+
+    #[test]
+    fn the_project_cache_is_read_before_the_users_and_the_users_can_be_left_out() {
+        let dir = TempDir::new("cache-layout");
+        let project = Project::initialize(dir.path()).unwrap();
+        let home = dir.path().join("home").join(".nostdb");
+
+        let both = project.cache_layout(Some(&home));
+        let tiers = both.tiers();
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[0].0, crate::cache::CacheTier::Project);
+        assert!(tiers[0].1.starts_with(dir.path()));
+
+        let project_only = project.cache_layout(None);
+        assert_eq!(project_only.tiers().len(), 1);
+        assert!(!project_only.uses_user_tier());
+    }
+
+    #[test]
+    fn the_cache_directory_is_never_analyzed() {
+        // It sits inside `.nostdb`, which the scanner prunes. Feeding cached artifacts back
+        // into the analysis that produced them would be a loop.
+        let dir = TempDir::new("cache-not-scanned");
+        let project = Project::initialize(dir.path()).unwrap();
+        let directory = project.prepare_cache().unwrap();
+        fs::write(directory.join("looks-like-source.rs"), "fn cached() {}\n").unwrap();
+        fs::write(dir.path().join("real.rs"), "fn real() {}\n").unwrap();
+
+        let scan = project.scan(&crate::scan::ScanOptions::default()).unwrap();
+        let paths: Vec<&str> = scan.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, ["real.rs"]);
     }
 }

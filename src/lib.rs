@@ -47,6 +47,7 @@ pub mod analysis;
 pub mod analyze;
 pub mod apply;
 pub mod build;
+pub mod cache;
 pub mod change;
 pub mod container;
 pub mod contribution;
