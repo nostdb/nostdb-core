@@ -278,7 +278,7 @@ fn accepted_fixtures_convert_to_a_graph_and_back_without_losing_content() {
 
     assert!(converted > 0, "no fixture exercised conversion");
     println!(
-        "nost conformance: {converted} fixtures round-tripped through a graph, \
-         {deferred} deferred pending link resolution"
+        "nost conformance: {converted} graph round trips verified, {deferred} deferred \
+         pending link resolution"
     );
 }
