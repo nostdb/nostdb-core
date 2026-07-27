@@ -167,17 +167,36 @@ pub fn apply(
 
     let mut working = graph.clone();
     let mut summary = ApplySummary::default();
+    // A rebuild withdraws its previous claim and then restates it, so a record it
+    // re-asserts was deleted and created within one set. Reporting that as a deletion and
+    // a creation would make an unchanged rebuild read as though it churned the whole
+    // database; the net effect is an update, and that is what is counted.
+    let mut retired = Retired::default();
 
     for operation in &change_set.operations {
         match operation {
             GraphOperation::UpsertNode(draft) => {
-                upsert_node(&mut working, draft, &change_set.owner, minter, &mut summary);
+                upsert_node(
+                    &mut working,
+                    draft,
+                    &change_set.owner,
+                    minter,
+                    &mut summary,
+                    &mut retired,
+                );
             }
             GraphOperation::UpsertEdge(draft) => {
-                upsert_edge(&mut working, draft, &change_set.owner, minter, &mut summary)?;
+                upsert_edge(
+                    &mut working,
+                    draft,
+                    &change_set.owner,
+                    minter,
+                    &mut summary,
+                    &mut retired,
+                )?;
             }
             GraphOperation::RemoveContribution(key) => {
-                remove_contribution(&mut working, key, &mut summary);
+                remove_contribution(&mut working, key, &mut summary, &mut retired);
             }
             GraphOperation::ResolvePlaceholder(resolution) => {
                 if !working
@@ -217,6 +236,13 @@ pub fn apply(
     Ok(summary)
 }
 
+/// Records deleted earlier in the same set, so restating one counts as an update.
+#[derive(Default)]
+struct Retired {
+    nodes: BTreeSet<LocalNodeId>,
+    edges: BTreeSet<LocalEdgeId>,
+}
+
 /// Merges one producer's claim into a node, creating it when it is not there.
 fn upsert_node(
     graph: &mut Graph,
@@ -224,6 +250,7 @@ fn upsert_node(
     owner: &Owner,
     minter: &mut Minter,
     summary: &mut ApplySummary,
+    retired: &mut Retired,
 ) {
     let contribution = Contribution {
         owner: owner.clone(),
@@ -252,7 +279,12 @@ fn upsert_node(
         properties: draft.properties.clone(),
         contributions: vec![contribution],
     });
-    summary.nodes_created += 1;
+    if retired.nodes.remove(&id) {
+        summary.nodes_deleted -= 1;
+        summary.nodes_updated += 1;
+    } else {
+        summary.nodes_created += 1;
+    }
 }
 
 /// Merges one producer's claim into an edge, creating it when it is not there.
@@ -262,6 +294,7 @@ fn upsert_edge(
     owner: &Owner,
     minter: &mut Minter,
     summary: &mut ApplySummary,
+    retired: &mut Retired,
 ) -> Result<(), ApplyError> {
     for endpoint in [&draft.source, &draft.target] {
         match endpoint {
@@ -305,12 +338,22 @@ fn upsert_edge(
         properties: draft.properties.clone(),
         contributions: vec![contribution],
     });
-    summary.edges_created += 1;
+    if retired.edges.remove(&id) {
+        summary.edges_deleted -= 1;
+        summary.edges_updated += 1;
+    } else {
+        summary.edges_created += 1;
+    }
     Ok(())
 }
 
 /// Drops one `(owner, source unit)` claim from every record, deleting what nothing asserts.
-fn remove_contribution(graph: &mut Graph, key: &ContributionKey, summary: &mut ApplySummary) {
+fn remove_contribution(
+    graph: &mut Graph,
+    key: &ContributionKey,
+    summary: &mut ApplySummary,
+    retired: &mut Retired,
+) {
     let matches = |contribution: &Contribution| {
         contribution.owner == key.owner && contribution.source_unit == key.source_unit
     };
@@ -337,6 +380,8 @@ fn remove_contribution(graph: &mut Graph, key: &ContributionKey, summary: &mut A
 
     summary.nodes_deleted += orphaned.len() as u64;
     summary.edges_deleted += orphaned_edges.len() as u64;
+    retired.nodes.extend(orphaned.iter().copied());
+    retired.edges.extend(orphaned_edges.iter().copied());
     graph.nodes.retain(|node| !orphaned.contains(&node.id));
     graph
         .edges

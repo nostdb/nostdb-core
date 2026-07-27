@@ -281,6 +281,8 @@ pub fn draft(
         }));
     }
 
+    let known_edges = existing_edges(graph);
+
     // Containment: from the file to each top-level record, and from each record to its
     // children. Emitted after every node, so no edge can name an endpoint not yet drafted.
     for (index, (path, unit, _, _)) in units.iter().enumerate() {
@@ -296,6 +298,7 @@ pub fn draft(
                 CONTAINS,
                 *unit,
                 &locator,
+                &known_edges,
             );
         }
     }
@@ -309,6 +312,7 @@ pub fn draft(
                 CONTAINS,
                 record.unit,
                 &locator,
+                &known_edges,
             );
         }
     }
@@ -327,6 +331,7 @@ pub fn draft(
                         CALLS,
                         record.unit,
                         &locator,
+                        &known_edges,
                     );
                 }
                 // Counted, not invented. See the module documentation.
@@ -344,6 +349,7 @@ pub fn draft(
                         IMPLEMENTS,
                         record.unit,
                         &locator,
+                        &known_edges,
                     );
                 }
                 None => unresolved += 1,
@@ -362,6 +368,7 @@ pub fn draft(
                         FOR_TYPE,
                         record.unit,
                         &locator,
+                        &known_edges,
                     );
                 }
                 _ => unresolved += 1,
@@ -436,6 +443,26 @@ fn existing_names(graph: &Graph, unit: SourceUnitId) -> BTreeMap<(String, i64), 
             let qualified = property(node, "qualified_name")?.to_owned();
             let ordinal = integer(node, "ordinal").unwrap_or(0);
             Some(((qualified, ordinal), node.id))
+        })
+        .collect()
+}
+
+/// Every edge identifier this analyzer already holds, keyed by what the edge connects.
+fn existing_edges(
+    graph: &Graph,
+) -> BTreeMap<(LocalNodeId, LocalNodeId, String), crate::id::LocalEdgeId> {
+    let owner = analyzer_owner();
+    graph
+        .edges
+        .iter()
+        .filter(|edge| edge.contributions.iter().any(|held| held.owner == owner))
+        .filter_map(|edge| {
+            let (NodeReference::Local(from), NodeReference::Local(to)) =
+                (&edge.source, &edge.target)
+            else {
+                return None;
+            };
+            Some(((*from, *to, edge.relation.as_str().to_owned()), edge.id))
         })
         .collect()
 }
@@ -521,12 +548,19 @@ fn push_edge(
     relation: &str,
     unit: SourceUnitId,
     locator: &CanonicalSourceLocator,
+    known: &BTreeMap<(LocalNodeId, LocalNodeId, String), crate::id::LocalEdgeId>,
 ) {
     let Ok(relation) = RelationName::new(relation) else {
         return;
     };
+    // An edge is identified by what it connects and what it is. A rebuild that finds the
+    // same relation between the same two records reuses its identifier rather than minting
+    // one, so an unchanged tree does not churn five thousand edges every build.
+    let id = known
+        .get(&(from, to, relation.as_str().to_owned()))
+        .copied();
     change_set.push(GraphOperation::UpsertEdge(EdgeDraft {
-        id: None,
+        id,
         source: NodeReference::Local(from),
         target: NodeReference::Local(to),
         relation,
@@ -1033,5 +1067,62 @@ mod tests {
             .find(|node| node.labels.iter().any(|held| held.as_str() == FILE_LABEL))
             .expect("the file record");
         assert_eq!(property(node, "digest"), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn an_unchanged_rebuild_reports_updates_rather_than_churn() {
+        // A rebuild withdraws its claim and restates it, so every record is deleted and
+        // recreated inside one change set. Reporting that as thousands of deletions and
+        // creations would make an unchanged tree look like it rewrote the whole database.
+        let dir = TempDir::new("rebuild-counts");
+        let file = dir.write(
+            "src/main.rs",
+            "fn main() { helper(); }\nfn helper() {}\nstruct S { a: u32 }\n",
+        );
+        let mut graph = Graph::default();
+        build(&dir, vec![file.clone()], &mut graph, 1);
+        let nodes = graph.nodes.len();
+        let edges = graph.edges.len();
+
+        let scan = Scan {
+            files: vec![file],
+            skipped: Vec::new(),
+        };
+        let mut minter = Minter::new();
+        let draft = super::draft(
+            dir.path(),
+            &scan,
+            &graph,
+            &builtin_registry().expect("the registry"),
+            "tree:sha256:test",
+            2,
+            &mut minter,
+        );
+        let summary = crate::apply::apply(&mut graph, &draft.change_set, 2, &mut minter)
+            .expect("the draft applies");
+
+        assert_eq!(summary.nodes_created, 0, "{summary:?}");
+        assert_eq!(summary.nodes_deleted, 0, "{summary:?}");
+        assert_eq!(summary.nodes_updated as usize, nodes);
+        assert_eq!(summary.edges_created, 0, "{summary:?}");
+        assert_eq!(summary.edges_deleted, 0, "{summary:?}");
+        assert_eq!(summary.edges_updated as usize, edges);
+    }
+
+    #[test]
+    fn an_edge_keeps_its_identifier_across_a_rebuild() {
+        let dir = TempDir::new("rebuild-edges");
+        let file = dir.write("src/main.rs", "fn main() { helper(); }\nfn helper() {}\n");
+        let mut graph = Graph::default();
+        build(&dir, vec![file.clone()], &mut graph, 1);
+        let mut before: Vec<crate::id::LocalEdgeId> =
+            graph.edges.iter().map(|edge| edge.id).collect();
+        before.sort();
+
+        build(&dir, vec![file], &mut graph, 2);
+        let mut after: Vec<crate::id::LocalEdgeId> =
+            graph.edges.iter().map(|edge| edge.id).collect();
+        after.sort();
+        assert_eq!(before, after, "an unchanged relation is the same edge");
     }
 }
