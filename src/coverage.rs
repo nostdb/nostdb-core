@@ -55,6 +55,12 @@ pub enum SkipReason {
     Binary,
     /// Reached through a symlink cycle.
     SymlinkCycle,
+    /// A symbolic link, and following was not enabled.
+    ///
+    /// Recorded rather than passed over. Following is off by default, so a project that
+    /// keeps real source behind a link would otherwise show a build that covered
+    /// everything while the link's target was never read.
+    Symlink,
 }
 
 impl fmt::Display for SkipReason {
@@ -68,6 +74,7 @@ impl fmt::Display for SkipReason {
             Self::TooLarge => "too large",
             Self::Binary => "binary",
             Self::SymlinkCycle => "symlink cycle",
+            Self::Symlink => "symlink not followed",
         })
     }
 }
