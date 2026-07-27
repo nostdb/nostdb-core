@@ -14,7 +14,8 @@
 //! its positions legitimately differ. What is required is rejection with a range.
 
 use nostdb_core::diagnostic::{DiagnosticCode, Severity};
-use nostdb_core::nost::{format, parse, validate};
+use nostdb_core::nost::convert::ConversionError;
+use nostdb_core::nost::{format, from_graph, parse, to_graph, validate};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
@@ -224,4 +225,60 @@ fn accepted_fixtures_round_trip_through_the_formatter() {
         "the accepted suite should exercise comment preservation"
     );
     println!("nost conformance: round trip verified, {comments_seen} comments preserved");
+}
+
+#[test]
+fn accepted_fixtures_convert_to_a_graph_and_back_without_losing_content() {
+    // The strongest form of the round trip root PRD section 30.2 requires: not that the
+    // text survives, but that the *graph* does. Text cannot survive byte for byte on the
+    // first pass, because a declaration name and the schema-versus-labels split are
+    // file-local rather than graph data. Both are stable, so the second pass is a fixed
+    // point, and that is what is asserted here.
+    let Some(directory) = category("valid") else {
+        println!("nost conformance: skipped, NOSTDB_SPEC_FIXTURES is unset");
+        return;
+    };
+
+    let mut converted = 0_usize;
+    let mut deferred = 0_usize;
+    for path in &fixtures(&directory) {
+        let name = path.display();
+        let parsed = parse(&read(path)).unwrap_or_else(|error| panic!("{name}: {error}"));
+
+        let graph = match to_graph(&parsed) {
+            Ok(graph) => graph,
+            Err(error @ ConversionError::ExternalEndpoint { .. }) => {
+                // Link resolution is Stage 7 increment 4. Refusing is deliberate: the
+                // alternative is degrading an external reference into a local
+                // Placeholder that would export as something else entirely.
+                deferred += 1;
+                assert!(error.range().is_some(), "{name}: {error} needs a range");
+                continue;
+            }
+            Err(error) => panic!("{name}: must convert but did not: {error}"),
+        };
+
+        let exported = format(&from_graph(&graph));
+        let reparsed = parse(&exported)
+            .unwrap_or_else(|error| panic!("{name}: exported text must parse: {error}"));
+        let reimported = to_graph(&reparsed)
+            .unwrap_or_else(|error| panic!("{name}: exported text must convert: {error}"));
+        assert_eq!(
+            reimported, graph,
+            "{name}: graph content changed:\n{exported}"
+        );
+
+        let again = format(&from_graph(&reimported));
+        assert_eq!(
+            again, exported,
+            "{name}: export is not a fixed point:\n{exported}"
+        );
+        converted += 1;
+    }
+
+    assert!(converted > 0, "no fixture exercised conversion");
+    println!(
+        "nost conformance: {converted} fixtures round-tripped through a graph, \
+         {deferred} deferred pending link resolution"
+    );
 }

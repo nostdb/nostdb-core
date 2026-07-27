@@ -112,6 +112,24 @@ macro_rules! validated_name {
                 Ok(Self(value))
             }
 
+            /// Wraps a value the caller has proven valid.
+            ///
+            /// This exists so an infallible construction can be written without
+            /// `unwrap`, keeping the crate's no-panic guarantee. It is crate-internal,
+            /// and the debug assertion catches a mistaken caller during development.
+            ///
+            /// The macro generates one per name type and only some are called, which is
+            /// the ordinary cost of generating five types from one definition.
+            #[allow(dead_code)]
+            pub(crate) fn literal(value: impl Into<String>) -> Self {
+                let value = value.into();
+                debug_assert!(
+                    validate(&value).is_ok(),
+                    "a name passed to `literal` must be valid"
+                );
+                Self(value)
+            }
+
             /// Borrows the name.
             #[must_use]
             pub fn as_str(&self) -> &str {

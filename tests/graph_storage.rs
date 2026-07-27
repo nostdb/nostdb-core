@@ -199,3 +199,85 @@ fn corrupting_a_committed_graph_is_reported_rather_than_returning_a_partial_grap
     // The container checksum catches it before any payload is interpreted.
     assert!(Database::open(&path).is_err());
 }
+
+#[test]
+fn a_nost_document_survives_a_trip_through_a_real_database_file() {
+    // The whole path `nostdb convert` walks in both directions, which root PRD section
+    // 20.3 requires and section 30.2 requires be tested: read a `.nost` document, commit
+    // it to a real file, reopen that file, and write the document back out.
+    use nostdb_core::nost::{format, from_graph, parse, to_graph};
+
+    let source = "@nost 2\n\
+        \n\
+        @link \"./packages/child\"\n\
+        @link \"./packages/shared\" as shared\n\
+        \n\
+        schema Function {\n\
+        \x20 name: string,\n\
+        \x20 aliases?: string[],\n\
+        \x20 labels?: string[],\n\
+        }\n\
+        \n\
+        node login: Function {\n\
+        \x20 id: \"n_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\",\n\
+        \x20 name: \"login\",\n\
+        \x20 aliases: [\"signin\"],\n\
+        \x20 labels: [\"Public\"],\n\
+        \n\
+        \x20 @by analyzer \"rust-structural\" \"0.1.0\" \
+        unit \"u_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\" {\n\
+        \x20   @evidence {\n\
+        \x20     source: \"./\",\n\
+        \x20     path: \"src/auth.rs\",\n\
+        \x20     digest: \"sha256:cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30\",\n\
+        \x20     range: \"12:1:340-40:2:1180\",\n\
+        \x20     method: deterministic,\n\
+        \x20     confidence: extracted,\n\
+        \x20   }\n\
+        \x20 }\n\
+        \n\
+        \x20 @by user {}\n\
+        }\n\
+        \n\
+        node primary: Function {\n\
+        \x20 id: \"n_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c\",\n\
+        \x20 name: \"primary\",\n\
+        }\n\
+        \n\
+        edge login -> primary :CALLS {\n\
+        \x20 id: \"e_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d\",\n\
+        }\n";
+
+    let dir = TempDir::new("nost-convert");
+    let path = dir.join("root.nostdb");
+
+    let imported = to_graph(&parse(source).expect("must parse")).expect("must convert");
+    let mut database = Database::create(&path).unwrap();
+    commit_graph(&mut database, &imported).unwrap();
+    drop(database);
+
+    // Reopen from disk, so this proves the bytes carry the document.
+    let reopened = Database::open(&path).unwrap();
+    let stored = read_graph(&reopened).unwrap();
+    assert_eq!(stored, imported);
+
+    let exported = format(&from_graph(&stored));
+    let reimported = to_graph(&parse(&exported).expect("exported text must parse"))
+        .expect("exported text must convert");
+    assert_eq!(reimported, imported, "content changed:\n{exported}");
+
+    // Ownership survived the trip. Without contribution blocks in the language, both of
+    // these would have come back owned by the user, and an analyzer refresh would then
+    // be free to replace what a person wrote by hand.
+    let contributions = &stored.nodes[0].contributions;
+    assert_eq!(contributions.len(), 2);
+    assert!(matches!(contributions[0].owner, Owner::Analyzer { .. }));
+    assert_eq!(contributions[1].owner, Owner::User);
+    assert_eq!(
+        contributions[0].evidence[0].producer.as_str(),
+        "rust-structural"
+    );
+
+    // And the exported text is a fixed point.
+    assert_eq!(format(&from_graph(&reimported)), exported);
+}

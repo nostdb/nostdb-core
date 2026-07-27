@@ -21,6 +21,7 @@
 //! them needs meaning rather than shape. [`validate`] reports those, each with the
 //! stable diagnostic code the contract assigns.
 
+pub mod convert;
 pub mod format;
 pub mod lexer;
 pub mod parser;
@@ -32,6 +33,7 @@ pub use crate::schema::{FieldType, ScalarType};
 use crate::text::NonEmptyText;
 use std::fmt;
 
+pub use convert::{ConversionError, from_graph, to_graph};
 pub use format::format;
 pub use parser::parse;
 pub use validate::validate;
