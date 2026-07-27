@@ -164,6 +164,33 @@ impl<'a> Transaction<'a> {
         self.run_federated(query, parameters, &[])
     }
 
+    /// Runs one query that can be asked to stop.
+    ///
+    /// The cancellation is cooperative and observed at part, clause, and match-row boundaries;
+    /// [`crate::cancel`] states the granularity. A stopped query leaves this transaction's copy
+    /// partly modified, exactly as a refused one does, and [`Transaction::rollback`] discards it.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Transaction::run`], plus `QUERY_CANCELLED` when `cancel` asks it to stop.
+    pub fn run_cancellable(
+        &mut self,
+        query: &Query,
+        parameters: &Parameters,
+        cancel: &dyn crate::cancel::ShouldStop,
+    ) -> Result<QueryResult, QueryError> {
+        let result = crate::execute::execute_federated_cancellable(
+            query,
+            &mut self.graph,
+            &[],
+            parameters,
+            &self.context,
+            cancel,
+        )?;
+        self.accumulate(result.writes);
+        Ok(result)
+    }
+
     /// Runs one query over this database and the linked sources it was given.
     ///
     /// A read sees the union; a write touches this database alone. A write naming a

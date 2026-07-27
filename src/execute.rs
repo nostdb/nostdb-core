@@ -35,6 +35,7 @@
 //! It is the obvious thing to revisit when there is a benchmark to justify a change, which
 //! the root product contract defers to a measured baseline.
 
+use crate::cancel::{Never, ShouldStop};
 use crate::cypher::{
     BinaryOperator, Clause, Direction, Expression, LengthRange, NodePattern, Pattern,
     ProcedureCall, Projection, ProjectionItem, Query, QueryError, QueryPart, RelationshipPattern,
@@ -1605,6 +1606,24 @@ pub fn execute(
     execute_federated(query, graph, &[], parameters, context)
 }
 
+/// Runs a query that can be asked to stop.
+///
+/// The cancellation is cooperative and is observed at part, clause, and match-row boundaries.
+/// [`crate::cancel`] states the granularity and why it is stated rather than implied.
+///
+/// # Errors
+///
+/// The same as [`execute`], plus `QUERY_CANCELLED` when `cancel` asks it to stop.
+pub fn execute_cancellable(
+    query: &Query,
+    graph: &mut Graph,
+    parameters: &Parameters,
+    context: &DatabaseContext,
+    cancel: &dyn ShouldStop,
+) -> Result<QueryResult, QueryError> {
+    execute_federated_cancellable(query, graph, &[], parameters, context, cancel)
+}
+
 /// Runs a query over the root and every linked source it was given.
 ///
 /// A read sees the union; a write touches the root alone. A write naming a record from a
@@ -1622,6 +1641,22 @@ pub fn execute_federated(
     parameters: &Parameters,
     context: &DatabaseContext,
 ) -> Result<QueryResult, QueryError> {
+    execute_federated_cancellable(query, graph, linked, parameters, context, &Never)
+}
+
+/// Runs a federated query that can be asked to stop.
+///
+/// # Errors
+///
+/// The same as [`execute_federated`], plus `QUERY_CANCELLED` when `cancel` asks it to stop.
+pub fn execute_federated_cancellable(
+    query: &Query,
+    graph: &mut Graph,
+    linked: &[LinkedSource<'_>],
+    parameters: &Parameters,
+    context: &DatabaseContext,
+    cancel: &dyn ShouldStop,
+) -> Result<QueryResult, QueryError> {
     // Records this query creates receive a minted UUID version 7. The generation they
     // commit at no longer takes part, because an identifier is no longer derived from it.
     let mut minter = Minter::new();
@@ -1631,12 +1666,16 @@ pub fn execute_federated(
     let mut all_rows: Vec<Vec<QueryValue>> = Vec::new();
 
     for (index, part) in query.parts.iter().enumerate() {
+        stop_if_asked(cancel)?;
         let (part_columns, part_rows) = run_part(
             part,
             graph,
-            linked,
-            parameters,
-            context,
+            &Run {
+                linked,
+                parameters,
+                context,
+                cancel,
+            },
             &mut minter,
             &mut writes,
         )?;
@@ -1660,12 +1699,38 @@ pub fn execute_federated(
     })
 }
 
+/// Asks whether to stop, and reports `QUERY_CANCELLED` if so.
+///
+/// The range is [`SourceRange::ORIGIN`] because a cancellation is not a fault in the source:
+/// nothing in the query is wrong, and pointing at a token would send a reader looking for a
+/// mistake that is not there.
+fn stop_if_asked(cancel: &dyn ShouldStop) -> Result<(), QueryError> {
+    if cancel.should_stop() {
+        return Err(QueryError::at(
+            DiagnosticCode::QueryCancelled,
+            cancel.reason(),
+            SourceRange::ORIGIN,
+        ));
+    }
+    Ok(())
+}
+
+/// The parts of one execution that every clause reads and no clause changes.
+///
+/// Grouped rather than passed one by one. Threading the cancellation token through pushed the
+/// argument list past what is readable, and four of the arguments were already travelling together
+/// unchanged from the top of the query to the innermost clause.
+struct Run<'a> {
+    linked: &'a [LinkedSource<'a>],
+    parameters: &'a Parameters,
+    context: &'a DatabaseContext,
+    cancel: &'a dyn ShouldStop,
+}
+
 fn run_part(
     part: &QueryPart,
     graph: &mut Graph,
-    linked: &[LinkedSource<'_>],
-    parameters: &Parameters,
-    context: &DatabaseContext,
+    run: &Run<'_>,
     minter: &mut Minter,
     writes: &mut WriteSummary,
 ) -> Result<(Vec<String>, Vec<Vec<QueryValue>>), QueryError> {
@@ -1675,6 +1740,7 @@ fn run_part(
     let mut call_columns: Option<Vec<String>> = None;
 
     for clause in &part.clauses {
+        stop_if_asked(run.cancel)?;
         let was_call = matches!(clause, Clause::Call(_));
         match clause {
             Clause::Match {
@@ -1682,11 +1748,20 @@ fn run_part(
                 patterns,
                 predicate,
             } => {
-                let executor = Executor::new(source_list(graph, linked), parameters, context);
-                rows = run_match(&executor, *optional, patterns, predicate.as_ref(), rows)?;
+                let executor =
+                    Executor::new(source_list(graph, run.linked), run.parameters, run.context);
+                rows = run_match(
+                    &executor,
+                    *optional,
+                    patterns,
+                    predicate.as_ref(),
+                    rows,
+                    run.cancel,
+                )?;
             }
             Clause::Unwind { list, variable } => {
-                let executor = Executor::new(source_list(graph, linked), parameters, context);
+                let executor =
+                    Executor::new(source_list(graph, run.linked), run.parameters, run.context);
                 let mut next = Vec::new();
                 for bindings in rows {
                     // UNWIND of a non-list produces no rows, matching Cypher's treatment
@@ -1702,7 +1777,8 @@ fn run_part(
                 rows = next;
             }
             Clause::With(projection) => {
-                let executor = Executor::new(source_list(graph, linked), parameters, context);
+                let executor =
+                    Executor::new(source_list(graph, run.linked), run.parameters, run.context);
                 let (names, projected) = apply_projection(&executor, projection, rows)?;
                 // WITH opens a new scope: only the projected names survive.
                 rows = projected
@@ -1711,7 +1787,8 @@ fn run_part(
                     .collect();
             }
             Clause::Call(call) => {
-                let executor = Executor::new(source_list(graph, linked), parameters, context);
+                let executor =
+                    Executor::new(source_list(graph, run.linked), run.parameters, run.context);
                 let (names, next) = executor.run_call(call, rows)?;
                 rows = next;
                 call_columns = Some(names);
@@ -1720,7 +1797,8 @@ fn run_part(
                 // Every map value is evaluated against the graph as this clause found it,
                 // so one row's write cannot change what another row assigns.
                 let evaluated: Vec<Vec<PatternValues>> = {
-                    let executor = Executor::new(source_list(graph, linked), parameters, context);
+                    let executor =
+                        Executor::new(source_list(graph, run.linked), run.parameters, run.context);
                     rows.iter()
                         .map(|bindings| {
                             patterns
@@ -1743,8 +1821,11 @@ fn run_part(
                 let mut next = Vec::with_capacity(rows.len());
                 for bindings in rows {
                     let found = {
-                        let executor =
-                            Executor::new(source_list(graph, linked), parameters, context);
+                        let executor = Executor::new(
+                            source_list(graph, run.linked),
+                            run.parameters,
+                            run.context,
+                        );
                         executor.match_pattern(pattern, &bindings)?
                     };
                     if !found.is_empty() {
@@ -1752,8 +1833,11 @@ fn run_part(
                         continue;
                     }
                     let values = {
-                        let executor =
-                            Executor::new(source_list(graph, linked), parameters, context);
+                        let executor = Executor::new(
+                            source_list(graph, run.linked),
+                            run.parameters,
+                            run.context,
+                        );
                         executor.pattern_values(pattern, &bindings)?
                     };
                     let mut created = bindings;
@@ -1765,7 +1849,8 @@ fn run_part(
             }
             Clause::Set { items, range } => {
                 let evaluated: Vec<Vec<Option<QueryValue>>> = {
-                    let executor = Executor::new(source_list(graph, linked), parameters, context);
+                    let executor =
+                        Executor::new(source_list(graph, run.linked), run.parameters, run.context);
                     rows.iter()
                         .map(|bindings| {
                             items
@@ -1811,7 +1896,8 @@ fn run_part(
                 range,
             } => {
                 let evaluated: Vec<Vec<QueryValue>> = {
-                    let executor = Executor::new(source_list(graph, linked), parameters, context);
+                    let executor =
+                        Executor::new(source_list(graph, run.linked), run.parameters, run.context);
                     rows.iter()
                         .map(|bindings| {
                             targets
@@ -1836,7 +1922,8 @@ fn run_part(
 
     match &part.result {
         Some(projection) => {
-            let executor = Executor::new(source_list(graph, linked), parameters, context);
+            let executor =
+                Executor::new(source_list(graph, run.linked), run.parameters, run.context);
             apply_projection(&executor, projection, rows)
         }
         // A trailing `CALL` produces the columns it yields.
@@ -1865,9 +1952,11 @@ fn run_match(
     patterns: &[Pattern],
     predicate: Option<&Expression>,
     rows: Vec<Bindings>,
+    cancel: &dyn ShouldStop,
 ) -> Result<Vec<Bindings>, QueryError> {
     let mut next = Vec::new();
     for bindings in rows {
+        stop_if_asked(cancel)?;
         let mut expanded = vec![bindings.clone()];
         for pattern in patterns {
             let mut grown = Vec::new();

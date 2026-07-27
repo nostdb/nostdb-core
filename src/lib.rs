@@ -48,6 +48,7 @@ pub mod analyze;
 pub mod apply;
 pub mod build;
 pub mod cache;
+pub mod cancel;
 pub mod change;
 pub mod change_document;
 pub mod container;

@@ -112,6 +112,12 @@ pub enum DiagnosticCode {
     CypherUnsupported,
     /// The query is inside the subset but meaningless.
     CypherSemanticError,
+    /// The query was asked to stop before it finished.
+    ///
+    /// Cooperative: execution asks at part, clause, and match-row boundaries, so this reports a
+    /// query that was stopped rather than one that was interrupted mid-operation. See
+    /// [`crate::cancel`].
+    QueryCancelled,
     /// A write named a record belonging to a linked source.
     ///
     /// This build cannot emit it, and that is worth stating rather than leaving a reader
@@ -139,7 +145,7 @@ impl DiagnosticCode {
     /// Every code, in registry order.
     ///
     /// The root workspace compares this against the `nostdb-spec` registry.
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::NostParseError,
         Self::NostVersionUnsupported,
         Self::NostDuplicateLinkAlias,
@@ -167,6 +173,7 @@ impl DiagnosticCode {
         Self::NostInvalidDatetime,
         Self::CypherUnsupported,
         Self::CypherSemanticError,
+        Self::QueryCancelled,
         Self::LinkedDatabaseReadOnly,
         Self::NostSourceStale,
         Self::SyncConflict,
@@ -206,6 +213,7 @@ impl DiagnosticCode {
             Self::NostInvalidDatetime => "NOST_INVALID_DATETIME",
             Self::CypherUnsupported => "CYPHER_UNSUPPORTED",
             Self::CypherSemanticError => "CYPHER_SEMANTIC_ERROR",
+            Self::QueryCancelled => "QUERY_CANCELLED",
             Self::LinkedDatabaseReadOnly => "LINKED_DATABASE_READ_ONLY",
             Self::NostSourceStale => "NOST_SOURCE_STALE",
             Self::SyncConflict => "SYNC_CONFLICT",
