@@ -876,6 +876,36 @@ impl Project {
         Ok(directory)
     }
 
+    /// Applies a change set and commits the result.
+    ///
+    /// A failure leaves the previous generation exactly as it was: the set is applied to a
+    /// copy of the graph and nothing is written until every operation succeeded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::Build`] when the graph will not accept the set — a stale
+    /// baseline, an endpoint that is not there, an endpoint in a linked source — and the
+    /// usual storage and decode failures otherwise.
+    pub fn apply(
+        &self,
+        change_set: &crate::change::GraphChangeSet,
+    ) -> Result<ApplyReport, ProjectError> {
+        let mut database = self.open_database()?;
+        let generation = database.generation();
+        let mut graph = crate::encoding::read_graph(&database).map_err(ProjectError::Decode)?;
+        let mut minter = crate::id::Minter::new();
+
+        let summary = crate::apply::apply(&mut graph, change_set, generation.get(), &mut minter)
+            .map_err(|error| ProjectError::Build {
+                reason: error.to_string(),
+            })?;
+        let generation = crate::encoding::commit_graph(&mut database, &graph)?;
+        Ok(ApplyReport {
+            generation,
+            summary,
+        })
+    }
+
     /// Where the multi-file journal lives.
     #[must_use]
     pub fn journal_path(&self) -> PathBuf {
@@ -1164,6 +1194,15 @@ pub struct BuildReport {
     pub resolved_references: u64,
     /// The plan the build ran against.
     pub plan: crate::plan::PlanReport,
+}
+
+/// What applying a change set did.
+#[derive(Clone, Debug)]
+pub struct ApplyReport {
+    /// The generation the database now holds.
+    pub generation: Generation,
+    /// What applying it did.
+    pub summary: crate::apply::ApplySummary,
 }
 
 /// A committed link change.
