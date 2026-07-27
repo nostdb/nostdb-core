@@ -47,7 +47,7 @@ use crate::name::{Label, PropertyKey, RelationName};
 use crate::property::PropertyValue;
 use crate::scan::Scan;
 use crate::text::NonEmptyText;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// The label every analyzed file carries.
@@ -83,6 +83,25 @@ pub fn label_for(kind: ItemKind) -> &'static str {
     }
 }
 
+/// What to build, and how.
+#[derive(Clone, Copy)]
+pub struct BuildRequest<'a> {
+    /// Where the scanned paths are relative to.
+    pub root: &'a Path,
+    /// What to analyze.
+    pub scan: &'a Scan,
+    /// The graph as it stands, which is where persisted identity is found.
+    pub graph: &'a Graph,
+    /// Which languages have an analyzer.
+    pub registry: &'a CapabilityRegistry,
+    /// The immutable snapshot the facts are derived from.
+    pub revision: &'a str,
+    /// The generation this is computed against.
+    pub base_generation: u64,
+    /// Whether to re-read every file rather than reusing what is already recorded.
+    pub rebuild: bool,
+}
+
 /// What building produced, before anything was applied.
 #[derive(Clone, Debug)]
 pub struct BuildDraft {
@@ -94,6 +113,8 @@ pub struct BuildDraft {
     pub analyzed_files: u64,
     /// References that matched a record in this build.
     pub resolved_references: u64,
+    /// Files whose recorded facts were reused rather than re-read.
+    pub reused_files: u64,
 }
 
 /// What one file contributes to settling an item's identity.
@@ -123,29 +144,21 @@ struct Planned {
 
 /// Builds a change set from a scan.
 ///
-/// `root` is where the scanned paths are relative to. Files whose language no analyzer
-/// reads are recorded as skipped rather than failed, because unsupported text stays
-/// eligible for AI analysis.
+/// Files whose language no analyzer reads are recorded as skipped rather than failed,
+/// because unsupported text stays eligible for AI analysis.
 ///
-/// # Errors
-///
-/// Never returns an error. A file that cannot be read becomes a
-/// [`SkipReason::PermissionDenied`] record, because one unreadable file must not cost a
-/// build every other file.
+/// Never fails. A file that cannot be read becomes a [`SkipReason::PermissionDenied`]
+/// record, because one unreadable file must not cost a build every other file.
 #[must_use]
-pub fn draft(
-    root: &Path,
-    scan: &Scan,
-    graph: &Graph,
-    registry: &CapabilityRegistry,
-    revision: &str,
-    base_generation: u64,
-    minter: &mut Minter,
-) -> BuildDraft {
+pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
+    let (root, scan, graph, registry) =
+        (request.root, request.scan, request.graph, request.registry);
     let locator = CanonicalSourceLocator::root();
     let mut coverage = BuildCoverage::empty();
     let mut planned: Vec<Planned> = Vec::new();
     let mut units: Vec<(String, SourceUnitId, Option<LocalNodeId>, FileAnalysis)> = Vec::new();
+    let mut reused: Vec<SourceUnitId> = Vec::new();
+    let mut reused_files = 0_u64;
 
     // Pass one: read and analyze, and settle each file's persisted identity.
     for file in &scan.files {
@@ -155,6 +168,18 @@ pub fn draft(
                 path: NonEmptyText::new(&file.path).ok(),
                 reason: SkipReason::Unsupported,
             });
+            continue;
+        }
+        let held = existing_unit(graph, &file.path);
+        // A file whose bytes are the digest already recorded is a file whose facts are
+        // already in the database. Section 17.8 makes reuse the default; `--rebuild` is
+        // what asks for the work to be redone.
+        if !request.rebuild
+            && let Some((unit, Some(node))) = held
+            && stored_digest(graph, node) == Some(file.digest.as_str())
+        {
+            reused.push(unit);
+            reused_files += 1;
             continue;
         }
         let Ok(source) = std::fs::read_to_string(root.join(&file.path)) else {
@@ -175,7 +200,7 @@ pub fn draft(
             });
             continue;
         };
-        let (unit, existing) = existing_unit(graph, &file.path).unwrap_or_else(|| {
+        let (unit, existing) = held.unwrap_or_else(|| {
             // A file nothing has analyzed before. Its unit is minted once and then
             // persists on the File node's contribution.
             (minter.source_unit(), None)
@@ -183,18 +208,55 @@ pub fn draft(
         units.push((file.path.clone(), unit, existing, analysis));
     }
 
+    // A file the source no longer holds must take its records with it. Nothing else would
+    // ever remove them: they belong to a unit no scan will name again.
+    let present: BTreeSet<SourceUnitId> = units
+        .iter()
+        .map(|(_, unit, _, _)| *unit)
+        .chain(reused.iter().copied())
+        .collect();
+    let departed: Vec<SourceUnitId> = analyzed_units(graph)
+        .into_iter()
+        .filter(|unit| !present.contains(unit))
+        .collect();
+
+    // Reuse is only sound while the names the unchanged files could refer to have not
+    // moved. When a rebuilt file adds or removes a declared name, an edge from a file this
+    // build never read may have become right or wrong, and the only honest answer at
+    // syntactic precision is to read them all. That is the "affected context-resolution
+    // units" half of section 17.8, taken conservatively rather than approximately.
+    let names_moved = !departed.is_empty()
+        || units
+            .iter()
+            .any(|(_, unit, _, analysis)| declared_names(analysis) != recorded_names(graph, *unit));
+    if names_moved && !reused.is_empty() {
+        return draft(
+            &BuildRequest {
+                rebuild: true,
+                ..*request
+            },
+            minter,
+        );
+    }
+
     let mut change_set = GraphChangeSet::new(
         analyzer_owner(),
-        NonEmptyText::new(revision).unwrap_or_else(|_| NonEmptyText::literal("tree:unknown")),
-        base_generation,
+        NonEmptyText::new(request.revision)
+            .unwrap_or_else(|_| NonEmptyText::literal("tree:unknown")),
+        request.base_generation,
     );
 
     // Every unit being rebuilt withdraws its previous claim first, so a record the source
-    // no longer declares disappears rather than lingering.
-    for (_, unit, _, _) in &units {
+    // no longer declares disappears rather than lingering. A departed file withdraws its
+    // claim and restates nothing, which is what removes it.
+    for unit in units
+        .iter()
+        .map(|(_, unit, _, _)| *unit)
+        .chain(departed.iter().copied())
+    {
         change_set.push(GraphOperation::RemoveContribution(ContributionKey {
             owner: analyzer_owner(),
-            source_unit: *unit,
+            source_unit: unit,
         }));
     }
 
@@ -353,6 +415,7 @@ pub fn draft(
         coverage,
         analyzed_files: units.len() as u64,
         resolved_references: resolved,
+        reused_files,
     }
 }
 
@@ -427,6 +490,54 @@ fn existing_edges(
             };
             Some(((*from, *to, edge.relation.as_str().to_owned()), edge.id))
         })
+        .collect()
+}
+
+/// The digest recorded on a file record, when it carries one.
+fn stored_digest(graph: &Graph, node: LocalNodeId) -> Option<&str> {
+    property(graph.nodes.iter().find(|held| held.id == node)?, "digest")
+}
+
+/// Every source unit this analyzer holds a contribution for.
+fn analyzed_units(graph: &Graph) -> BTreeSet<SourceUnitId> {
+    let owner = analyzer_owner();
+    graph
+        .nodes
+        .iter()
+        .flat_map(|node| node.contributions.iter())
+        .filter(|held| held.owner == owner)
+        .map(|held| held.source_unit)
+        .collect()
+}
+
+/// The names one analysis declares, at every depth.
+///
+/// This is what a reference from another file could resolve to, so a change to it is what
+/// makes reuse unsound. An implementation is excluded for the same reason it is excluded
+/// from the resolution index: nothing can refer to one.
+fn declared_names(analysis: &FileAnalysis) -> BTreeSet<String> {
+    analysis
+        .walk()
+        .filter(|item| item.kind != ItemKind::Implementation)
+        .map(|item| item.name.clone())
+        .collect()
+}
+
+/// The names already recorded for one source unit.
+fn recorded_names(graph: &Graph, unit: SourceUnitId) -> BTreeSet<String> {
+    let owner = analyzer_owner();
+    graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            !node.labels.iter().any(|held| held.as_str() == FILE_LABEL)
+                && !node.labels.iter().any(|held| held.as_str() == "Impl")
+                && node
+                    .contributions
+                    .iter()
+                    .any(|held| held.owner == owner && held.source_unit == unit)
+        })
+        .filter_map(|node| property(node, "name").map(str::to_owned))
         .collect()
 }
 
@@ -704,22 +815,51 @@ mod tests {
         graph: &mut Graph,
         generation: u64,
     ) -> BuildDraft {
+        build_with(dir, files, graph, generation, false)
+    }
+
+    static REGISTRY: std::sync::OnceLock<CapabilityRegistry> = std::sync::OnceLock::new();
+
+    fn request<'a>(
+        dir: &'a TempDir,
+        scan: &'a Scan,
+        graph: &'a Graph,
+        generation: u64,
+        rebuild: bool,
+    ) -> BuildRequest<'a> {
+        BuildRequest {
+            root: dir.path(),
+            scan,
+            graph,
+            registry: REGISTRY.get_or_init(|| builtin_registry().expect("the registry")),
+            revision: "tree:sha256:test",
+            base_generation: generation,
+            rebuild,
+        }
+    }
+
+    fn build_with(
+        dir: &TempDir,
+        files: Vec<ScannedFile>,
+        graph: &mut Graph,
+        generation: u64,
+        rebuild: bool,
+    ) -> BuildDraft {
         let scan = Scan {
             files,
             skipped: Vec::new(),
         };
         let mut minter = Minter::new();
         let draft = super::draft(
-            dir.path(),
-            &scan,
-            graph,
-            &builtin_registry().expect("the registry"),
-            "tree:sha256:test",
-            generation,
+            &request(dir, &scan, graph, generation, rebuild),
             &mut minter,
         );
-        crate::apply::apply(graph, &draft.change_set, generation, &mut minter)
-            .expect("the draft applies");
+        // A build that reused everything proposes nothing, which is the point of reuse
+        // rather than a failure to apply.
+        if !draft.change_set.operations.is_empty() {
+            crate::apply::apply(graph, &draft.change_set, generation, &mut minter)
+                .expect("the draft applies");
+        }
         draft
     }
 
@@ -865,28 +1005,110 @@ mod tests {
         );
     }
 
+    fn ids(graph: &Graph) -> Vec<LocalNodeId> {
+        let mut ids: Vec<LocalNodeId> = graph.nodes.iter().map(|node| node.id).collect();
+        ids.sort();
+        ids
+    }
+
     #[test]
-    fn a_rebuild_with_no_change_keeps_every_identifier() {
-        // The whole point of finding the persisted source unit by path: an edge pointing
-        // at a record must survive a rebuild that did not change its name.
+    fn a_rebuild_with_no_change_reuses_everything_and_proposes_nothing() {
         let dir = TempDir::new("rebuild-stable");
-        let source = "fn main() { helper(); }\nfn helper() {}\n";
-        let file = dir.write("src/main.rs", source);
+        let file = dir.write("src/main.rs", "fn main() { helper(); }\nfn helper() {}\n");
         let mut graph = Graph::default();
         build(&dir, vec![file.clone()], &mut graph, 1);
-        let before: Vec<LocalNodeId> = {
-            let mut ids: Vec<LocalNodeId> = graph.nodes.iter().map(|node| node.id).collect();
-            ids.sort();
-            ids
-        };
+        let before = ids(&graph);
 
-        build(&dir, vec![file], &mut graph, 2);
-        let after: Vec<LocalNodeId> = {
-            let mut ids: Vec<LocalNodeId> = graph.nodes.iter().map(|node| node.id).collect();
-            ids.sort();
-            ids
-        };
-        assert_eq!(before, after, "a rebuild must not churn identifiers");
+        let draft = build(&dir, vec![file], &mut graph, 2);
+        assert_eq!(draft.reused_files, 1);
+        assert_eq!(draft.analyzed_files, 0, "nothing was re-read");
+        assert!(
+            draft.change_set.operations.is_empty(),
+            "a build with nothing to do proposes nothing rather than restating everything"
+        );
+        assert_eq!(ids(&graph), before);
+    }
+
+    #[test]
+    fn asking_for_a_rebuild_re_reads_a_file_reuse_would_have_skipped() {
+        // Section 17.8: `--rebuild` explicitly bypasses reusable analysis artifacts.
+        let dir = TempDir::new("rebuild-forced");
+        let file = dir.write("src/main.rs", "fn main() {}\n");
+        let mut graph = Graph::default();
+        build(&dir, vec![file.clone()], &mut graph, 1);
+        let before = ids(&graph);
+
+        let draft = build_with(&dir, vec![file], &mut graph, 2, true);
+        assert_eq!(draft.reused_files, 0);
+        assert_eq!(draft.analyzed_files, 1);
+        assert_eq!(
+            ids(&graph),
+            before,
+            "redoing the work must still reach the same identifiers"
+        );
+    }
+
+    #[test]
+    fn only_the_file_that_changed_is_re_read() {
+        let dir = TempDir::new("rebuild-partial");
+        let one = dir.write("src/a.rs", "fn a_one() {}\nfn a_two() {}\n");
+        let two = dir.write("src/b.rs", "fn b_one() {}\n");
+        let mut graph = Graph::default();
+        build(&dir, vec![one, two.clone()], &mut graph, 1);
+
+        // Only the body moves, so the names this file declares are unchanged and the
+        // other file's edges cannot have been affected.
+        let edited = dir.write("src/a.rs", "fn a_one() { let x = 1; }\nfn a_two() {}\n");
+        let draft = build(&dir, vec![edited, two], &mut graph, 2);
+        assert_eq!(draft.analyzed_files, 1, "one file changed");
+        assert_eq!(draft.reused_files, 1, "the other did not");
+    }
+
+    #[test]
+    fn a_changed_declaration_makes_the_whole_build_read_again() {
+        // Reuse is only sound while the names an unchanged file could refer to have not
+        // moved. Adding one means an edge from a file this build never read may have
+        // become right, and the only honest answer at syntactic precision is to read them
+        // all.
+        let dir = TempDir::new("rebuild-names-moved");
+        let one = dir.write("src/a.rs", "fn a_one() {}\n");
+        let two = dir.write("src/b.rs", "fn b_one() { added(); }\n");
+        let mut graph = Graph::default();
+        build(&dir, vec![one, two.clone()], &mut graph, 1);
+        assert!(relations(&graph, CALLS).is_empty());
+
+        let edited = dir.write("src/a.rs", "fn a_one() {}\nfn added() {}\n");
+        let draft = build(&dir, vec![edited, two], &mut graph, 2);
+        assert_eq!(draft.analyzed_files, 2, "a declared name moved");
+        assert_eq!(draft.reused_files, 0);
+        assert_eq!(
+            relations(&graph, CALLS),
+            [("b_one".to_owned(), "added".to_owned())],
+            "the unchanged file's call now resolves, and would not have if it were skipped"
+        );
+    }
+
+    #[test]
+    fn a_file_the_source_no_longer_holds_takes_its_records_with_it() {
+        // Nothing else would ever remove them: they belong to a unit no scan will name
+        // again.
+        let dir = TempDir::new("rebuild-departed");
+        let one = dir.write("src/a.rs", "fn kept() {}\n");
+        let two = dir.write("src/gone.rs", "fn departed() {}\n");
+        let mut graph = Graph::default();
+        build(&dir, vec![one.clone(), two], &mut graph, 1);
+        assert_eq!(names(&graph, "Function"), ["departed", "kept"]);
+
+        std::fs::remove_file(dir.path().join("src/gone.rs")).expect("remove");
+        build(&dir, vec![one], &mut graph, 2);
+        assert_eq!(names(&graph, "Function"), ["kept"]);
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| property(node, "path") == Some("src/gone.rs")),
+            "the file record goes too"
+        );
     }
 
     #[test]
@@ -979,8 +1201,9 @@ mod tests {
             .collect();
         assert_eq!(impls.len(), 3);
 
-        // The rebuild is the half that used to fail.
-        build(&dir, vec![file], &mut graph, 2);
+        // The rebuild is the half that used to fail. Forced, because reuse would
+        // otherwise skip the file and never exercise the identity lookup.
+        build_with(&dir, vec![file], &mut graph, 2, true);
         let mut after: Vec<LocalNodeId> = graph
             .nodes
             .iter()
@@ -1004,15 +1227,7 @@ mod tests {
             skipped: Vec::new(),
         };
         let mut minter = Minter::new();
-        let draft = super::draft(
-            dir.path(),
-            &scan,
-            &graph,
-            &builtin_registry().expect("the registry"),
-            "tree:sha256:test",
-            1,
-            &mut minter,
-        );
+        let draft = super::draft(&request(&dir, &scan, &graph, 1, false), &mut minter);
         assert_eq!(draft.analyzed_files, 0);
         assert_eq!(draft.coverage.skipped_sources.len(), 1);
         assert_eq!(
@@ -1097,15 +1312,9 @@ mod tests {
             skipped: Vec::new(),
         };
         let mut minter = Minter::new();
-        let draft = super::draft(
-            dir.path(),
-            &scan,
-            &graph,
-            &builtin_registry().expect("the registry"),
-            "tree:sha256:test",
-            2,
-            &mut minter,
-        );
+        // Forced: reuse would propose nothing, and what this test is about is what the
+        // counts say when the work is actually redone.
+        let draft = super::draft(&request(&dir, &scan, &graph, 2, true), &mut minter);
         let summary = crate::apply::apply(&mut graph, &draft.change_set, 2, &mut minter)
             .expect("the draft applies");
 
@@ -1127,7 +1336,7 @@ mod tests {
             graph.edges.iter().map(|edge| edge.id).collect();
         before.sort();
 
-        build(&dir, vec![file], &mut graph, 2);
+        build_with(&dir, vec![file], &mut graph, 2, true);
         let mut after: Vec<crate::id::LocalEdgeId> =
             graph.edges.iter().map(|edge| edge.id).collect();
         after.sort();
@@ -1163,8 +1372,8 @@ mod tests {
             "how many times is a property of the relation, not more relations"
         );
 
-        // The rebuild is what used to be refused.
-        build(&dir, vec![file], &mut graph, 2);
+        // The rebuild is what used to be refused. Forced, so reuse does not skip it.
+        build_with(&dir, vec![file], &mut graph, 2, true);
         assert_eq!(
             graph
                 .edges

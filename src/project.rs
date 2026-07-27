@@ -742,6 +742,10 @@ impl Project {
     /// PRD section 17.1 requires: AI failure must not be able to erase structural facts,
     /// and the only way to guarantee that is for the structural database to exist first.
     ///
+    /// Reuse is the default. A file whose bytes match the digest already recorded is not
+    /// re-read, which is what section 17.8 asks for; `rebuild` asks for the work to be
+    /// redone anyway.
+    ///
     /// A failure leaves the previous generation exactly as it was. Nothing is written until
     /// the change set has been built, validated, and applied to a copy of the graph.
     ///
@@ -755,6 +759,7 @@ impl Project {
         &self,
         registry: &crate::analysis::CapabilityRegistry,
         options: &crate::scan::ScanOptions,
+        rebuild: bool,
     ) -> Result<BuildReport, ProjectError> {
         let scan = self.scan(options)?;
         let plan = crate::plan::plan(&scan, registry, &self.settings.analysis);
@@ -766,12 +771,15 @@ impl Project {
         let mut minter = crate::id::Minter::new();
 
         let draft = crate::build::draft(
-            &self.root,
-            &scan,
-            &graph,
-            registry,
-            &revision,
-            generation.get(),
+            &crate::build::BuildRequest {
+                root: &self.root,
+                scan: &scan,
+                graph: &graph,
+                registry,
+                revision: &revision,
+                base_generation: generation.get(),
+                rebuild,
+            },
             &mut minter,
         );
         // An empty set is refused by contract, and a project with no analyzable source is
@@ -783,6 +791,7 @@ impl Project {
                 summary: crate::apply::ApplySummary::default(),
                 coverage: draft.coverage,
                 analyzed_files: draft.analyzed_files,
+                reused_files: draft.reused_files,
                 resolved_references: draft.resolved_references,
                 plan,
             });
@@ -801,6 +810,7 @@ impl Project {
             summary,
             coverage: draft.coverage,
             analyzed_files: draft.analyzed_files,
+            reused_files: draft.reused_files,
             resolved_references: draft.resolved_references,
             plan,
         })
@@ -1086,6 +1096,8 @@ pub struct BuildReport {
     pub coverage: crate::coverage::BuildCoverage,
     /// How many files were read and analyzed.
     pub analyzed_files: u64,
+    /// How many files were reused rather than re-read.
+    pub reused_files: u64,
     /// How many references matched a record in the build.
     pub resolved_references: u64,
     /// The plan the build ran against.
@@ -1771,7 +1783,7 @@ mod tests {
         let registry = crate::analyze::builtin_registry().unwrap();
         let before = project.open_database().unwrap().generation();
         let report = project
-            .build(&registry, &crate::scan::ScanOptions::default())
+            .build(&registry, &crate::scan::ScanOptions::default(), false)
             .unwrap();
 
         assert!(report.generation > before);
@@ -1799,7 +1811,7 @@ mod tests {
         let registry = crate::analyze::builtin_registry().unwrap();
         let before = project.open_database().unwrap().generation();
         let report = project
-            .build(&registry, &crate::scan::ScanOptions::default())
+            .build(&registry, &crate::scan::ScanOptions::default(), false)
             .unwrap();
 
         assert_eq!(report.analyzed_files, 0);
@@ -1820,7 +1832,7 @@ mod tests {
 
         let registry = crate::analyze::builtin_registry().unwrap();
         let options = crate::scan::ScanOptions::default();
-        project.build(&registry, &options).unwrap();
+        project.build(&registry, &options, false).unwrap();
 
         let kept = project
             .read_graph()
@@ -1837,7 +1849,7 @@ mod tests {
             .id;
 
         fs::write(dir.path().join("src/b.rs"), "fn replaced() {}\n").unwrap();
-        project.build(&registry, &options).unwrap();
+        project.build(&registry, &options, false).unwrap();
 
         let graph = project.read_graph().unwrap();
         let names: Vec<String> = graph
@@ -1871,7 +1883,7 @@ mod tests {
 
         let registry = crate::analyze::builtin_registry().unwrap();
         let report = project
-            .build(&registry, &crate::scan::ScanOptions::default())
+            .build(&registry, &crate::scan::ScanOptions::default(), false)
             .unwrap();
         assert_eq!(report.analyzed_files, 1);
         assert!(
@@ -1880,6 +1892,28 @@ mod tests {
                 .skipped
                 .iter()
                 .any(|(reason, _)| *reason == crate::coverage::SkipReason::Ignored)
+        );
+    }
+
+    #[test]
+    fn a_second_build_with_nothing_changed_commits_no_generation() {
+        // A build that reuses everything has nothing to say. Committing a generation
+        // anyway would make every run look like a change to whatever watches the file.
+        let dir = TempDir::new("build-reuse");
+        let project = Project::initialize(dir.path()).unwrap();
+        fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+        let registry = crate::analyze::builtin_registry().unwrap();
+        let options = crate::scan::ScanOptions::default();
+        let first = project.build(&registry, &options, false).unwrap();
+        assert_eq!(first.analyzed_files, 1);
+
+        let second = project.build(&registry, &options, false).unwrap();
+        assert_eq!(second.reused_files, 1);
+        assert_eq!(second.analyzed_files, 0);
+        assert_eq!(
+            second.generation, first.generation,
+            "nothing changed, so nothing is committed"
         );
     }
 }
