@@ -689,6 +689,47 @@ impl Project {
         self.settings.orphan_link_settings(declared)
     }
 
+    /// Walks this project's tree and reports what a build may analyze.
+    ///
+    /// The scan starts at the project root, not at the state directory, so the source a
+    /// person arranged is what gets read. `.nostdb` is pruned, which keeps the database's
+    /// own bytes from being fed back into it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::Io`] when the root cannot be listed. Nothing below the root
+    /// produces an error: every failure becomes a recorded skip, because one unreadable
+    /// subtree must not cost a build every other subtree.
+    pub fn scan(
+        &self,
+        options: &crate::scan::ScanOptions,
+    ) -> Result<crate::scan::Scan, ProjectError> {
+        // The root is its own source. A federated build gives each linked source its own
+        // locator, which is what keeps a coverage record meaningful once there are several.
+        let locator = CanonicalSourceLocator::new(".")
+            .unwrap_or_else(|_| unreachable!("`.` is a valid relative locator"));
+        crate::scan::scan(&self.root, &locator, options).map_err(|error| match error {
+            crate::scan::ScanError::Unreadable { path, error } => ProjectError::Io { path, error },
+        })
+    }
+
+    /// Plans a build over this project without doing any of it.
+    ///
+    /// Root PRD section 17.6 requires a plan before any AI action begins. This produces
+    /// one and spends nothing: it reads source to digest it, and stops there.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Project::scan`] reports.
+    pub fn plan(
+        &self,
+        registry: &crate::analysis::CapabilityRegistry,
+        options: &crate::scan::ScanOptions,
+    ) -> Result<crate::plan::PlanReport, ProjectError> {
+        let scan = self.scan(options)?;
+        Ok(crate::plan::plan(&scan, registry, &self.settings.analysis))
+    }
+
     /// Where the multi-file journal lives.
     #[must_use]
     pub fn journal_path(&self) -> PathBuf {

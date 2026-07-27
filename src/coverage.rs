@@ -37,7 +37,9 @@ impl fmt::Display for CoverageState {
 }
 
 /// Why a source was not analyzed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+///
+/// Ordered so a report can group by reason and produce the same order every run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SkipReason {
     /// Excluded by ignore rules.
     Ignored,

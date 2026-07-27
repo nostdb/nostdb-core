@@ -65,6 +65,7 @@ pub mod locator;
 pub mod mutate;
 pub mod name;
 pub mod nost;
+pub mod plan;
 pub mod procedure;
 pub mod project;
 pub mod property;
