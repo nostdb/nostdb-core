@@ -76,6 +76,7 @@ pub mod procedure;
 pub mod project;
 pub mod property;
 pub mod provider;
+pub mod provider_process;
 pub mod result;
 pub mod scan;
 pub mod schema;
