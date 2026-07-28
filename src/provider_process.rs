@@ -189,9 +189,20 @@ mod tests {
         // Engine with nothing, and naming that beats waiting for a timeout.
         let (mut client, program) = client("silent", "exit 0");
         let refused = client.handshake().unwrap_err();
+        let reported = refused.to_string();
+
+        // Either message is correct, and which one appears is a race the operating system
+        // decides: if the child is already gone when the request is written, the write fails
+        // with a broken pipe; if it is still alive, the write succeeds and the read finds
+        // end-of-file. This asserted only the second, and passed on a machine slow enough to
+        // lose the race — until a CI runner won it.
+        //
+        // What the test is for is the property in its name: the conversation *ends*, with a
+        // reason, rather than blocking. Pinning which of the two reasons appeared was pinning
+        // the scheduler.
         assert!(
-            refused.to_string().contains("ended without answering"),
-            "{refused}"
+            reported.contains("ended without answering") || reported.contains("stopped reading"),
+            "{reported}"
         );
         let _ = std::fs::remove_file(&program);
     }
