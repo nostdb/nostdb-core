@@ -906,6 +906,134 @@ impl Project {
         })
     }
 
+    /// Resolves every remote link and records the commit each one now points at.
+    ///
+    /// This is the only thing that advances a snapshot. A query never does, which is what
+    /// keeps a branch from moving underneath a build: two queries a week apart see the same
+    /// commit unless somebody asked for a newer one.
+    ///
+    /// `resolve` is given each remote locator and answers with a commit. It is a closure
+    /// rather than a provider handle so that this can be tested without a child process,
+    /// and so that a caller decides how a provider is found — the Engine does not own a
+    /// registry of executables.
+    ///
+    /// A link that cannot be resolved keeps whatever commit it already had. An unreachable
+    /// host is not a reason to forget where a link pointed, and clearing the field would
+    /// turn one bad minute into a rebuild of everything that link reached.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::Io`] or [`ProjectError::Settings`] when the settings cannot
+    /// be read or written. A link that fails to resolve is reported in the result rather
+    /// than failing the command.
+    pub fn refresh_links(
+        &self,
+        mut resolve: impl FnMut(&str) -> Result<RefreshedSnapshot, String>,
+    ) -> Result<Vec<RefreshOutcome>, ProjectError> {
+        let graph = self.read_graph()?;
+        let mut outcomes = Vec::new();
+        let mut resolved: Vec<(String, RefreshedSnapshot)> = Vec::new();
+
+        for link in &graph.links {
+            let locator = link.source.as_str();
+            if !link.is_remote() {
+                // A local link is read live at every query. There is no snapshot to
+                // advance, so there is nothing here to do rather than something to fail.
+                outcomes.push(RefreshOutcome::NotRemote {
+                    source: locator.to_owned(),
+                });
+                continue;
+            }
+            match resolve(locator) {
+                Ok(snapshot) => {
+                    let previous = self
+                        .settings
+                        .links
+                        .iter()
+                        .find(|entry| entry.source == locator)
+                        .and_then(|entry| entry.resolved_commit.clone());
+                    outcomes.push(if previous.as_deref() == Some(snapshot.commit.as_str()) {
+                        RefreshOutcome::Unchanged {
+                            source: locator.to_owned(),
+                            commit: snapshot.commit.clone(),
+                        }
+                    } else {
+                        RefreshOutcome::Advanced {
+                            source: locator.to_owned(),
+                            from: previous,
+                            to: snapshot.commit.clone(),
+                        }
+                    });
+                    resolved.push((locator.to_owned(), snapshot));
+                }
+                Err(reason) => outcomes.push(RefreshOutcome::Unavailable {
+                    source: locator.to_owned(),
+                    reason,
+                }),
+            }
+        }
+
+        if !resolved.is_empty() {
+            self.record_snapshots(&resolved)?;
+        }
+        Ok(outcomes)
+    }
+
+    /// Writes the resolved commits into the settings, preserving everything else.
+    fn record_snapshots(
+        &self,
+        resolved: &[(String, RefreshedSnapshot)],
+    ) -> Result<(), ProjectError> {
+        let path = Self::settings_path(&self.root);
+        let text = std::fs::read_to_string(&path).map_err(|error| ProjectError::Io {
+            path: path.clone(),
+            error,
+        })?;
+        let document = SettingsDocument::parse(&text).map_err(|error| ProjectError::Settings {
+            path: path.clone(),
+            error,
+        })?;
+        let mut value = document.to_json().clone();
+        let Some(object) = value.as_object_mut() else {
+            return Err(ProjectError::Settings {
+                path,
+                error: SettingsError::Invalid {
+                    field: "<root>".to_owned(),
+                    reason: "the document is not an object".to_owned(),
+                },
+            });
+        };
+
+        let mut entries: Vec<serde_json::Value> = object
+            .get("links")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for (locator, snapshot) in resolved {
+            let entry = entries.iter_mut().find(|entry| {
+                entry.get("source").and_then(serde_json::Value::as_str) == Some(locator.as_str())
+            });
+            match entry {
+                Some(entry) => {
+                    entry["resolved_commit"] = serde_json::json!(snapshot.commit);
+                    entry["resolved_digest"] = serde_json::json!(snapshot.digest);
+                }
+                // A link declared in the graph with no operational entry yet. The
+                // declaration is authoritative and the entry supplies defaults, so one is
+                // created rather than the refresh being refused.
+                None => entries.push(serde_json::json!({
+                    "source": locator,
+                    "resolved_commit": snapshot.commit,
+                    "resolved_digest": snapshot.digest,
+                })),
+            }
+        }
+        object.insert("links".to_owned(), serde_json::Value::Array(entries));
+        let rendered =
+            serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()) + "\n";
+        write_atomically(&path, rendered.as_bytes())
+    }
+
     /// Where the multi-file journal lives.
     #[must_use]
     pub fn journal_path(&self) -> PathBuf {
@@ -1203,6 +1331,67 @@ pub struct ApplyReport {
     pub generation: Generation,
     /// What applying it did.
     pub summary: crate::apply::ApplySummary,
+}
+
+/// What a provider said a locator now points at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefreshedSnapshot {
+    /// The immutable commit.
+    pub commit: String,
+    /// The digest of what it yielded, when the caller has one.
+    pub digest: Option<String>,
+}
+
+/// What refreshing one link did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// The link now points at a different commit.
+    Advanced {
+        /// Which link.
+        source: String,
+        /// What it pointed at before, when it had been resolved.
+        from: Option<String>,
+        /// What it points at now.
+        to: String,
+    },
+    /// The link resolved to the commit it already had.
+    Unchanged {
+        /// Which link.
+        source: String,
+        /// The commit.
+        commit: String,
+    },
+    /// The link could not be reached, and keeps whatever it had.
+    Unavailable {
+        /// Which link.
+        source: String,
+        /// Why.
+        reason: String,
+    },
+    /// The link is local, so there is no snapshot to advance.
+    NotRemote {
+        /// Which link.
+        source: String,
+    },
+}
+
+impl RefreshOutcome {
+    /// The link this outcome is about.
+    #[must_use]
+    pub fn source(&self) -> &str {
+        match self {
+            Self::Advanced { source, .. }
+            | Self::Unchanged { source, .. }
+            | Self::Unavailable { source, .. }
+            | Self::NotRemote { source } => source,
+        }
+    }
+
+    /// Reports whether this outcome means the link could not be reached.
+    #[must_use]
+    pub const fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable { .. })
+    }
 }
 
 /// A committed link change.
@@ -2137,5 +2326,145 @@ mod tests {
         let forced = project.build(&registry, &options, true).unwrap();
         assert_eq!(forced.analyzed_files, 1);
         assert_eq!(forced.cached_parses, 1);
+    }
+
+    fn remote_project(dir: &TempDir) -> Project {
+        let project = Project::initialize(dir.path()).unwrap();
+        project
+            .add_link("github://example/payments/?ref=main", Some("payments"))
+            .unwrap();
+        project.add_link("./local/child", None).unwrap();
+        Project::open(dir.path(), None).unwrap()
+    }
+
+    fn snapshot(commit: &str) -> RefreshedSnapshot {
+        RefreshedSnapshot {
+            commit: commit.to_owned(),
+            digest: Some("sha256:abcd".to_owned()),
+        }
+    }
+
+    fn recorded(project: &Project, source: &str) -> Option<String> {
+        let text = fs::read_to_string(Project::settings_path(project.root())).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&text).unwrap();
+        document["links"]
+            .as_array()?
+            .iter()
+            .find(|entry| entry["source"] == source)?
+            .get("resolved_commit")?
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    #[test]
+    fn refreshing_records_the_commit_a_remote_link_now_points_at() {
+        let dir = TempDir::new("refresh");
+        let project = remote_project(&dir);
+
+        let outcomes = project.refresh_links(|_| Ok(snapshot("0f1e2d3c"))).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(matches!(
+            outcomes[0],
+            RefreshOutcome::Advanced { from: None, .. }
+        ));
+        assert_eq!(
+            recorded(&project, "github://example/payments/?ref=main").as_deref(),
+            Some("0f1e2d3c")
+        );
+    }
+
+    #[test]
+    fn a_local_link_has_no_snapshot_to_advance() {
+        // Read live at every query, so there is nothing here to do rather than something
+        // to fail. This is the reason `link refresh` could not be built before Stage 9.
+        let dir = TempDir::new("refresh-local");
+        let project = remote_project(&dir);
+        let outcomes = project.refresh_links(|_| Ok(snapshot("0f1e"))).unwrap();
+        let local = outcomes
+            .iter()
+            .find(|outcome| outcome.source() == "./local/child")
+            .expect("the local link");
+        assert!(matches!(local, RefreshOutcome::NotRemote { .. }));
+        assert_eq!(recorded(&project, "./local/child"), None);
+    }
+
+    #[test]
+    fn resolving_to_the_same_commit_is_reported_as_unchanged() {
+        let dir = TempDir::new("refresh-unchanged");
+        let project = remote_project(&dir);
+        project.refresh_links(|_| Ok(snapshot("0f1e"))).unwrap();
+
+        let project = Project::open(dir.path(), None).unwrap();
+        let outcomes = project.refresh_links(|_| Ok(snapshot("0f1e"))).unwrap();
+        assert!(
+            matches!(outcomes[0], RefreshOutcome::Unchanged { .. }),
+            "{:?}",
+            outcomes[0]
+        );
+    }
+
+    #[test]
+    fn a_link_that_cannot_be_reached_keeps_the_commit_it_had() {
+        // An unreachable host is not a reason to forget where a link pointed. Clearing it
+        // would turn one bad minute into a rebuild of everything that link reached.
+        let dir = TempDir::new("refresh-unavailable");
+        let project = remote_project(&dir);
+        project.refresh_links(|_| Ok(snapshot("0f1e"))).unwrap();
+
+        let project = Project::open(dir.path(), None).unwrap();
+        let outcomes = project
+            .refresh_links(|_| Err("the host did not answer".to_owned()))
+            .unwrap();
+        assert!(outcomes.iter().any(RefreshOutcome::is_unavailable));
+        assert_eq!(
+            recorded(&project, "github://example/payments/?ref=main").as_deref(),
+            Some("0f1e"),
+            "the previous commit survives a failed refresh"
+        );
+    }
+
+    #[test]
+    fn refreshing_preserves_operational_fields_and_unknown_ones() {
+        let dir = TempDir::new("refresh-preserve");
+        Project::initialize(dir.path()).unwrap();
+        fs::write(
+            Project::settings_path(dir.path()),
+            r#"{
+  "settings_version": 1,
+  "links": [{"source": "github://example/payments/?ref=main", "timeout_ms": 42000}],
+  "experimental_field_a_newer_build_wrote": true
+}"#,
+        )
+        .unwrap();
+        let project = Project::open(dir.path(), None).unwrap();
+        project
+            .add_link("github://example/payments/?ref=main", None)
+            .unwrap();
+        let project = Project::open(dir.path(), None).unwrap();
+        project.refresh_links(|_| Ok(snapshot("0f1e"))).unwrap();
+
+        let text = fs::read_to_string(Project::settings_path(dir.path())).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(document["links"][0]["timeout_ms"], 42000);
+        assert_eq!(document["links"][0]["resolved_commit"], "0f1e");
+        assert_eq!(document["experimental_field_a_newer_build_wrote"], true);
+    }
+
+    #[test]
+    fn a_query_never_advances_a_snapshot() {
+        // The invariant `link refresh` exists to make explicit: two queries a week apart
+        // see the same commit unless somebody asked for a newer one.
+        let dir = TempDir::new("refresh-not-a-query");
+        let project = remote_project(&dir);
+        project.refresh_links(|_| Ok(snapshot("0f1e"))).unwrap();
+
+        let project = Project::open(dir.path(), None).unwrap();
+        let _ = project.resolve_links().unwrap();
+        let _ = project.read_graph().unwrap();
+        assert_eq!(
+            recorded(&project, "github://example/payments/?ref=main").as_deref(),
+            Some("0f1e"),
+            "nothing but a refresh may move it"
+        );
     }
 }

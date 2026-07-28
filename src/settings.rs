@@ -210,6 +210,13 @@ pub struct LinkSettings {
     pub refresh: RefreshPolicy,
     /// How long opening this source may take.
     pub timeout_ms: u64,
+    /// The immutable commit this link last resolved to.
+    ///
+    /// Snapshot metadata, not identity. The `source` remains what the link *is*; this
+    /// records what it last pointed at, and only an explicit refresh advances it.
+    pub resolved_commit: Option<String>,
+    /// The content digest of what that commit yielded.
+    pub resolved_digest: Option<String>,
 }
 
 /// Where the database is and whether `.nost` is materialized.
@@ -343,6 +350,8 @@ impl Settings {
                             "credential_ref": link.credential_ref,
                             "refresh": link.refresh.as_str(),
                             "timeout_ms": link.timeout_ms,
+                            "resolved_commit": link.resolved_commit,
+                            "resolved_digest": link.resolved_digest,
                         })
                     })
                     .collect(),
@@ -832,6 +841,18 @@ fn read_links(entries: &[Value]) -> Result<Vec<LinkSettings>, SettingsError> {
                 .unwrap_or_default(),
             timeout_ms: optional(object, "timeout_ms", &field("timeout_ms"), read_count)?
                 .unwrap_or(DEFAULT_LINK_OPEN_TIMEOUT_MS),
+            resolved_commit: optional(
+                object,
+                "resolved_commit",
+                &field("resolved_commit"),
+                read_string,
+            )?,
+            resolved_digest: optional(
+                object,
+                "resolved_digest",
+                &field("resolved_digest"),
+                read_string,
+            )?,
         });
     }
     Ok(links)
