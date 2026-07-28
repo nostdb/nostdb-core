@@ -75,6 +75,7 @@ pub mod plan;
 pub mod procedure;
 pub mod project;
 pub mod property;
+pub mod provider;
 pub mod result;
 pub mod scan;
 pub mod schema;
