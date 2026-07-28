@@ -301,6 +301,42 @@ fn open_target(target: &Target) -> Result<Graph, Unreachable> {
 /// product contract requires a query over a broken link to return what it can reach.
 #[must_use]
 pub fn resolve(root: Graph, root_path: &Path, limits: &FederationSettings) -> Federation {
+    // The turbofish names a closure type that is never constructed: `None` still has to
+    // say what it would have held.
+    resolve_with::<fn(&CanonicalSourceLocator) -> Result<Vec<u8>, String>>(
+        root, root_path, limits, None,
+    )
+}
+
+/// Resolves links, optionally reaching remote sources through a provider.
+///
+/// `open_remote` is handed a remote locator and answers with the bytes of a `.nostdb` a
+/// provider materialized and the Engine already verified. It is a closure rather than a
+/// provider handle for the same reason `refresh_links` takes one: this decides what a link
+/// *means*, not how an executable is found, and a caller that owns the provider can be
+/// tested without one.
+///
+/// Passing `None` is what [`resolve`] does, and reports every remote link as having no
+/// provider — which is a fact about this caller rather than about the link.
+///
+/// This never fails. A remote source that cannot be opened becomes a status and a warning,
+/// exactly as an unreadable local one does: the product contract requires a query over a
+/// broken link to return what it can reach, and where the break happened does not change
+/// that.
+#[must_use]
+pub fn resolve_with<F>(
+    root: Graph,
+    root_path: &Path,
+    limits: &FederationSettings,
+    open_remote: Option<&mut F>,
+) -> Federation
+where
+    F: FnMut(&CanonicalSourceLocator) -> Result<Vec<u8>, String>,
+{
+    // Generic rather than a trait object, so the closure can be reborrowed for each link. A
+    // closure that opens a network source cannot be cloned, and every step of the walk needs
+    // the same one.
+    let mut open_remote = open_remote;
     let root_directory = link_base(root_path);
 
     let mut sources = vec![FederatedSource {
@@ -351,6 +387,7 @@ pub fn resolve(root: Graph, root_path: &Path, limits: &FederationSettings) -> Fe
                     &mut opened,
                     &mut sources,
                     &mut next,
+                    open_remote.as_deref_mut(),
                 );
                 statuses.push(status);
             }
@@ -367,7 +404,12 @@ fn collect_links(graph: &Graph) -> Vec<Link> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn follow(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each names a distinct part of one traversal step, and bundling them into a \
+              struct used at a single call site would hide the walk rather than clarify it"
+)]
+fn follow<F>(
     link: &Link,
     base: &Path,
     declared_by: Option<CanonicalSourceLocator>,
@@ -376,7 +418,11 @@ fn follow(
     opened: &mut BTreeSet<String>,
     sources: &mut Vec<FederatedSource>,
     next: &mut Vec<(usize, PathBuf)>,
-) -> LinkStatus {
+    open_remote: Option<&mut F>,
+) -> LinkStatus
+where
+    F: FnMut(&CanonicalSourceLocator) -> Result<Vec<u8>, String>,
+{
     let mut status = LinkStatus {
         locator: link.source.clone(),
         alias: link.alias.as_ref().map(ToString::to_string),
@@ -404,12 +450,42 @@ fn follow(
     }
 
     if let Some(scheme) = link.source.scheme() {
-        // The MVP remote provider is a separate out-of-process executable, and this
-        // binary does not carry one. Saying so is better than reporting "not found",
-        // which would send a reader looking for a missing file.
-        status.unreachable = Some(Unreachable::NoProvider {
-            scheme: scheme.to_owned(),
-        });
+        let Some(open_remote) = open_remote else {
+            // A remote provider is a separate out-of-process executable, and this caller
+            // supplied none. Saying so is better than reporting "not found", which would
+            // send a reader looking for a missing file.
+            status.unreachable = Some(Unreachable::NoProvider {
+                scheme: scheme.to_owned(),
+            });
+            return status;
+        };
+        match open_remote(&link.source).and_then(|bytes| {
+            // Parsed from bytes rather than opened from a path: a remote database has no
+            // path here, and materializing one to disk would put a file somewhere nobody
+            // asked for.
+            crate::container::Container::parse(&bytes)
+                .map_err(|error| error.to_string())
+                .and_then(|container| {
+                    crate::encoding::decode_graph(&container).map_err(|error| error.to_string())
+                })
+        }) {
+            Ok(graph) => {
+                opened.insert(link.source.as_str().to_owned());
+                sources.push(FederatedSource {
+                    locator: Some(link.source.clone()),
+                    // A remote source has no local path. The locator is its identity and
+                    // the only thing that ever needed to be.
+                    path: PathBuf::from(link.source.as_str()),
+                    depth: depth + 1,
+                    graph,
+                });
+                // Not added to the frontier: a remote source's own links would each need
+                // another provider round trip, and recursing into them is deferred rather
+                // than done badly. A link it declares is not silently dropped — it is
+                // simply not followed, and one level is what this build promises.
+            }
+            Err(reason) => status.unreachable = Some(Unreachable::Unreadable { reason }),
+        }
         return status;
     }
 
@@ -1027,6 +1103,126 @@ mod tests {
         assert_eq!(
             resolved.linked_databases_opened(),
             1,
+            "{:?}",
+            resolved.statuses
+        );
+    }
+
+    #[test]
+    fn a_remote_link_with_no_provider_says_so_rather_than_reporting_it_missing() {
+        // A fact about this caller, not about the link. Reporting "not found" would send a
+        // reader looking for a missing file.
+        let dir = TempDir::new("remote-no-provider");
+        let root = graph(
+            1,
+            "Root",
+            vec![Link::new(locator("github://example/payments/?ref=main"))],
+        );
+        let path = write_database(dir.path(), "root.nostdb", &root);
+        let resolved = resolve(root, &path, &limits());
+        assert!(matches!(
+            resolved.statuses[0].unreachable,
+            Some(Unreachable::NoProvider { .. })
+        ));
+        assert!(resolved.is_partial());
+    }
+
+    #[test]
+    fn a_remote_link_opens_through_a_provider_and_joins_the_federation() {
+        let dir = TempDir::new("remote-opened");
+        // The bytes a provider would have materialized and the Engine already verified.
+        let remote = write_database(dir.path(), "remote.nostdb", &graph(2, "Remote", Vec::new()));
+        let bytes = std::fs::read(&remote).expect("the artifact");
+
+        let root = graph(
+            1,
+            "Root",
+            vec![Link::new(locator("github://example/payments/?ref=main"))],
+        );
+        let path = write_database(dir.path(), "root.nostdb", &root);
+        let mut open = |_: &CanonicalSourceLocator| Ok(bytes.clone());
+        let resolved = resolve_with(root, &path, &limits(), Some(&mut open));
+
+        assert_eq!(
+            resolved.linked_databases_opened(),
+            1,
+            "{:?}",
+            resolved.statuses
+        );
+        assert_eq!(
+            resolved.sources[1].graph.nodes[0].labels[0].as_str(),
+            "Remote"
+        );
+        assert!(!resolved.is_partial());
+    }
+
+    #[test]
+    fn a_remote_source_that_will_not_decode_is_unreachable_rather_than_fatal() {
+        // The contract requires a query over a broken link to return what it can reach, and
+        // where the break happened does not change that.
+        let dir = TempDir::new("remote-corrupt");
+        let root = graph(
+            1,
+            "Root",
+            vec![Link::new(locator("github://example/payments/?ref=main"))],
+        );
+        let path = write_database(dir.path(), "root.nostdb", &root);
+        let mut open = |_: &CanonicalSourceLocator| Ok(b"not a database".to_vec());
+        let resolved = resolve_with(root, &path, &limits(), Some(&mut open));
+
+        assert!(matches!(
+            resolved.statuses[0].unreachable,
+            Some(Unreachable::Unreadable { .. })
+        ));
+        assert_eq!(
+            resolved.sources[0].graph.nodes.len(),
+            1,
+            "the root survives"
+        );
+    }
+
+    #[test]
+    fn a_provider_that_refuses_leaves_the_link_declared() {
+        let dir = TempDir::new("remote-refused");
+        let root = graph(
+            1,
+            "Root",
+            vec![Link::new(locator("github://example/payments/?ref=main"))],
+        );
+        let path = write_database(dir.path(), "root.nostdb", &root);
+        let mut open = |_: &CanonicalSourceLocator| Err("the host did not answer".to_owned());
+        let resolved = resolve_with(root, &path, &limits(), Some(&mut open));
+
+        assert_eq!(resolved.statuses.len(), 1, "the link is still declared");
+        assert!(resolved.statuses[0].unreachable.is_some());
+        assert!(resolved.is_partial());
+    }
+
+    #[test]
+    fn a_local_link_beside_a_remote_one_still_opens() {
+        let dir = TempDir::new("remote-and-local");
+        write_database(
+            &dir.path().join("child").join(STATE_DIRECTORY),
+            "root.nostdb",
+            &graph(3, "Child", Vec::new()),
+        );
+        let remote = write_database(dir.path(), "remote.nostdb", &graph(2, "Remote", Vec::new()));
+        let bytes = std::fs::read(&remote).expect("the artifact");
+
+        let root = graph(
+            1,
+            "Root",
+            vec![
+                Link::new(locator("./child")),
+                Link::new(locator("github://example/payments/?ref=main")),
+            ],
+        );
+        let path = write_database(dir.path(), "root.nostdb", &root);
+        let mut open = |_: &CanonicalSourceLocator| Ok(bytes.clone());
+        let resolved = resolve_with(root, &path, &limits(), Some(&mut open));
+        assert_eq!(
+            resolved.linked_databases_opened(),
+            2,
             "{:?}",
             resolved.statuses
         );
