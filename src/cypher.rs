@@ -30,6 +30,16 @@ use crate::evidence::{SourcePosition, SourceRange};
 use crate::text::NonEmptyText;
 use std::fmt;
 
+/// The query subset version this build implements.
+///
+/// The Engine owns the subset, so it is the thing that can say which version of it exists. Nothing
+/// stated this before, which meant `nostdb --version --json` could not report it and a caller asking
+/// whether this build spoke the subset it needed had nothing to read.
+pub const QUERY_SUBSET_VERSION: u64 = 1;
+
+/// The query subset versions this build reads.
+pub const SUPPORTED_QUERY_SUBSET_VERSIONS: [u64; 1] = [QUERY_SUBSET_VERSION];
+
 /// Why a query was refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryError {
