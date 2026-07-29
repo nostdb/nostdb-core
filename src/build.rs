@@ -53,6 +53,12 @@ use std::path::Path;
 /// The label every analyzed file carries.
 pub const FILE_LABEL: &str = "File";
 
+/// The label every directory in the source tree carries.
+pub const DIRECTORY_LABEL: &str = "Directory";
+
+/// The path recorded for the project root, which has no name of its own.
+pub const ROOT_PATH: &str = ".";
+
 /// Relation from a container to what it declares.
 pub const CONTAINS: &str = "CONTAINS";
 
@@ -70,7 +76,12 @@ pub const FOR_TYPE: &str = "FOR_TYPE";
 /// Part of every parse cache key, so changing a label, a property, or a relation makes
 /// every stored artifact miss instead of being read back into a shape that no longer
 /// matches. Bump it whenever what a build asserts about a file changes.
-pub const GRAPH_SCHEMA_VERSION: u32 = 1;
+///
+/// It is also recorded on every file node, and reuse requires the stored value to match. Without
+/// that, a database written by an earlier shape keeps it forever: reuse compares digests, an
+/// unchanged tree is never read, and so nothing would ever rewrite records that predate a new
+/// property. A version bump is the migration — the next build redraws what it holds.
+pub const GRAPH_SCHEMA_VERSION: u32 = 2;
 
 /// The label a kind of item carries.
 #[must_use]
@@ -285,10 +296,18 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
         if !registry.precision(&file.language).is_deterministic() {
             // The capability diagnostic. Recording the file is not claiming to have read it,
             // so this entry stays and `structural` stays short of `Complete`.
+            //
+            // A file whose language could not be named is reported as unclassified rather than
+            // unsupported. Section 17.2 requires both in coverage and they are different facts:
+            // one says no analyzer covers this language, the other says there was no language to
+            // look up. Collapsing them would lose the distinction the section asks for.
             coverage.skipped_sources.push(SkippedSource {
                 source: locator.clone(),
                 path: NonEmptyText::new(&file.path).ok(),
-                reason: SkipReason::Unsupported,
+                reason: match file.language == crate::scan::UNKNOWN_LANGUAGE {
+                    true => SkipReason::Unclassified,
+                    false => SkipReason::Unsupported,
+                },
             });
             units.push(Unit::recorded(file, held, minter));
             continue;
@@ -338,7 +357,12 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
 
     // A file the source no longer holds must take its records with it. Nothing else would
     // ever remove them: they belong to a unit no scan will name again.
-    let present: BTreeSet<SourceUnitId> = units.iter().map(|held| held.unit).collect();
+    // Settled before the departed set, because the tree is a unit this build still holds. Left out
+    // of `present` it would look like a deleted file, its directories would be withdrawn, and every
+    // build would report the whole tree as changed.
+    let tree_unit = existing_tree_unit(graph).unwrap_or_else(|| minter.source_unit());
+    let mut present: BTreeSet<SourceUnitId> = units.iter().map(|held| held.unit).collect();
+    present.insert(tree_unit);
     let departed: Vec<SourceUnitId> = analyzed_units(graph)
         .into_iter()
         .filter(|unit| !present.contains(unit))
@@ -359,9 +383,18 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
     // Every unit being rebuilt withdraws its previous claim first, so a record the source
     // no longer declares disappears rather than lingering. A departed file withdraws its
     // claim and restates nothing, which is what removes it.
+    // The tree's unit withdraws with the rest. It is redrawn in full below, and without the
+    // withdrawal a directory whose last file was deleted would keep being claimed: it is upserted
+    // when it exists and nothing would ever remove it when it stops existing.
+    //
+    // Only when there is a tree to speak about, though. A project holding nothing this build
+    // records has no directories to withdraw and none to draw, and a change set carrying a lone
+    // withdrawal would commit a generation on every build over a project that never changes.
+    let redraw_tree = !units.is_empty() || existing_tree_unit(graph).is_some();
     for unit in units
         .iter()
         .map(|held| held.unit)
+        .chain(redraw_tree.then_some(tree_unit))
         .chain(departed.iter().copied())
     {
         change_set.push(GraphOperation::RemoveContribution(ContributionKey {
@@ -402,6 +435,7 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
                 // says the file is here and nothing read it, which is a different claim from
                 // an analyzer having found no items in it.
                 text_property("precision", &precision_of(registry, held).to_string()),
+                integer_property("schema_version", i64::from(GRAPH_SCHEMA_VERSION)),
             ],
             source_unit: held.unit,
             evidence: vec![file_evidence(&locator, held)],
@@ -460,6 +494,57 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
 
     let known_edges = existing_edges(graph);
     let mut edges = Edges::default();
+
+    // The tree the files sit in.
+    //
+    // Without it a graph is a bag of files. That is enough to satisfy section 17.3's minimum, and
+    // it is not enough to be worth querying: a project with no analyzer for its language would hold
+    // records nothing connects, and "which files are under docs/" would be a string comparison
+    // rather than a traversal.
+    //
+    // Paths are the only input, so this is deterministic, language-neutral, and spends nothing.
+    let mut directories: BTreeMap<String, LocalNodeId> = BTreeMap::new();
+    let mut ancestors: BTreeSet<String> = BTreeSet::new();
+    for held in &units {
+        let mut at = parent_of(&held.path);
+        loop {
+            let next = parent_of(&at);
+            ancestors.insert(at.clone());
+            if at == ROOT_PATH {
+                break;
+            }
+            at = next;
+        }
+    }
+    for path in &ancestors {
+        let id = existing_directory(graph, path).unwrap_or_else(|| minter.node());
+        directories.insert(path.clone(), id);
+        change_set.push(GraphOperation::UpsertNode(NodeDraft {
+            id: Some(id),
+            labels: vec![label(DIRECTORY_LABEL)],
+            properties: vec![
+                text_property("path", path),
+                integer_property("schema_version", i64::from(GRAPH_SCHEMA_VERSION)),
+            ],
+            source_unit: tree_unit,
+            evidence: vec![directory_evidence(&locator, path)],
+        }));
+    }
+    // A directory to its parent directory, and to every file directly in it. Both endpoints are
+    // drafted above, so no edge can name one that does not exist.
+    for (path, id) in &directories {
+        if path == ROOT_PATH {
+            continue;
+        }
+        if let Some(parent) = directories.get(&parent_of(path)) {
+            edges.add(*parent, *id, CONTAINS, tree_unit);
+        }
+    }
+    for (index, held) in units.iter().enumerate() {
+        if let Some(parent) = directories.get(&parent_of(&held.path)) {
+            edges.add(*parent, file_nodes[index].1, CONTAINS, tree_unit);
+        }
+    }
 
     // Containment: from the file to each top-level record, and from each record to its
     // children. Emitted after every node, so no edge can name an endpoint not yet drafted.
@@ -557,14 +642,21 @@ fn every_file_unchanged(scan: &Scan, graph: &Graph) -> Option<u64> {
         if stored_digest(graph, node) != Some(file.digest.as_str()) {
             return None;
         }
+        // Written by an earlier record shape. The bytes are unchanged, so nothing else here would
+        // ever notice, and the records would keep a shape this build no longer produces.
+        if stored_schema_version(graph, node) != Some(i64::from(GRAPH_SCHEMA_VERSION)) {
+            return None;
+        }
         present.insert(unit);
         count += 1;
     }
     // A unit the database holds and the scan no longer names is a deleted file, which is a
-    // change even though no file this scan saw differs.
+    // change even though no file this scan saw differs. The tree's own unit is exempt: it holds
+    // directories rather than files, so no scan names it and it is never deleted.
+    let tree = existing_tree_unit(graph);
     if analyzed_units(graph)
         .iter()
-        .any(|unit| !present.contains(unit))
+        .any(|unit| !present.contains(unit) && Some(*unit) != tree)
     {
         return None;
     }
@@ -666,6 +758,83 @@ fn existing_edges(
 /// The digest recorded on a file record, when it carries one.
 fn stored_digest(graph: &Graph, node: LocalNodeId) -> Option<&str> {
     property(graph.nodes.iter().find(|held| held.id == node)?, "digest")
+}
+
+/// The directory a path sits in, as [`ROOT_PATH`] when it sits at the top.
+///
+/// Scan paths always use `/`, on every platform, so this is not a platform-dependent split.
+fn parent_of(path: &str) -> String {
+    match path.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => parent.to_owned(),
+        _ => ROOT_PATH.to_owned(),
+    }
+}
+
+/// The source unit the directory tree already belongs to, when a build drew it before.
+///
+/// The tree gets one unit of its own rather than borrowing a file's. A directory outlives any
+/// single file in it, so owning it through one file would delete `docs/` when `docs/api.md` was
+/// removed and leave every other document in it parentless.
+fn existing_tree_unit(graph: &Graph) -> Option<SourceUnitId> {
+    let owner = analyzer_owner();
+    graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.labels
+                .iter()
+                .any(|label| label.as_str() == DIRECTORY_LABEL)
+        })
+        .flat_map(|node| node.contributions.iter())
+        .find(|held| held.owner == owner)
+        .map(|held| held.source_unit)
+}
+
+/// The node an earlier build minted for a directory, so its identifier survives a rebuild.
+fn existing_directory(graph: &Graph, path: &str) -> Option<LocalNodeId> {
+    graph
+        .nodes
+        .iter()
+        .find(|node| {
+            node.labels
+                .iter()
+                .any(|label| label.as_str() == DIRECTORY_LABEL)
+                && property(node, "path") == Some(path)
+        })
+        .map(|node| node.id)
+}
+
+/// Evidence for a directory's record.
+///
+/// The producer is the scan: a directory is something the tree walk observed, and no analyzer is
+/// involved in it at all. A directory has no contents of its own, so what is digested is its path:
+/// that is the fact being recorded, and a digest of nothing would leave the evidence unable to say
+/// what it was evidence of.
+fn directory_evidence(locator: &CanonicalSourceLocator, path: &str) -> Evidence {
+    Evidence {
+        source: locator.clone(),
+        resolved_revision: None,
+        path: NonEmptyText::new(path).ok(),
+        content_digest: crate::sync::digest_bytes(path.as_bytes()),
+        range: None,
+        producer: NonEmptyText::new(SCAN_PRODUCER)
+            .unwrap_or_else(|_| NonEmptyText::literal("scan")),
+        producer_version: NonEmptyText::new(SCAN_VERSION)
+            .unwrap_or_else(|_| NonEmptyText::literal("1")),
+        method: EvidenceMethod::Deterministic,
+        confidence: Confidence::Extracted,
+    }
+}
+
+/// The record shape a stored file node was written by, when it records one.
+///
+/// `None` for a node written before the version was recorded, which is the answer that makes such
+/// a database rebuild rather than keep a shape nothing would otherwise refresh.
+fn stored_schema_version(graph: &Graph, node: LocalNodeId) -> Option<i64> {
+    integer(
+        graph.nodes.iter().find(|held| held.id == node)?,
+        "schema_version",
+    )
 }
 
 /// Every source unit this analyzer holds a contribution for.
@@ -1067,7 +1236,10 @@ mod tests {
                 .nodes
                 .iter()
                 .find(|node| node.id == *id)
-                .and_then(|node| property(node, "name"))
+                // A file or a directory is named by its path and carries no `name`, so both are
+                // read here. Without the fallback every containment edge from a file rendered as
+                // `?` and an assertion about one could not say which file it meant.
+                .and_then(|node| property(node, "name").or_else(|| property(node, "path")))
                 .unwrap_or("?")
                 .to_owned(),
             NodeReference::External(_) => "external".to_owned(),
@@ -1147,8 +1319,21 @@ mod tests {
 
         assert!(relations(&graph, CALLS).is_empty());
         assert_eq!(draft.coverage.unresolved_units, 2);
+        // Directories are excluded rather than counted. The claim being made is that nothing was
+        // invented for `nowhere` or `elsewhere`, and a directory is observed rather than invented —
+        // counting them would make this assertion move whenever the tree's depth did.
+        let read_out_of_source = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                !node
+                    .labels
+                    .iter()
+                    .any(|label| label.as_str() == DIRECTORY_LABEL)
+            })
+            .count();
         assert_eq!(
-            graph.nodes.len(),
+            read_out_of_source,
             2,
             "the file and `main`, and nothing invented: {:?}",
             names(&graph, "Function")
@@ -1431,6 +1616,69 @@ mod tests {
     }
 
     #[test]
+    fn a_database_written_by_an_earlier_record_shape_is_redrawn_rather_than_reused() {
+        // Reuse compares digests, so an unchanged tree is never read and nothing would ever rewrite
+        // records that predate a new property. The version on each record is what makes a bump the
+        // migration: without it, a database built before `precision` existed would never gain it.
+        let dir = TempDir::new("shape-change");
+        let file = dir.write("src/lib.rs", "fn only() {}\n");
+        let mut graph = Graph::default();
+        build(&dir, vec![file.clone()], &mut graph, 1);
+
+        // What a database written by the previous shape looks like: same bytes, no version.
+        for node in &mut graph.nodes {
+            node.properties
+                .retain(|(key, _)| key.as_str() != "schema_version");
+        }
+
+        let draft = build(&dir, vec![file], &mut graph, 2);
+        assert_eq!(
+            draft.reused_files, 0,
+            "the bytes are unchanged, and the shape is not"
+        );
+        assert_eq!(draft.analyzed_files, 1, "so the file is read again");
+        assert!(
+            graph.nodes.iter().any(|node| {
+                node.labels.iter().any(|held| held.as_str() == FILE_LABEL)
+                    && integer(node, "schema_version") == Some(i64::from(GRAPH_SCHEMA_VERSION))
+            }),
+            "and its record now says which shape wrote it"
+        );
+    }
+
+    #[test]
+    fn a_directory_that_loses_its_last_file_goes_with_it() {
+        // A directory is not owned by any one file in it — it has its own source unit for exactly
+        // this reason. What must still happen is that an empty one stops being claimed, because a
+        // directory the tree no longer has is not a fact about the tree.
+        let dir = TempDir::new("emptied");
+        let kept = dir.write("src/kept.rs", "fn kept() {}\n");
+        let going = dir.write("old/going.rs", "fn going() {}\n");
+        let mut graph = Graph::default();
+        build(&dir, vec![kept.clone(), going], &mut graph, 1);
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| property(node, "path") == Some("old")),
+            "it was there to begin with"
+        );
+
+        build(&dir, vec![kept], &mut graph, 2);
+        let remaining: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.labels
+                    .iter()
+                    .any(|held| held.as_str() == DIRECTORY_LABEL)
+            })
+            .filter_map(|node| property(node, "path"))
+            .collect();
+        assert_eq!(remaining, [".", "src"], "and `old` left with its last file");
+    }
+
+    #[test]
     fn a_project_holding_only_documents_builds_a_graph() {
         // The direction this Stage answers: analysis must not depend on the language, and a
         // repository of documents with no code at all has to be analyzable. Whatever else is
@@ -1453,16 +1701,35 @@ mod tests {
             !draft.change_set.operations.is_empty(),
             "an empty change set is refused, and would commit no generation at all"
         );
-        let paths = {
+        let paths = |label: &str| {
             let mut found: Vec<&str> = graph
                 .nodes
                 .iter()
+                .filter(|node| node.labels.iter().any(|held| held.as_str() == label))
                 .filter_map(|node| property(node, "path"))
                 .collect();
             found.sort_unstable();
             found
         };
-        assert_eq!(paths, ["README.md", "docs/api.md", "docs/design.md"]);
+        assert_eq!(
+            paths(FILE_LABEL),
+            ["README.md", "docs/api.md", "docs/design.md"]
+        );
+        // And the tree they sit in, so the graph is something to walk rather than a list.
+        assert_eq!(paths(DIRECTORY_LABEL), [".", "docs"]);
+        let contains = relations(&graph, CONTAINS);
+        assert!(
+            contains.contains(&(".".to_owned(), "docs".to_owned())),
+            "a directory reaches its subdirectory: {contains:?}"
+        );
+        assert!(
+            contains.contains(&("docs".to_owned(), "docs/api.md".to_owned())),
+            "and the files directly in it: {contains:?}"
+        );
+        assert!(
+            contains.contains(&(".".to_owned(), "README.md".to_owned())),
+            "including at the top: {contains:?}"
+        );
     }
 
     #[test]

@@ -2088,7 +2088,12 @@ mod tests {
         assert!(report.generation > before, "a generation is committed");
         assert_eq!(report.analyzed_files, 0, "no analyzer covers Kotlin");
         assert_eq!(report.recorded_files, 2, "and both files are in the graph");
-        assert_eq!(report.summary.nodes_created, 2);
+        // Two files and the four directories they sit in: `.`, `src`, `src/main`, `src/main/kotlin`.
+        assert_eq!(report.summary.nodes_created, 6);
+        assert!(
+            report.summary.edges_created > 0,
+            "and the tree connects them"
+        );
         // Coverage still says what has no analyzer, per section 17.2. A record is not coverage.
         assert_eq!(
             report.coverage.structural,
@@ -2112,7 +2117,17 @@ mod tests {
             })
             .collect();
         paths.sort_unstable();
-        assert_eq!(paths, ["build.gradle.kts", "src/main/kotlin/Server.kt"]);
+        assert_eq!(
+            paths,
+            [
+                ".",
+                "build.gradle.kts",
+                "src",
+                "src/main",
+                "src/main/kotlin",
+                "src/main/kotlin/Server.kt",
+            ]
+        );
     }
 
     #[test]
@@ -2149,10 +2164,12 @@ mod tests {
     }
 
     #[test]
-    fn a_project_with_no_analyzable_source_is_not_a_failure() {
+    fn a_project_holding_nothing_at_all_commits_nothing() {
+        // The empty case, which is what this used to test with a `notes.txt` in it. That file is
+        // now recorded — a repository of plain text is a repository — so proving that an empty
+        // change set commits no generation needs a project that really is empty.
         let dir = TempDir::new("build-empty");
         let project = Project::initialize(dir.path()).unwrap();
-        fs::write(dir.path().join("notes.txt"), "nothing to analyze\n").unwrap();
 
         let registry = crate::analyze::builtin_registry().unwrap();
         let before = project.open_database().unwrap().generation();
@@ -2161,10 +2178,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.analyzed_files, 0);
+        assert_eq!(report.recorded_files, 0);
         assert!(report.summary.is_empty());
         assert_eq!(
             report.generation, before,
             "nothing was found, so nothing is committed"
+        );
+    }
+
+    #[test]
+    fn a_project_of_plain_text_is_recorded_even_though_no_extension_names_a_language() {
+        // `.txt` is in no language list and never will be in every list. The direction is that
+        // analysis does not depend on the language, so what a file is called cannot decide whether
+        // it appears in its own repository's graph.
+        let dir = TempDir::new("plain-text");
+        let project = Project::initialize(dir.path()).unwrap();
+        fs::write(dir.path().join("notes.txt"), "nothing to analyze\n").unwrap();
+        fs::write(dir.path().join("CHANGELOG"), "released\n").unwrap();
+
+        let registry = crate::analyze::builtin_registry().unwrap();
+        let report = project
+            .build(&registry, &crate::scan::ScanOptions::default(), false)
+            .unwrap();
+
+        assert_eq!(report.analyzed_files, 0);
+        assert_eq!(
+            report.recorded_files, 2,
+            "including the one with no extension"
+        );
+        // Coverage says unclassified rather than unsupported: there was no language to look up,
+        // which is a different fact from no analyzer covering one.
+        assert!(
+            report
+                .coverage
+                .skipped_sources
+                .iter()
+                .all(|held| { held.reason == crate::coverage::SkipReason::Unclassified }),
+            "{:?}",
+            report.coverage.skipped_sources
         );
     }
 

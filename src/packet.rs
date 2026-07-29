@@ -183,6 +183,13 @@ impl AnalysisPacket {
     }
 }
 
+/// Whether a node is a directory rather than something read out of a file.
+fn is_directory(node: &crate::graph::Node) -> bool {
+    node.labels
+        .iter()
+        .any(|label| label.as_str() == crate::build::DIRECTORY_LABEL)
+}
+
 /// Builds a packet for one source unit.
 ///
 /// `excerpts` are supplied by the caller rather than read here: the Engine does not hold
@@ -240,6 +247,11 @@ pub fn build(
         if let Some(node) = graph.nodes.iter().find(|node| node.id == *outside)
             && let Some(unit) = unit_of(node)
             && unit != source_unit
+            // The directory a file sits in is not context worth spending a token on. Its whole
+            // content is the path, and the packet already carries the path. Every file has a
+            // parent, so without this every packet in the repository would name the tree's unit as
+            // a neighbour and describe a fact the model can read off the file name.
+            && !is_directory(node)
         {
             let entry = neighbours.entry(unit).or_insert((text(node, "path"), 0));
             entry.1 += 1;

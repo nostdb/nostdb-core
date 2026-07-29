@@ -147,6 +147,19 @@ const LANGUAGES: [(&str, &str); 42] = [
     ("zsh", "shell"),
 ];
 
+/// The language recorded for a text file whose language cannot be named.
+///
+/// A name rather than an absence, so every scanned file carries one and nothing downstream has to
+/// handle a missing language. It is not in [`LANGUAGES`] and no analyzer registers it, so its
+/// precision is [`crate::analysis::PrecisionClass::Unsupported`] — which is the truth.
+///
+/// Recorded rather than skipped because a repository of `.txt` files is a repository. Naming a
+/// language is how a report says "42 Python files, unsupported" instead of "42 unclassified files",
+/// and the answer to a file whose language cannot be named is that it is a file, not that it is
+/// absent. Extending [`LANGUAGES`] until every document form appeared in it would be the
+/// product-level allowlist section 4 forbids, one extension at a time.
+pub const UNKNOWN_LANGUAGE: &str = "unknown";
+
 /// Extensionless file names this build can still name a language for.
 const NAMED_FILES: [(&str, &str); 6] = [
     ("CMakeLists.txt", "cmake"),
@@ -529,10 +542,6 @@ impl Walk {
             self.skip(relative, SkipReason::TooLarge);
             return;
         }
-        let Some(language) = language_of(relative) else {
-            self.skip(relative, SkipReason::Unclassified);
-            return;
-        };
         let Ok(contents) = fs::read(path) else {
             self.skip(relative, SkipReason::PermissionDenied);
             return;
@@ -541,6 +550,16 @@ impl Walk {
             self.skip(relative, SkipReason::Binary);
             return;
         }
+        // After the read, not before it.
+        //
+        // Classifying first was cheaper — an unnamed extension cost no read at all — and it decided
+        // by extension that a file was absent from its own repository. It also mislabelled: a `.png`
+        // was reported `Unclassified` when `Binary` is what it is, because nothing had looked.
+        //
+        // The read is bounded by `max_file_bytes` above, so what this costs is reading text files
+        // that will hold no facts. What it buys is that a document is in the graph whatever it is
+        // called, and that the skip reasons say what was actually true of the bytes.
+        let language = language_of(relative).unwrap_or(UNKNOWN_LANGUAGE);
         self.scan.files.push(ScannedFile {
             path: relative.to_owned(),
             language: language.to_owned(),
@@ -596,6 +615,13 @@ mod tests {
         scan.files.iter().map(|file| file.path.as_str()).collect()
     }
 
+    fn language<'a>(scan: &'a Scan, path: &str) -> Option<&'a str> {
+        scan.files
+            .iter()
+            .find(|file| file.path == path)
+            .map(|file| file.language.as_str())
+    }
+
     fn reason(scan: &Scan, path: &str) -> Option<SkipReason> {
         scan.skipped
             .iter()
@@ -642,7 +668,9 @@ mod tests {
         dir.write("generated/out.rs", "fn main() {}\n");
 
         let found = run(&dir, &ScanOptions::default());
-        assert_eq!(paths(&found), ["keep.rs"]);
+        // `.gitignore` is content as well as an input to this scan, so it is recorded like any
+        // other text file. What this test is about is the three assertions below.
+        assert_eq!(paths(&found), [".gitignore", "keep.rs"]);
         assert_eq!(reason(&found, "debug.log"), Some(SkipReason::Ignored));
         assert_eq!(reason(&found, "generated"), Some(SkipReason::Ignored));
         assert!(
@@ -661,7 +689,7 @@ mod tests {
         dir.write("fixtures/big.rs", "fn main() {}\n");
 
         let found = run(&dir, &ScanOptions::default());
-        assert_eq!(paths(&found), ["keep.rs"]);
+        assert_eq!(paths(&found), [".gitignore", ".nostdbignore", "keep.rs"]);
         assert_eq!(reason(&found, "fixtures"), Some(SkipReason::Ignored));
     }
 
@@ -675,8 +703,12 @@ mod tests {
         dir.write("secret.rs", "fn main() {}\n");
 
         let found = run(&dir, &ScanOptions::default());
-        assert!(paths(&found).is_empty(), "{:?}", found.files);
-        assert_eq!(reason(&found, "secret.rs"), Some(SkipReason::Ignored));
+        assert_eq!(paths(&found), [".gitignore", ".nostdbignore"]);
+        assert_eq!(
+            reason(&found, "secret.rs"),
+            Some(SkipReason::Ignored),
+            "the file the negation tried to re-include stays excluded"
+        );
     }
 
     #[test]
@@ -693,7 +725,7 @@ mod tests {
             ..ScanOptions::default()
         };
         let found = run(&dir, &options);
-        assert_eq!(paths(&found), ["secret.rs"]);
+        assert_eq!(paths(&found), [".gitignore", ".nostdbignore", "secret.rs"]);
     }
 
     #[test]
@@ -788,19 +820,25 @@ mod tests {
     }
 
     #[test]
-    fn a_file_whose_language_cannot_be_named_is_unclassified_rather_than_dropped() {
+    fn a_file_whose_language_cannot_be_named_is_kept_and_named_unknown() {
+        // It used to be skipped, so a repository of `.txt` files had nothing in its graph. An
+        // extension decided whether a file existed at all, which is a language-dependent outcome
+        // reached without anybody writing a language list.
         let dir = TempDir::new("unclassified");
         dir.write("src/main.rs", "fn main() {}\n");
         dir.write("notes", "plain text\n");
         dir.write("data.frobnicate", "who knows\n");
 
         let found = run(&dir, &ScanOptions::default());
-        assert_eq!(paths(&found), ["src/main.rs"]);
-        assert_eq!(reason(&found, "notes"), Some(SkipReason::Unclassified));
+        assert_eq!(paths(&found), ["data.frobnicate", "notes", "src/main.rs"]);
+        assert_eq!(language(&found, "notes"), Some(UNKNOWN_LANGUAGE));
+        assert_eq!(language(&found, "data.frobnicate"), Some(UNKNOWN_LANGUAGE));
         assert_eq!(
-            reason(&found, "data.frobnicate"),
-            Some(SkipReason::Unclassified)
+            language(&found, "src/main.rs"),
+            Some("rust"),
+            "a language that can be named still is"
         );
+        assert!(found.skipped.is_empty(), "{:?}", found.skipped);
         assert_eq!(found.visited(), 3, "every path reached is accounted for");
     }
 
@@ -842,9 +880,11 @@ mod tests {
         dir.write("node_modules/x/index.js", "1\n");
 
         let found = run(&dir, &ScanOptions::default());
-        assert_eq!(found.files.len(), 1);
-        // `.gitignore`, `app.log`, `notes`, `.env`, `node_modules`.
-        assert_eq!(found.skipped.len(), 5, "{:?}", found.skipped);
+        // `src/main.rs`, plus `.gitignore` and `notes` named `unknown`.
+        assert_eq!(found.files.len(), 3, "{:?}", paths(&found));
+        // `app.log` ignored, `.env` sensitive, `node_modules` ignored. `.env` is caught by name
+        // before anything is read, so recording unclassified text never reaches a secret.
+        assert_eq!(found.skipped.len(), 3, "{:?}", found.skipped);
         assert_eq!(found.visited(), 6);
     }
 
@@ -923,9 +963,9 @@ mod tests {
             Some(SkipReason::Ignored)
         );
         assert_eq!(
-            reason(&found, "keep/kept.log"),
-            Some(SkipReason::Unclassified),
-            "the deeper negation re-included it, so it is judged on its language instead"
+            language(&found, "keep/kept.log"),
+            Some(UNKNOWN_LANGUAGE),
+            "the deeper negation re-included it, and `.log` names no language"
         );
     }
 }
