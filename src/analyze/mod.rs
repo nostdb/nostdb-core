@@ -15,6 +15,7 @@
 //! with the facts. A caller must be able to tell a resolved fact from a syntactic one, and
 //! presenting the second as the first is the specific thing the contract forbids.
 
+pub mod kotlin;
 pub mod kotlin_lexer;
 pub mod rust;
 pub mod rust_lexer;
@@ -214,6 +215,7 @@ pub fn range(start: At, end: At) -> SourceRange {
 /// analyzers here declared the same language.
 pub fn builtin_registry() -> Result<CapabilityRegistry, crate::analysis::CapabilityError> {
     let mut registry = CapabilityRegistry::new();
+    registry.register(kotlin::capability())?;
     registry.register(rust::capability())?;
     Ok(registry)
 }
@@ -225,6 +227,7 @@ pub fn builtin_registry() -> Result<CapabilityRegistry, crate::analysis::Capabil
 #[must_use]
 pub fn analyze(language: &str, source: &str) -> Option<FileAnalysis> {
     match language {
+        "kotlin" => Some(kotlin::analyze(source)),
         "rust" => Some(rust::analyze(source)),
         _ => None,
     }

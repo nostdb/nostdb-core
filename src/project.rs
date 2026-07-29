@@ -2069,15 +2069,18 @@ mod tests {
         // a source record for an unsupported language, so the empty generation was a defect and
         // not the language's fault. An analyzer adds facts inside a record; it does not decide
         // whether the repository appears in its own graph.
-        let dir = TempDir::new("kotlin-only");
+        // Ruby, which nothing here analyzes. This was written with Kotlin, and Kotlin gained an
+        // analyzer — so the case moved rather than went away, and using a language that *is* read
+        // would have made this test pass for the wrong reason.
+        let dir = TempDir::new("unanalyzed-only");
         let project = Project::initialize(dir.path()).unwrap();
-        fs::create_dir_all(dir.path().join("src/main/kotlin")).unwrap();
+        fs::create_dir_all(dir.path().join("lib/demo")).unwrap();
         fs::write(
-            dir.path().join("src/main/kotlin/Server.kt"),
-            "package demo\n\nclass Server(val port: Int) {\n    fun start() {}\n}\n",
+            dir.path().join("lib/demo/server.rb"),
+            "class Server\n  def start\n  end\nend\n",
         )
         .unwrap();
-        fs::write(dir.path().join("build.gradle.kts"), "plugins { }\n").unwrap();
+        fs::write(dir.path().join("Rakefile"), "task :default\n").unwrap();
 
         let registry = crate::analyze::builtin_registry().unwrap();
         let before = project.open_database().unwrap().generation();
@@ -2086,10 +2089,10 @@ mod tests {
             .unwrap();
 
         assert!(report.generation > before, "a generation is committed");
-        assert_eq!(report.analyzed_files, 0, "no analyzer covers Kotlin");
+        assert_eq!(report.analyzed_files, 0, "no analyzer covers Ruby");
         assert_eq!(report.recorded_files, 2, "and both files are in the graph");
-        // Two files and the four directories they sit in: `.`, `src`, `src/main`, `src/main/kotlin`.
-        assert_eq!(report.summary.nodes_created, 6);
+        // Two files and the three directories they sit in: `.`, `lib`, `lib/demo`.
+        assert_eq!(report.summary.nodes_created, 5);
         assert!(
             report.summary.edges_created > 0,
             "and the tree connects them"
@@ -2119,14 +2122,7 @@ mod tests {
         paths.sort_unstable();
         assert_eq!(
             paths,
-            [
-                ".",
-                "build.gradle.kts",
-                "src",
-                "src/main",
-                "src/main/kotlin",
-                "src/main/kotlin/Server.kt",
-            ]
+            [".", "Rakefile", "lib", "lib/demo", "lib/demo/server.rb"]
         );
     }
 
@@ -2183,6 +2179,108 @@ mod tests {
         assert_eq!(
             report.generation, before,
             "nothing was found, so nothing is committed"
+        );
+    }
+
+    #[test]
+    fn a_kotlin_project_is_analyzed_and_not_merely_recorded() {
+        // The report that opened Stage 13 was a Kotlin service building to `0 nodes, 0 edges`. Stage 13
+        // gave it its files and its tree; this is the half that reads inside them, and the difference
+        // between the two is what `analyzed_files` and `recorded_files` separately mean.
+        let dir = TempDir::new("kotlin-analyzed");
+        let project = Project::initialize(dir.path()).unwrap();
+        fs::create_dir_all(dir.path().join("src/main/kotlin")).unwrap();
+        fs::write(
+            dir.path().join("src/main/kotlin/Server.kt"),
+            "package demo\n\n\
+             import java.time.Duration\n\n\
+             class Server(val port: Int) {\n\
+             \x20   fun start() { configure() }\n\
+             \x20   private fun configure() {}\n\
+             }\n",
+        )
+        .unwrap();
+
+        let registry = crate::analyze::builtin_registry().unwrap();
+        let report = project
+            .build(&registry, &crate::scan::ScanOptions::default(), false)
+            .unwrap();
+
+        assert_eq!(report.analyzed_files, 1, "the analyzer read it");
+        assert_eq!(report.recorded_files, 1);
+        assert_eq!(
+            report.coverage.structural,
+            crate::coverage::CoverageState::Complete,
+            "every file has an analyzer, so coverage is complete rather than partial"
+        );
+
+        let database = project.open_database().unwrap();
+        let graph = crate::encoding::read_graph(&database).unwrap();
+        let named = |label: &str| {
+            let mut found: Vec<&str> = graph
+                .nodes
+                .iter()
+                .filter(|node| node.labels.iter().any(|held| held.as_str() == label))
+                .filter_map(|node| {
+                    node.properties.iter().find_map(|(key, value)| match value {
+                        crate::property::PropertyValue::String(text) if key.as_str() == "name" => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                })
+                .collect();
+            found.sort_unstable();
+            found
+        };
+        assert_eq!(named("Struct"), ["Server"], "the class");
+        assert_eq!(named("Method"), ["configure", "start"], "and its methods");
+        assert_eq!(named("Field"), ["port"], "and its constructor property");
+
+        // The call inside `start` resolved to the method it names, which is the whole point of
+        // reading inside a file rather than recording that it exists.
+        let calls: Vec<(&str, &str)> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.relation.as_str() == crate::build::CALLS)
+            .filter_map(|edge| {
+                let name_of = |reference: &crate::graph::NodeReference| match reference {
+                    crate::graph::NodeReference::Local(id) => graph
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == *id)
+                        .and_then(|node| {
+                            node.properties.iter().find_map(|(key, value)| match value {
+                                crate::property::PropertyValue::String(text)
+                                    if key.as_str() == "name" =>
+                                {
+                                    Some(text.as_str())
+                                }
+                                _ => None,
+                            })
+                        }),
+                    crate::graph::NodeReference::External(_) => None,
+                };
+                Some((name_of(&edge.source)?, name_of(&edge.target)?))
+            })
+            .collect();
+        assert_eq!(calls, [("start", "configure")], "{calls:?}");
+
+        // And the provenance says which analyzer, at which version, rather than the Rust one.
+        let producers: std::collections::BTreeSet<&str> = graph
+            .nodes
+            .iter()
+            .flat_map(|node| node.contributions.iter())
+            .flat_map(|held| held.evidence.iter())
+            .map(|held| held.producer.as_str())
+            .collect();
+        assert!(
+            producers.contains("kotlin"),
+            "a Kotlin record names the Kotlin analyzer: {producers:?}"
+        );
+        assert!(
+            !producers.contains("rust"),
+            "and never the Rust one: {producers:?}"
         );
     }
 

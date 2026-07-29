@@ -81,7 +81,11 @@ pub const FOR_TYPE: &str = "FOR_TYPE";
 /// that, a database written by an earlier shape keeps it forever: reuse compares digests, an
 /// unchanged tree is never read, and so nothing would ever rewrite records that predate a new
 /// property. A version bump is the migration — the next build redraws what it holds.
-pub const GRAPH_SCHEMA_VERSION: u32 = 2;
+///
+/// 3 because a second analyzer arrived. A Kotlin file used to assert only that it existed and now
+/// asserts what is declared in it, so a database built before it holds Kotlin records this build
+/// would not write. Reuse would keep them: the bytes did not change.
+pub const GRAPH_SCHEMA_VERSION: u32 = 3;
 
 /// The label a kind of item carries.
 #[must_use]
