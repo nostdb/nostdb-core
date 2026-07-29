@@ -671,17 +671,50 @@ pub fn parse_cache_key(file: &crate::scan::ScannedFile) -> crate::cache::Structu
         language: file.language.clone(),
         // The analyzer's version is part of its identity, so a new analyzer never reads an
         // old one's work back as its own.
-        analyzer_digest: format!(
-            "{}/{}",
-            crate::analyze::rust::LANGUAGE,
-            crate::analyze::rust::VERSION
-        ),
+        //
+        // Named per language rather than fixed to Rust. With one analyzer the two were the same
+        // string; with two, a Kotlin parse would be stored under the Rust analyzer's identity, so
+        // bumping the Kotlin analyzer would not invalidate Kotlin parses and bumping the Rust one
+        // would invalidate them for no reason.
+        analyzer_digest: format!("{}/{}", file.language, analyzer_version(&file.language)),
         analyzer_config_digest: "default".to_owned(),
         graph_schema_version: GRAPH_SCHEMA_VERSION,
     }
 }
 
+/// The version the analyzer for a language declares, or `"0"` when nothing analyzes it.
+///
+/// Read from the declared capability rather than from a constant, because the capability is where an
+/// analyzer states its version and a second copy of it is a second answer. `"0"` for an unanalyzed
+/// language is deliberate: a recorded file's provenance is the scan's, so nothing reaches this with a
+/// language no analyzer covers, and a value that could not belong to a real analyzer makes a mistake
+/// visible instead of plausible.
+fn analyzer_version(language: &str) -> String {
+    crate::analyze::builtin_registry()
+        .ok()
+        .and_then(|registry| {
+            registry
+                .capability(language)
+                .map(|found| found.version.as_str().to_owned())
+        })
+        .unwrap_or_else(|| "0".to_owned())
+}
+
 /// The owner every record this module produces belongs to.
+///
+/// **Still one value, and still named for Rust.** That is wrong with a second analyzer and it is not
+/// changed here, because changing it cannot be done without deciding something the product contract
+/// has not decided.
+///
+/// `docs/PRD.md` section 11.3 lets a change set remove only contributions owned by its own owner, and
+/// `GraphChangeSet::validate` enforces it. So renaming this owner would leave every record an earlier
+/// build wrote owned by a name nothing can withdraw: `existing_unit` would not find them, fresh units
+/// would be minted beside them, and the graph would hold both readings of every file forever.
+///
+/// Retiring a superseded owner is the same question as retiring a superseded analyzer *version*, which
+/// section 11.3 also leaves open. Both are recorded in the root `IMPLEMENTATION_PROGRESS.md` awaiting
+/// the owning contract. Until then the honest state is one stable owner with per-language provenance
+/// in evidence — which is what section 11.4 dedicates `Evidence` to, and where it now is.
 #[must_use]
 pub fn analyzer_owner() -> Owner {
     Owner::Analyzer {
@@ -1001,9 +1034,11 @@ fn push_edge(
             path: None,
             content_digest: crate::sync::digest_bytes(&[]),
             range: None,
-            producer: NonEmptyText::new(crate::analyze::rust::LANGUAGE)
-                .unwrap_or_else(|_| NonEmptyText::literal("rust")),
-            producer_version: NonEmptyText::new(crate::analyze::rust::VERSION)
+            // The scan, not an analyzer. This is a link the settings declare, and naming the Rust
+            // analyzer as its producer said a language analyzer had found something it never read.
+            producer: NonEmptyText::new(SCAN_PRODUCER)
+                .unwrap_or_else(|_| NonEmptyText::literal("scan")),
+            producer_version: NonEmptyText::new(SCAN_VERSION)
                 .unwrap_or_else(|_| NonEmptyText::literal("1")),
             method: EvidenceMethod::Deterministic,
             confidence: Confidence::Extracted,
@@ -1066,8 +1101,8 @@ fn analyzed_evidence(
         content_digest: analysis.digest.clone(),
         range: None,
         producer: NonEmptyText::new(analysis.language.as_str())
-            .unwrap_or_else(|_| NonEmptyText::literal("rust")),
-        producer_version: NonEmptyText::new(crate::analyze::rust::VERSION)
+            .unwrap_or_else(|_| NonEmptyText::literal("unknown")),
+        producer_version: NonEmptyText::new(analyzer_version(&analysis.language).as_str())
             .unwrap_or_else(|_| NonEmptyText::literal("1")),
         method: EvidenceMethod::Deterministic,
         confidence: Confidence::Extracted,
