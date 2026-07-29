@@ -234,9 +234,10 @@ impl DiagnosticCode {
     #[must_use]
     pub const fn default_severity(&self) -> Severity {
         match self {
-            Self::NostUnresolvedEndpoint | Self::NostSchemaViolation | Self::OrphanLinkSettings => {
-                Severity::Warning
-            }
+            Self::NostUnresolvedEndpoint
+            | Self::NostSchemaViolation
+            | Self::OrphanLinkSettings
+            | Self::CypherUnknownLabel => Severity::Warning,
             _ => Severity::Error,
         }
     }
