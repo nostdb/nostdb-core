@@ -805,6 +805,9 @@ impl Project {
                 coverage: draft.coverage,
                 analyzed_files: draft.analyzed_files,
                 recorded_files: draft.recorded_files,
+                endpoints: draft.endpoints,
+                frameworks: draft.frameworks.clone(),
+                uninterpreted_annotations: draft.uninterpreted_annotations.clone(),
                 reused_files: draft.reused_files,
                 cached_parses: draft.cached_parses,
                 resolved_references: draft.resolved_references,
@@ -826,6 +829,9 @@ impl Project {
             coverage: draft.coverage,
             analyzed_files: draft.analyzed_files,
             recorded_files: draft.recorded_files,
+            endpoints: draft.endpoints,
+            frameworks: draft.frameworks,
+            uninterpreted_annotations: draft.uninterpreted_annotations,
             reused_files: draft.reused_files,
             cached_parses: draft.cached_parses,
             resolved_references: draft.resolved_references,
@@ -1318,6 +1324,12 @@ pub struct BuildReport {
     pub analyzed_files: u64,
     /// How many files hold a record, whether or not an analyzer read them.
     pub recorded_files: u64,
+    /// Framework entry points recorded.
+    pub endpoints: u64,
+    /// The frameworks whose analyzers recognised something, in name order.
+    pub frameworks: Vec<String>,
+    /// Annotation names no framework analyzer interpreted, in name order.
+    pub uninterpreted_annotations: Vec<String>,
     /// How many files were reused rather than re-read.
     pub reused_files: u64,
     /// How many parses came from the cache rather than from the source.
@@ -2179,6 +2191,115 @@ mod tests {
         assert_eq!(
             report.generation, before,
             "nothing was found, so nothing is committed"
+        );
+    }
+
+    #[test]
+    fn a_spring_controller_becomes_a_queryable_endpoint() {
+        // The reported question, end to end: `MATCH (e:Endpoint)` returned nothing because nothing
+        // produced that label and because the route had been discarded with the annotation.
+        let dir = TempDir::new("spring-endpoints");
+        let project = Project::initialize(dir.path()).unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/AuthController.kt"),
+            "package demo\n\n\
+             import org.springframework.web.bind.annotation.RestController\n\n\
+             @RestController\n\
+             @RequestMapping(\"/api/auth\")\n\
+             class AuthController {\n\
+             \x20   @GetMapping(\"/google\")\n\
+             \x20   fun googleUrl(): String = \"\"\n\
+             \x20   @PostMapping(\"/callback\")\n\
+             \x20   fun callback(): String = \"\"\n\
+             }\n",
+        )
+        .unwrap();
+        // A second file using a framework nothing here reads, so both halves are exercised at once.
+        fs::write(
+            dir.path().join("src/Widget.kt"),
+            "package demo\n\n@Entity\n@Table(\"widgets\")\nclass Widget\n",
+        )
+        .unwrap();
+
+        let registry = crate::analyze::builtin_registry().unwrap();
+        let report = project
+            .build(&registry, &crate::scan::ScanOptions::default(), false)
+            .unwrap();
+
+        assert_eq!(report.endpoints, 2);
+        assert_eq!(report.frameworks, ["spring"]);
+        // The capability diagnostic: annotations seen and not interpreted, by name. `RestController`
+        // and the mappings are interpreted, so they are absent from this list.
+        assert_eq!(report.uninterpreted_annotations, ["Entity", "Table"]);
+
+        let database = project.open_database().unwrap();
+        let graph = crate::encoding::read_graph(&database).unwrap();
+        let text_of = |node: &crate::graph::Node, key: &str| {
+            node.properties
+                .iter()
+                .find_map(|(held, value)| match value {
+                    crate::property::PropertyValue::String(found) if held.as_str() == key => {
+                        Some(found.clone())
+                    }
+                    _ => None,
+                })
+        };
+        let mut routes: Vec<(String, String, String)> = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.labels
+                    .iter()
+                    .any(|held| held.as_str() == crate::build::ENDPOINT_LABEL)
+            })
+            .map(|node| {
+                (
+                    text_of(node, "method").unwrap_or_default(),
+                    text_of(node, "path").unwrap_or_default(),
+                    text_of(node, "precision").unwrap_or_default(),
+                )
+            })
+            .collect();
+        routes.sort();
+        assert_eq!(
+            routes,
+            [
+                (
+                    "GET".to_owned(),
+                    "/api/auth/google".to_owned(),
+                    "deterministic syntactic".to_owned()
+                ),
+                (
+                    "POST".to_owned(),
+                    "/api/auth/callback".to_owned(),
+                    "deterministic syntactic".to_owned()
+                ),
+            ],
+            "the class prefix joins the method path, and every record says how precisely it was read"
+        );
+
+        // And each route reaches the method that serves it.
+        let handled: Vec<(String, String)> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.relation.as_str() == crate::build::HANDLED_BY)
+            .filter_map(|edge| {
+                let named = |reference: &crate::graph::NodeReference, key: &str| match reference {
+                    crate::graph::NodeReference::Local(id) => graph
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == *id)
+                        .and_then(|node| text_of(node, key)),
+                    crate::graph::NodeReference::External(_) => None,
+                };
+                Some((named(&edge.source, "path")?, named(&edge.target, "name")?))
+            })
+            .collect();
+        assert_eq!(handled.len(), 2, "{handled:?}");
+        assert!(
+            handled.contains(&("/api/auth/google".to_owned(), "googleUrl".to_owned())),
+            "{handled:?}"
         );
     }
 

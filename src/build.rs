@@ -53,6 +53,17 @@ use std::path::Path;
 /// The label every analyzed file carries.
 pub const FILE_LABEL: &str = "File";
 
+/// The label a framework's entry point carries.
+///
+/// `Endpoint` rather than `EntryPoint`, which is the fact kind's name. An HTTP route is one kind of
+/// configuration-defined entry point and a scheduled job is another, and giving them one label with a
+/// `kind` property would make every query about routes filter on a property to avoid matching jobs. The
+/// fact kind stays the general one; the label names the specific thing.
+pub const ENDPOINT_LABEL: &str = "Endpoint";
+
+/// Relation from a framework's entry point to the declaration that serves it.
+pub const HANDLED_BY: &str = "HANDLED_BY";
+
 /// The label every directory in the source tree carries.
 pub const DIRECTORY_LABEL: &str = "Directory";
 
@@ -85,7 +96,7 @@ pub const FOR_TYPE: &str = "FOR_TYPE";
 /// 3 because a second analyzer arrived. A Kotlin file used to assert only that it existed and now
 /// asserts what is declared in it, so a database built before it holds Kotlin records this build
 /// would not write. Reuse would keep them: the bytes did not change.
-pub const GRAPH_SCHEMA_VERSION: u32 = 3;
+pub const GRAPH_SCHEMA_VERSION: u32 = 4;
 
 /// The label a kind of item carries.
 #[must_use]
@@ -147,6 +158,17 @@ pub struct BuildDraft {
     pub reused_files: u64,
     /// Files whose parse came from the cache rather than from the source.
     pub cached_parses: u64,
+    /// Framework entry points recorded.
+    pub endpoints: u64,
+    /// The frameworks whose analyzers recognised something, in name order.
+    pub frameworks: Vec<String>,
+    /// Annotation names no framework analyzer interpreted, in name order.
+    ///
+    /// The capability diagnostic section 17.3 requires, and the evidence a caller needs to decide what
+    /// is worth enriching. Reported by annotation name rather than by framework: naming a framework this
+    /// build cannot read would need a list of frameworks it knows of and cannot read, which is a closed
+    /// allowlist by another route.
+    pub uninterpreted_annotations: Vec<String>,
 }
 
 /// What one file contributes to settling an item's identity.
@@ -281,6 +303,9 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
                 request.base_generation,
             ),
             coverage,
+            endpoints: 0,
+            frameworks: Vec::new(),
+            uninterpreted_annotations: Vec::new(),
             analyzed_files: 0,
             recorded_files: 0,
             resolved_references: 0,
@@ -499,6 +524,67 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
     let known_edges = existing_edges(graph);
     let mut edges = Edges::default();
 
+    // Framework entry points, and the declarations that serve them.
+    //
+    // Drafted after every item node exists, so `HANDLED_BY` can name the method it points at. A route
+    // whose handler is not among the planned records gets the edge omitted rather than a placeholder:
+    // the endpoint is still a fact about the project, and inventing a handler would assert a method the
+    // source does not declare.
+    let mut uninterpreted: BTreeSet<String> = BTreeSet::new();
+    let mut framework_names: BTreeSet<String> = BTreeSet::new();
+    let mut endpoints_found = 0_u64;
+    for (index, held) in units.iter().enumerate() {
+        if !held.analyzed {
+            continue;
+        }
+        let framework = crate::analyze::framework::analyze(&held.analysis);
+        uninterpreted.extend(framework.uninterpreted.iter().cloned());
+        framework_names.extend(framework.frameworks.iter().cloned());
+        let file_id = file_nodes[index].1;
+        for endpoint in &framework.endpoints {
+            endpoints_found += 1;
+            let id = minter.node();
+            change_set.push(GraphOperation::UpsertNode(NodeDraft {
+                id: Some(id),
+                labels: vec![label(ENDPOINT_LABEL)],
+                properties: vec![
+                    text_property("method", &endpoint.method),
+                    text_property("path", &endpoint.path),
+                    text_property("handler", &endpoint.handler),
+                    text_property(
+                        "framework",
+                        &framework
+                            .frameworks
+                            .iter()
+                            .next()
+                            .cloned()
+                            .unwrap_or_default(),
+                    ),
+                    // A framework analyzer reads what a language analyzer wrote down, so its precision
+                    // is its own and is recorded on the record. Section 17.3 requires that nothing imply
+                    // an AI-inferred route has the confidence of a read one.
+                    text_property(
+                        "precision",
+                        &crate::analyze::framework::spring::PRECISION.to_string(),
+                    ),
+                    integer_property("schema_version", i64::from(GRAPH_SCHEMA_VERSION)),
+                ],
+                source_unit: held.unit,
+                evidence: vec![framework_evidence(&locator, held, endpoint)],
+            }));
+            // The handler, by name, among the records planned for this same file. Matched within the
+            // file rather than across the build: two files may each declare a `callback`, and a route in
+            // one of them is served by its own.
+            if let Some(record) = planned
+                .iter()
+                .find(|record| record.path == held.path && record.name == endpoint.handler)
+            {
+                edges.add(id, record.id, HANDLED_BY, held.unit);
+            }
+            edges.add(file_id, id, CONTAINS, held.unit);
+        }
+    }
+
     // The tree the files sit in.
     //
     // Without it a graph is a bag of files. That is enough to satisfy section 17.3's minimum, and
@@ -620,6 +706,9 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
         // Recorded is not analyzed. A build that recorded 41 Kotlin files and read none of
         // them reports zero here, because this is what `plan` predicts as `structural_files`
         // and the two are checked against each other.
+        endpoints: endpoints_found,
+        frameworks: framework_names.into_iter().collect(),
+        uninterpreted_annotations: uninterpreted.into_iter().collect(),
         analyzed_files: units.iter().filter(|held| held.analyzed).count() as u64,
         recorded_files: units.len() as u64,
         resolved_references: resolved,
@@ -1086,6 +1175,35 @@ fn file_evidence(locator: &CanonicalSourceLocator, held: &Unit) -> Evidence {
                 .unwrap_or_else(|_| NonEmptyText::literal("1")),
             ..analyzed_evidence(locator, &held.path, &held.analysis)
         },
+    }
+}
+
+/// Evidence for a framework's entry point.
+///
+/// The producer is the framework analyzer, not the language analyzer that read the file. A route is a
+/// fact about Spring, and crediting the Kotlin analyzer with finding it would name a producer that read
+/// an annotation and drew no conclusion from it.
+///
+/// The range is the handler's, because that is where the route is written. `Deterministic` and
+/// `Extracted` hold: the method and the path were read off an annotation rather than inferred, and a path
+/// this analyzer could not evaluate is recorded as written rather than resolved.
+fn framework_evidence(
+    locator: &CanonicalSourceLocator,
+    held: &Unit,
+    endpoint: &crate::analyze::framework::Endpoint,
+) -> Evidence {
+    Evidence {
+        source: locator.clone(),
+        resolved_revision: None,
+        path: NonEmptyText::new(held.path.as_str()).ok(),
+        content_digest: held.analysis.digest.clone(),
+        range: Some(endpoint.range),
+        producer: NonEmptyText::new(crate::analyze::framework::spring::FRAMEWORK)
+            .unwrap_or_else(|_| NonEmptyText::literal("framework")),
+        producer_version: NonEmptyText::new(crate::analyze::framework::spring::VERSION)
+            .unwrap_or_else(|_| NonEmptyText::literal("1")),
+        method: EvidenceMethod::Deterministic,
+        confidence: Confidence::Extracted,
     }
 }
 

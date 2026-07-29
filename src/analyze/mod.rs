@@ -15,6 +15,7 @@
 //! with the facts. A caller must be able to tell a resolved fact from a syntactic one, and
 //! presenting the second as the first is the specific thing the contract forbids.
 
+pub mod framework;
 pub mod kotlin;
 pub mod kotlin_lexer;
 pub mod rust;
