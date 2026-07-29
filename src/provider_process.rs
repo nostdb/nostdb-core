@@ -130,37 +130,44 @@ mod tests {
     /// across a pipe — which a fake transport cannot get wrong in the same way.
     /// A counter, so two scripts never share a path.
     ///
-    /// The label alone was the path, in a directory every test and every concurrent run shares. Tests
-    /// in one binary run in parallel, so one could write a script while another was executing it —
-    /// which the operating system reports as `ETXTBSY`, "text file busy", and which passed locally
-    /// for as long as the timing happened not to overlap. Each test also deleted the shared path when
-    /// it finished, so a slower one could lose its program mid-run.
-    ///
-    /// The process id and this counter make the path unique per script rather than per test name.
+    /// Unique paths are not what fixes `ETXTBSY` here — see `client` — but a shared path is its own
+    /// defect: each test removed the path when it finished, so a slower one could lose its program
+    /// mid-run.
     #[cfg(unix)]
     static SCRIPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+    /// Writes a script and returns its path. Not executable, and with no shebang: nothing execs it.
     #[cfg(unix)]
     fn scripted(label: &str, body: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
         let unique = SCRIPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut path = std::env::temp_dir();
         path.push(format!(
             "nostdb-provider-{label}-{}-{unique}.sh",
             std::process::id()
         ));
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write");
-        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&path, permissions).expect("chmod");
+        std::fs::write(&path, body).expect("write");
         path
     }
 
+    /// A real child process over real pipes, run as `sh <script>`.
+    ///
+    /// The script is an **argument**, never the program. Exec'ing a file this process just wrote fails
+    /// intermittently with `ETXTBSY`, "text file busy", and unique paths do not fix it: these tests run
+    /// in parallel, and `Command::spawn` forks — so a child forked by one thread briefly inherits the
+    /// write descriptor another thread still holds on its own script. While that duplicate exists the
+    /// file cannot be exec'd, by anyone.
+    ///
+    /// Running `sh` removes the race rather than narrowing it. `sh` is not a file these tests write, and
+    /// a script passed to it is read rather than executed. Nothing is lost: what is under test is the
+    /// framing across a pipe, and a real provider is an executable named by configuration rather than a
+    /// file the Engine wrote a moment ago.
     #[cfg(unix)]
     fn client(label: &str, body: &str) -> (ProviderClient<ProviderProcess>, std::path::PathBuf) {
-        let program = scripted(label, body);
-        let process = ProviderProcess::start(&program, &[]).expect("it starts");
-        (ProviderClient::new(process), program)
+        let script = scripted(label, body);
+        let argument = script.to_str().expect("a UTF-8 temporary path");
+        let process = ProviderProcess::start(std::path::Path::new("/bin/sh"), &[argument])
+            .expect("it starts");
+        (ProviderClient::new(process), script)
     }
 
     #[cfg(unix)]
