@@ -110,6 +110,8 @@ pub enum DiagnosticCode {
     NostInvalidDatetime,
     /// The query uses a construct outside the declared subset.
     CypherUnsupported,
+    /// A `MATCH` named a label no record in the database carries. It executed.
+    CypherUnknownLabel,
     /// The query is inside the subset but meaningless.
     CypherSemanticError,
     /// The query was asked to stop before it finished.
@@ -145,7 +147,7 @@ impl DiagnosticCode {
     /// Every code, in registry order.
     ///
     /// The root workspace compares this against the `nostdb-spec` registry.
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 35] = [
         Self::NostParseError,
         Self::NostVersionUnsupported,
         Self::NostDuplicateLinkAlias,
@@ -172,6 +174,7 @@ impl DiagnosticCode {
         Self::NostNonFiniteNumber,
         Self::NostInvalidDatetime,
         Self::CypherUnsupported,
+        Self::CypherUnknownLabel,
         Self::CypherSemanticError,
         Self::QueryCancelled,
         Self::LinkedDatabaseReadOnly,
@@ -212,6 +215,7 @@ impl DiagnosticCode {
             Self::NostNonFiniteNumber => "NOST_NON_FINITE_NUMBER",
             Self::NostInvalidDatetime => "NOST_INVALID_DATETIME",
             Self::CypherUnsupported => "CYPHER_UNSUPPORTED",
+            Self::CypherUnknownLabel => "CYPHER_UNKNOWN_LABEL",
             Self::CypherSemanticError => "CYPHER_SEMANTIC_ERROR",
             Self::QueryCancelled => "QUERY_CANCELLED",
             Self::LinkedDatabaseReadOnly => "LINKED_DATABASE_READ_ONLY",

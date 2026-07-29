@@ -1691,10 +1691,39 @@ pub fn execute_federated_cancellable(
         all_rows.retain(|row| seen.insert(row.iter().map(QueryValue::sort_key).collect()));
     }
 
+    // A label no record carries, reported after execution rather than refused before it.
+    //
+    // Zero rows is otherwise indistinguishable from zero rows: nothing in the result tells a caller
+    // whether the project has none of that thing or whether the word means nothing to this database.
+    // Both are legitimate answers and they call for opposite responses.
+    //
+    // Every label in the graph, not only the ones this query bound, because a pattern that matched
+    // nothing never reaches the matcher — and that is exactly the case worth reporting.
+    let present: BTreeSet<&str> = graph
+        .nodes
+        .iter()
+        .flat_map(|node| node.labels.iter())
+        .map(crate::name::Label::as_str)
+        .collect();
+    let warnings = query
+        .required_labels()
+        .into_iter()
+        .filter(|wanted| !present.contains(wanted))
+        .map(|absent| {
+            Diagnostic::new(
+                DiagnosticCode::CypherUnknownLabel,
+                crate::text::NonEmptyText::new(format!(
+                    "no record in this database carries the label `{absent}`"
+                ))
+                .unwrap_or_else(|_| crate::text::NonEmptyText::literal("unknown label")),
+            )
+        })
+        .collect();
+
     Ok(QueryResult {
         columns,
         rows: all_rows,
-        warnings: Vec::new(),
+        warnings,
         writes,
     })
 }
@@ -1999,6 +2028,76 @@ pub fn projected_columns(projection: &Projection) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A label no record carries warns, and one that is carried does not.
+    ///
+    /// The case this exists for: `MATCH (e:Endpoint)` returned zero rows, the empty table looked like a
+    /// data problem, and the diagnosis produced from it named the wrong cause. Nothing in the result had
+    /// said the label was unknown.
+    #[test]
+    fn a_label_no_record_carries_warns_and_still_executes() {
+        let mut graph = Graph::default();
+        graph.nodes.push(node(1, &["File"], &[]));
+
+        let query = crate::cypher::parse("MATCH (n:Endpoint) RETURN n").expect("parses");
+        let result = super::execute(
+            &query,
+            &mut graph,
+            &Parameters::default(),
+            &DatabaseContext::default(),
+        )
+        .expect("it executes rather than refusing");
+        assert!(result.rows.is_empty(), "and finds nothing");
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert_eq!(
+            result.warnings[0].code.as_str(),
+            "CYPHER_UNKNOWN_LABEL",
+            "{:?}",
+            result.warnings[0]
+        );
+        assert!(
+            result.warnings[0].message.as_str().contains("Endpoint"),
+            "it names the label: {:?}",
+            result.warnings[0]
+        );
+
+        // A label the database does carry warns about nothing, even when the match finds no rows for
+        // another reason. Absence of records is not absence of the label.
+        let query = crate::cypher::parse("MATCH (n:File) WHERE n.path = 'absent' RETURN n")
+            .expect("parses");
+        let result = super::execute(
+            &query,
+            &mut graph,
+            &Parameters::default(),
+            &DatabaseContext::default(),
+        )
+        .expect("executes");
+        assert!(result.rows.is_empty());
+        assert!(
+            result.warnings.is_empty(),
+            "a carried label warns about nothing: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn a_label_a_query_creates_is_not_warned_about() {
+        // The one case where absence is the expected state: the record is about to be written.
+        let mut graph = Graph::default();
+        let query = crate::cypher::parse("CREATE (n:Brand {name: 'x'}) RETURN n").expect("parses");
+        let result = super::execute(
+            &query,
+            &mut graph,
+            &Parameters::default(),
+            &DatabaseContext::default(),
+        )
+        .expect("executes");
+        assert!(
+            result.warnings.is_empty(),
+            "warning here would be warning about the record being created: {:?}",
+            result.warnings
+        );
+    }
+
     use super::*;
     use crate::contribution::{Contribution, Owner};
     use crate::cypher::parse;

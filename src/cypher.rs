@@ -579,6 +579,20 @@ pub struct Query {
 }
 
 impl Query {
+    /// Every label this query's node patterns require, in name order.
+    ///
+    /// Read from the parsed query rather than tracked during execution, because a pattern that matched
+    /// nothing never reaches the matcher — and the point is to say something about a label precisely
+    /// when it matched nothing.
+    #[must_use]
+    pub fn required_labels(&self) -> std::collections::BTreeSet<&str> {
+        let mut found = std::collections::BTreeSet::new();
+        for part in &self.parts {
+            part.collect_labels(&mut found);
+        }
+        found
+    }
+
     /// Reports whether this query modifies the database.
     ///
     /// A caller holding a read-only graph therefore cannot be surprised by a write: it
@@ -601,6 +615,24 @@ pub struct QueryPart {
 }
 
 impl QueryPart {
+    /// Adds every label this part's **reading** patterns require.
+    ///
+    /// `MATCH` only, and deliberately not `CREATE` or `MERGE`. A label a query creates is a label the
+    /// database is about to carry, so warning that no record has it would be warning about the record
+    /// being written — the one case where absence is the expected state.
+    fn collect_labels<'a>(&'a self, into: &mut std::collections::BTreeSet<&'a str>) {
+        for clause in &self.clauses {
+            if let Clause::Match { patterns, .. } = clause {
+                for pattern in patterns {
+                    into.extend(pattern.start.labels.iter().map(String::as_str));
+                    for (_, node) in &pattern.steps {
+                        into.extend(node.labels.iter().map(String::as_str));
+                    }
+                }
+            }
+        }
+    }
+
     /// Reports whether this part modifies the database.
     #[must_use]
     pub fn is_writing(&self) -> bool {
