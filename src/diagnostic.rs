@@ -234,9 +234,22 @@ impl DiagnosticCode {
     #[must_use]
     pub const fn default_severity(&self) -> Severity {
         match self {
+            // The registry is the authority on what a code means, and the root workspace verifier
+            // compares this list against it.
+            //
+            // The three link codes were errors here while the registry registered them as warnings —
+            // and the rest of this crate already treated them as warnings, since `result.rs` makes each
+            // of them mark a result *partial*, which is a thing only a warning can do to a result that
+            // returned rows. `AGENTS.md` settles it outright: "An unavailable link stays declared and
+            // yields reachable partial results plus a structured warning."
+            //
+            // They went unnoticed because the test that checked severity exempted exactly these three.
             Self::NostUnresolvedEndpoint
             | Self::NostSchemaViolation
             | Self::OrphanLinkSettings
+            | Self::LinkUnavailable
+            | Self::LinkCycle
+            | Self::LinkLimitExceeded
             | Self::CypherUnknownLabel => Severity::Warning,
             _ => Severity::Error,
         }
@@ -393,10 +406,13 @@ mod tests {
     /// function lives, so a change here fails locally rather than only across the workspace.
     #[test]
     fn exactly_the_declared_codes_are_warnings() {
-        const WARNINGS: [DiagnosticCode; 4] = [
+        const WARNINGS: [DiagnosticCode; 7] = [
             DiagnosticCode::NostUnresolvedEndpoint,
             DiagnosticCode::NostSchemaViolation,
             DiagnosticCode::OrphanLinkSettings,
+            DiagnosticCode::LinkUnavailable,
+            DiagnosticCode::LinkCycle,
+            DiagnosticCode::LinkLimitExceeded,
             DiagnosticCode::CypherUnknownLabel,
         ];
         for code in DiagnosticCode::ALL {
