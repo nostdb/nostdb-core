@@ -203,6 +203,55 @@ mod tests {
             .collect()
     }
 
+    fn endpoints_in_java(source: &str) -> Vec<(String, String, String)> {
+        let analysis = crate::analyze::java::analyze(source);
+        super::super::analyze(&analysis)
+            .endpoints
+            .into_iter()
+            .map(|held| (held.method, held.path, held.handler))
+            .collect()
+    }
+
+    #[test]
+    fn the_same_framework_knowledge_serves_java_without_being_written_twice() {
+        // The layer's whole claim, now testable in both directions. Nothing in this file mentions Java:
+        // it reads `FileAnalysis`, and a Java analyzer producing the same annotations reaches it. Spring
+        // is predominantly Java, so a Kotlin-only reading covered the smaller half of its own ecosystem.
+        assert_eq!(
+            endpoints_in_java(
+                "package com.demo;\n\
+                 @RestController\n\
+                 @RequestMapping(\"/api\")\n\
+                 public class UserController {\n\
+                   @GetMapping(\"/users/{id}\")\n\
+                   public String find(@PathVariable long id) { return \"\"; }\n\
+                   @PostMapping(\"/users\")\n\
+                   public void create(@RequestBody User user) { }\n\
+                 }\n"
+            ),
+            [
+                (
+                    "GET".to_owned(),
+                    "/api/users/{id}".to_owned(),
+                    "find".to_owned()
+                ),
+                (
+                    "POST".to_owned(),
+                    "/api/users".to_owned(),
+                    "create".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_java_class_without_a_spring_annotation_yields_nothing() {
+        assert!(
+            endpoints_in_java("package com.demo;\npublic class Plain { public void run() { } }")
+                .is_empty()
+        );
+    }
+
     #[test]
     fn a_controller_yields_one_endpoint_per_mapping() {
         // The reported case, end to end from Kotlin source.

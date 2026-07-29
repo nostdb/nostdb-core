@@ -28,7 +28,9 @@ use crate::analysis::{FactKind, PrecisionClass};
 use crate::evidence::SourceRange;
 use crate::text::NonEmptyText;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
+pub mod react;
 pub mod spring;
 
 /// What one framework analyzer declares.
@@ -69,6 +71,42 @@ pub struct Endpoint {
     pub range: SourceRange,
 }
 
+/// One user-interface component a framework analyzer found.
+///
+/// Separate from [`Endpoint`] because the two are reached differently: an entry point is reached by an HTTP
+/// request from outside the program, and a component is rendered by something else inside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Component {
+    /// The declaration's name, which is also the component's.
+    pub name: String,
+    /// How the analyzer recognised it, which is what a reader needs to judge the fact.
+    ///
+    /// Carried per component rather than taken from the analyzer's declared precision, because one
+    /// analyzer may know some of them exactly and others by convention. A class extending `Component` says
+    /// what it is; a capitalised function is a convention that a helper called `Wrapper` also satisfies.
+    pub recognised_by: Recognition,
+    /// Where the declaration is.
+    pub range: SourceRange,
+}
+
+/// How certainly a component was recognised.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Recognition {
+    /// The source states it: a supertype, a decorator, or a call the framework defines.
+    Declared,
+    /// A naming or shape convention the framework's community follows, which a non-component may satisfy.
+    Convention,
+}
+
+impl fmt::Display for Recognition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Declared => "declared",
+            Self::Convention => "convention",
+        })
+    }
+}
+
 /// What framework analysis found in one file.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FrameworkAnalysis {
@@ -76,6 +114,8 @@ pub struct FrameworkAnalysis {
     pub frameworks: BTreeSet<String>,
     /// Entry points, in source order.
     pub endpoints: Vec<Endpoint>,
+    /// User-interface components, in source order.
+    pub components: Vec<Component>,
     /// Annotations no registered analyzer interpreted, by name, in name order.
     ///
     /// The capability diagnostic's evidence. An annotation here is not an error: most annotations mean
@@ -89,7 +129,10 @@ impl FrameworkAnalysis {
     /// Reports whether anything at all was found.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.frameworks.is_empty() && self.endpoints.is_empty() && self.uninterpreted.is_empty()
+        self.frameworks.is_empty()
+            && self.endpoints.is_empty()
+            && self.components.is_empty()
+            && self.uninterpreted.is_empty()
     }
 }
 
@@ -114,11 +157,20 @@ trait Framework {
 
     /// The entry points in one file.
     fn endpoints(&self, analysis: &FileAnalysis) -> Vec<Endpoint>;
+
+    /// The user-interface components in one file.
+    ///
+    /// Defaulted to none, because most frameworks have no such concept and an analyzer should not have to
+    /// say so. A route holder is not a component and a component is not an entry point: one is reached by
+    /// an HTTP request, the other is rendered by something else in the same program.
+    fn components(&self, _analysis: &FileAnalysis) -> Vec<Component> {
+        Vec::new()
+    }
 }
 
 /// Every framework analyzer this build ships.
 fn analyzers() -> Vec<Box<dyn Framework>> {
-    vec![Box::new(spring::Spring)]
+    vec![Box::new(react::React), Box::new(spring::Spring)]
 }
 
 /// What every framework analyzer this build ships declares, by framework name.
@@ -152,6 +204,7 @@ pub fn analyze(analysis: &FileAnalysis) -> FrameworkAnalysis {
             .insert(analyzer.capability().framework.as_str().to_owned());
         interpreted.extend(analyzer.interprets().iter().copied());
         found.endpoints.extend(analyzer.endpoints(analysis));
+        found.components.extend(analyzer.components(analysis));
     }
 
     // Every annotation in the file, minus what a recognising analyzer says it interprets.

@@ -102,20 +102,56 @@ const SENSITIVE_EXTENSIONS: [&str; 8] =
 /// Naming a language is not claiming to analyze it. The list exists so a report can say
 /// "42 Python files, unsupported" rather than "42 unclassified files", which is the
 /// difference between a gap somebody can act on and a number nobody can read.
-const LANGUAGES: [(&str, &str); 42] = [
+///
+/// Sorted by extension, and the suite requires it to stay sorted with no duplicate extension. A
+/// second row for one extension is unreachable — [`language_of`] takes the first match — so a
+/// duplicate is a silent decision about which language wins.
+///
+/// An ambiguous extension is left out rather than guessed. `.m` is Objective-C and MATLAB, `.v` is
+/// Verilog and V, `.s` is assembly for several assemblers, and `.pro` is Prolog and a Qt project
+/// file. Naming one of them would report the other language's files as the wrong language, which is
+/// worse than `unknown`: an unnamed file says nothing, and a misnamed one says something false.
+const LANGUAGES: [(&str, &str); 95] = [
+    ("asm", "assembly"),
+    ("astro", "astro"),
     ("bash", "shell"),
+    ("bat", "batch"),
     ("c", "c"),
     ("cc", "cpp"),
     ("cjs", "javascript"),
+    ("clj", "clojure"),
+    ("cljc", "clojure"),
+    ("cljs", "clojure"),
+    ("cmd", "batch"),
     ("cpp", "cpp"),
+    ("cr", "crystal"),
     ("cs", "csharp"),
     ("css", "css"),
     ("cxx", "cpp"),
+    ("dart", "dart"),
+    ("el", "elisp"),
+    ("erb", "erb"),
+    ("erl", "erlang"),
+    ("ex", "elixir"),
+    ("exs", "elixir"),
+    ("f90", "fortran"),
+    ("f95", "fortran"),
+    ("fs", "fsharp"),
+    ("fsx", "fsharp"),
     ("go", "go"),
+    ("gql", "graphql"),
+    ("gradle", "groovy"),
+    ("graphql", "graphql"),
+    ("groovy", "groovy"),
     ("h", "c"),
+    ("hbs", "handlebars"),
+    ("hcl", "hcl"),
     ("hpp", "cpp"),
+    ("hrl", "erlang"),
     ("hs", "haskell"),
     ("html", "html"),
+    ("ini", "ini"),
+    ("ipynb", "jupyter"),
     ("java", "java"),
     ("jl", "julia"),
     ("js", "javascript"),
@@ -123,24 +159,50 @@ const LANGUAGES: [(&str, &str); 42] = [
     ("jsx", "javascript"),
     ("kt", "kotlin"),
     ("kts", "kotlin"),
+    ("less", "less"),
     ("lua", "lua"),
     ("md", "markdown"),
     ("mjs", "javascript"),
     ("ml", "ocaml"),
+    ("mm", "objcpp"),
+    ("nim", "nim"),
+    ("nix", "nix"),
     ("nost", "nost"),
+    ("pas", "pascal"),
     ("php", "php"),
     ("pl", "perl"),
+    ("pm", "perl"),
+    ("prisma", "prisma"),
+    ("properties", "properties"),
+    ("proto", "protobuf"),
+    ("ps1", "powershell"),
+    ("psm1", "powershell"),
     ("py", "python"),
     ("pyi", "python"),
+    ("r", "r"),
     ("rb", "ruby"),
+    ("rkt", "racket"),
     ("rs", "rust"),
+    ("sass", "sass"),
     ("scala", "scala"),
+    ("scm", "scheme"),
+    ("scss", "scss"),
     ("sh", "shell"),
+    ("sol", "solidity"),
     ("sql", "sql"),
+    ("svelte", "svelte"),
     ("swift", "swift"),
+    ("tex", "tex"),
+    ("tf", "terraform"),
+    ("tfvars", "terraform"),
     ("toml", "toml"),
     ("ts", "typescript"),
     ("tsx", "typescript"),
+    ("vb", "vbnet"),
+    ("vue", "vue"),
+    ("xml", "xml"),
+    ("xsl", "xslt"),
+    ("xslt", "xslt"),
     ("yaml", "yaml"),
     ("yml", "yaml"),
     ("zig", "zig"),
@@ -161,12 +223,18 @@ const LANGUAGES: [(&str, &str); 42] = [
 pub const UNKNOWN_LANGUAGE: &str = "unknown";
 
 /// Extensionless file names this build can still name a language for.
-const NAMED_FILES: [(&str, &str); 6] = [
+const NAMED_FILES: [(&str, &str); 12] = [
+    ("Brewfile", "ruby"),
     ("CMakeLists.txt", "cmake"),
     ("Dockerfile", "dockerfile"),
     ("Gemfile", "ruby"),
+    ("Jenkinsfile", "groovy"),
     ("Makefile", "make"),
+    ("Podfile", "ruby"),
     ("Rakefile", "ruby"),
+    ("Vagrantfile", "ruby"),
+    ("go.mod", "go"),
+    ("go.sum", "go"),
     ("justfile", "just"),
 ];
 
@@ -817,6 +885,85 @@ mod tests {
         let found = run(&dir, &ScanOptions::default());
         assert_eq!(paths(&found), ["real.rs"]);
         assert_eq!(reason(&found, "fake.rs"), Some(SkipReason::Binary));
+    }
+
+    #[test]
+    fn the_language_table_is_sorted_and_names_each_extension_once() {
+        // `language_of` takes the first match, so a second row for one extension is unreachable and
+        // decides silently which language an extension means. Sortedness is what makes a duplicate
+        // visible in a diff; without it the two rows sit far apart and read as unrelated additions.
+        let extensions: Vec<&str> = LANGUAGES.iter().map(|(extension, _)| *extension).collect();
+        let mut sorted = extensions.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            extensions, sorted,
+            "LANGUAGES must stay sorted by extension"
+        );
+
+        let mut unique = extensions.clone();
+        unique.dedup();
+        assert_eq!(
+            extensions, unique,
+            "an extension may name only one language"
+        );
+
+        let names: Vec<&str> = NAMED_FILES.iter().map(|(name, _)| *name).collect();
+        let mut sorted_names = names.clone();
+        sorted_names.sort_unstable();
+        assert_eq!(names, sorted_names, "NAMED_FILES must stay sorted by name");
+    }
+
+    #[test]
+    fn no_extension_is_named_for_a_language_it_shares_with_another() {
+        // Left out on purpose, and asserted so a later addition has to argue with this test rather
+        // than with a comment. `.m` is Objective-C and MATLAB; naming either reports the other's
+        // files as the wrong language, and a misnamed file says something false where an unnamed one
+        // says nothing.
+        for ambiguous in ["m", "v", "s", "pro", "d"] {
+            assert_eq!(
+                language_of(&format!("a.{ambiguous}")),
+                None,
+                "`.{ambiguous}` names more than one language and must stay unnamed"
+            );
+        }
+    }
+
+    #[test]
+    fn the_added_languages_resolve() {
+        // One per shape the lookup has: a plain extension, two extensions meeting at one language,
+        // and a named file whose name contains a dot so the extension path would otherwise win.
+        for (path, expected) in [
+            ("lib/main.dart", "dart"),
+            ("lib/app.ex", "elixir"),
+            ("lib/app.exs", "elixir"),
+            ("infra/main.tf", "terraform"),
+            ("infra/prod.tfvars", "terraform"),
+            ("schema.graphql", "graphql"),
+            ("web/App.vue", "vue"),
+            ("build.gradle", "groovy"),
+            ("scripts/deploy.ps1", "powershell"),
+            ("pom.xml", "xml"),
+            ("go.mod", "go"),
+            ("Jenkinsfile", "groovy"),
+        ] {
+            assert_eq!(
+                language_of(path),
+                Some(expected),
+                "{path} should be named {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn naming_a_language_is_not_claiming_to_analyze_it() {
+        // The table's whole purpose, and the line this Stage must not blur. Naming Dart lets a report
+        // say "42 Dart files, unsupported" instead of "42 unclassified files"; it does not register an
+        // analyzer, so precision stays `Unsupported` until one exists.
+        assert_eq!(language_of("lib/main.dart"), Some("dart"));
+        assert!(
+            !crate::analyze::is_supported("dart"),
+            "a named language with no analyzer must still report unsupported"
+        );
     }
 
     #[test]

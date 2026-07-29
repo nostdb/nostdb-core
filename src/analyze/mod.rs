@@ -15,11 +15,21 @@
 //! with the facts. A caller must be able to tell a resolved fact from a syntactic one, and
 //! presenting the second as the first is the specific thing the contract forbids.
 
+pub mod c;
+pub mod c_lexer;
 pub mod framework;
+pub mod go;
+pub mod go_lexer;
+pub mod java;
+pub mod java_lexer;
 pub mod kotlin;
 pub mod kotlin_lexer;
+pub mod python;
+pub mod python_lexer;
 pub mod rust;
 pub mod rust_lexer;
+pub mod typescript;
+pub mod typescript_lexer;
 
 use crate::analysis::{AnalyzerCapability, CapabilityRegistry, PrecisionClass};
 use crate::evidence::{ContentDigest, SourcePosition, SourceRange};
@@ -245,8 +255,16 @@ pub fn range(start: At, end: At) -> SourceRange {
 /// analyzers here declared the same language.
 pub fn builtin_registry() -> Result<CapabilityRegistry, crate::analysis::CapabilityError> {
     let mut registry = CapabilityRegistry::new();
+    registry.register(c::capability_for(c::LANGUAGE))?;
+    registry.register(c::capability_for(c::CPP))?;
+    registry.register(c::capability_for(c::OBJCPP))?;
+    registry.register(go::capability())?;
+    registry.register(java::capability())?;
     registry.register(kotlin::capability())?;
+    registry.register(python::capability())?;
     registry.register(rust::capability())?;
+    registry.register(typescript::capability_for(typescript::LANGUAGE))?;
+    registry.register(typescript::capability_for(typescript::JAVASCRIPT))?;
     Ok(registry)
 }
 
@@ -257,8 +275,13 @@ pub fn builtin_registry() -> Result<CapabilityRegistry, crate::analysis::Capabil
 #[must_use]
 pub fn analyze(language: &str, source: &str) -> Option<FileAnalysis> {
     match language {
+        "c" | "cpp" | "objcpp" => Some(c::analyze_as(language, source)),
+        "go" => Some(go::analyze(source)),
+        "java" => Some(java::analyze(source)),
         "kotlin" => Some(kotlin::analyze(source)),
+        "python" => Some(python::analyze(source)),
         "rust" => Some(rust::analyze(source)),
+        "typescript" | "javascript" => Some(typescript::analyze_as(language, source)),
         _ => None,
     }
 }

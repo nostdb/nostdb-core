@@ -807,6 +807,7 @@ impl Project {
                 recorded_files: draft.recorded_files,
                 replaced_schemas: Vec::new(),
                 endpoints: draft.endpoints,
+                components: draft.components,
                 frameworks: draft.frameworks.clone(),
                 uninterpreted_annotations: draft.uninterpreted_annotations.clone(),
                 reused_files: draft.reused_files,
@@ -840,6 +841,7 @@ impl Project {
             recorded_files: draft.recorded_files,
             replaced_schemas: replaced,
             endpoints: draft.endpoints,
+            components: draft.components,
             frameworks: draft.frameworks,
             uninterpreted_annotations: draft.uninterpreted_annotations,
             reused_files: draft.reused_files,
@@ -1344,6 +1346,8 @@ pub struct BuildReport {
     pub replaced_schemas: Vec<String>,
     /// Framework entry points recorded.
     pub endpoints: u64,
+    /// Framework user-interface components recorded.
+    pub components: u64,
     /// The frameworks whose analyzers recognised something, in name order.
     pub frameworks: Vec<String>,
     /// Annotation names no framework analyzer interpreted, in name order.
@@ -2337,6 +2341,121 @@ mod tests {
             again.replaced_schemas.is_empty(),
             "an identical schema is not a loss: {:?}",
             again.replaced_schemas
+        );
+    }
+
+    #[test]
+    fn a_component_and_the_asset_it_imports_are_queryable_end_to_end() {
+        // The requirement, through a real build and a real query: a frontend component importing an
+        // image is joined to it, so `MATCH (f:File)-[:IMPORTS]->(a:Asset)` answers "what uses this
+        // asset". The image is never read — it is in the graph because the component names it.
+        let dir = TempDir::new("component-assets");
+        let project = Project::initialize(dir.path()).unwrap();
+        fs::create_dir_all(dir.path().join("src/assets")).unwrap();
+        fs::write(
+            dir.path().join("src/Card.tsx"),
+            "import logo from \"./assets/logo.png\";\n\
+             import { helper } from \"./helper\";\n\
+             import React from \"react\";\n\n\
+             export class Card {\n\
+             \x20   render() { return helper(logo); }\n\
+             }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/helper.ts"),
+            "export function helper(x: string) { return x; }\n",
+        )
+        .unwrap();
+        // A PNG's signature carries a NUL byte, which is what makes the scan skip it as binary.
+        fs::write(
+            dir.path().join("src/assets/logo.png"),
+            [0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00],
+        )
+        .unwrap();
+
+        let registry = crate::analyze::builtin_registry().unwrap();
+        project
+            .build(&registry, &crate::scan::ScanOptions::default(), false)
+            .unwrap();
+
+        let database = project.open_database().unwrap();
+        let graph = crate::encoding::read_graph(&database).unwrap();
+        let text_of = |node: &crate::graph::Node, key: &str| {
+            node.properties
+                .iter()
+                .find_map(|(held, value)| match value {
+                    crate::property::PropertyValue::String(found) if held.as_str() == key => {
+                        Some(found.clone())
+                    }
+                    _ => None,
+                })
+        };
+        let is_asset = |reference: &crate::graph::NodeReference| match reference {
+            crate::graph::NodeReference::Local(id) => graph.nodes.iter().any(|node| {
+                node.id == *id
+                    && node
+                        .labels
+                        .iter()
+                        .any(|held| held.as_str() == crate::build::ASSET_LABEL)
+            }),
+            crate::graph::NodeReference::External(_) => false,
+        };
+
+        // One asset record, carrying the path and why nothing read it.
+        let assets: Vec<(String, String)> = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.labels
+                    .iter()
+                    .any(|held| held.as_str() == crate::build::ASSET_LABEL)
+            })
+            .map(|node| {
+                (
+                    text_of(node, "path").unwrap_or_default(),
+                    text_of(node, "skipped").unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            assets,
+            [("src/assets/logo.png".to_owned(), "binary".to_owned())]
+        );
+
+        // The component reaches both the module and the asset, and `react` reaches neither because a
+        // package is not a file in this project.
+        let mut imports: Vec<(String, String, bool)> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.relation.as_str() == crate::build::IMPORTS)
+            .filter_map(|edge| {
+                let named = |reference: &crate::graph::NodeReference| match reference {
+                    crate::graph::NodeReference::Local(id) => graph
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == *id)
+                        .and_then(|node| text_of(node, "path")),
+                    crate::graph::NodeReference::External(_) => None,
+                };
+                Some((
+                    named(&edge.source)?,
+                    named(&edge.target)?,
+                    is_asset(&edge.target),
+                ))
+            })
+            .collect();
+        imports.sort();
+        assert_eq!(
+            imports,
+            [
+                (
+                    "src/Card.tsx".to_owned(),
+                    "src/assets/logo.png".to_owned(),
+                    true
+                ),
+                ("src/Card.tsx".to_owned(), "src/helper.ts".to_owned(), false),
+            ]
         );
     }
 

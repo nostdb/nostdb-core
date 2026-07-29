@@ -136,6 +136,20 @@ impl Score {
         Ok(Self(if value == 0.0 { 0.0 } else { value }))
     }
 
+    /// Wraps a compile-time constant that the author asserts is in range.
+    ///
+    /// This exists only so an infallible fallback can be written without `unwrap`, keeping the
+    /// crate's no-panic guarantee — the same reason [`crate::text::NonEmptyText::literal`] exists,
+    /// and it is crate-internal for the same reason: a caller cannot smuggle runtime data past
+    /// validation. The debug assertion catches a bad constant during development.
+    pub(crate) fn literal(value: f32) -> Self {
+        debug_assert!(
+            Self::new(value).is_ok(),
+            "Score::literal was given a value outside 0.0..=1.0"
+        );
+        Self(value)
+    }
+
     /// The wrapped score.
     #[must_use]
     pub const fn get(self) -> f32 {

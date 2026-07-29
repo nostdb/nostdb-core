@@ -64,8 +64,35 @@ pub const ENDPOINT_LABEL: &str = "Endpoint";
 /// Relation from a framework's entry point to the declaration that serves it.
 pub const HANDLED_BY: &str = "HANDLED_BY";
 
+/// The label a framework analyzer's user-interface component carries.
+///
+/// A record of its own rather than a second label on the declaration, for the reason `Endpoint` is one: a
+/// framework analyzer declares its own version and capability, and root `docs/PRD.md` section 11.3 lets it
+/// withdraw only its own contributions. A label added to a record the language analyzer owns could not be
+/// withdrawn when the framework analyzer's version moved.
+pub const COMPONENT_LABEL: &str = "Component";
+
+/// Relation from a component to the declaration that defines it.
+///
+/// Not `HANDLED_BY`, which says something different: an entry point is *served by* a handler it names, and a
+/// component *is* its declaration seen through a framework's eyes. One relation for both would make
+/// "what serves this route" and "where is this component written" the same question.
+pub const DECLARED_BY: &str = "DECLARED_BY";
+
 /// The label every directory in the source tree carries.
 pub const DIRECTORY_LABEL: &str = "Directory";
+
+/// The label a file carries when analyzed source imports it and no analyzer read it.
+///
+/// An image, a font, a media file — anything a component imports by path and the scanner skipped. It is
+/// in the graph because **analyzed source references it**, not because the scan found it: root
+/// `docs/PRD.md` section 17.2 requires the scanner to skip a binary file unless an analyzer supports one,
+/// and this record does not change that. The bytes are never read, never sniffed, and never analyzed.
+///
+/// What is asserted is exactly what is known: something at this path was imported, it was skipped, and
+/// this is why. Duration, codec, and resolution are not here, because reading them would mean opening the
+/// file — which is the thing section 17.2 forbids and nothing about an import requires.
+pub const ASSET_LABEL: &str = "Asset";
 
 /// The path recorded for the project root, which has no name of its own.
 pub const ROOT_PATH: &str = ".";
@@ -82,6 +109,14 @@ pub const IMPLEMENTS: &str = "IMPLEMENTS";
 /// Relation from an implementation to the type it is for.
 pub const FOR_TYPE: &str = "FOR_TYPE";
 
+/// Relation from a file to a file it imports from.
+///
+/// File to file, rather than to the imported declaration, because that is what the import proves. An
+/// import names a path; whether the declaration at the end of it is the one a reader means is a
+/// question about resolution, and at [`PrecisionClass::DeterministicSyntactic`] this build does not
+/// answer it. What it can state exactly is which file in this project the path names.
+pub const IMPORTS: &str = "IMPORTS";
+
 /// Version of the record shape this module produces.
 ///
 /// Part of every parse cache key, so changing a label, a property, or a relation makes
@@ -96,7 +131,7 @@ pub const FOR_TYPE: &str = "FOR_TYPE";
 /// 3 because a second analyzer arrived. A Kotlin file used to assert only that it existed and now
 /// asserts what is declared in it, so a database built before it holds Kotlin records this build
 /// would not write. Reuse would keep them: the bytes did not change.
-pub const GRAPH_SCHEMA_VERSION: u32 = 5;
+pub const GRAPH_SCHEMA_VERSION: u32 = 8;
 
 /// The label a kind of item carries.
 #[must_use]
@@ -160,6 +195,8 @@ pub struct BuildDraft {
     pub cached_parses: u64,
     /// Framework entry points recorded.
     pub endpoints: u64,
+    /// Framework user-interface components recorded.
+    pub components: u64,
     /// The frameworks whose analyzers recognised something, in name order.
     pub frameworks: Vec<String>,
     /// Annotation names no framework analyzer interpreted, in name order.
@@ -304,6 +341,7 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
             ),
             coverage,
             endpoints: 0,
+            components: 0,
             frameworks: Vec::new(),
             uninterpreted_annotations: Vec::new(),
             analyzed_files: 0,
@@ -533,6 +571,7 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
     let mut uninterpreted: BTreeSet<String> = BTreeSet::new();
     let mut framework_names: BTreeSet<String> = BTreeSet::new();
     let mut endpoints_found = 0_u64;
+    let mut components_found = 0_u64;
     for (index, held) in units.iter().enumerate() {
         if !held.analyzed {
             continue;
@@ -580,6 +619,46 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
                 .find(|record| record.path == held.path && record.name == endpoint.handler)
             {
                 edges.add(id, record.id, HANDLED_BY, held.unit);
+            }
+            edges.add(file_id, id, CONTAINS, held.unit);
+        }
+
+        // Components, which are the same shape of fact about a different kind of thing.
+        for component in &framework.components {
+            components_found += 1;
+            let id = minter.node();
+            change_set.push(GraphOperation::UpsertNode(NodeDraft {
+                id: Some(id),
+                labels: vec![label(COMPONENT_LABEL)],
+                properties: vec![
+                    text_property("name", &component.name),
+                    text_property(
+                        "framework",
+                        &framework
+                            .frameworks
+                            .iter()
+                            .next()
+                            .cloned()
+                            .unwrap_or_default(),
+                    ),
+                    // The analyzer's class, and then how *this* component was recognised. One analyzer may
+                    // know some exactly and others by convention, and a reader judging a count needs the
+                    // second number rather than the first.
+                    text_property(
+                        "precision",
+                        &crate::analyze::framework::react::PRECISION.to_string(),
+                    ),
+                    text_property("recognised_by", &component.recognised_by.to_string()),
+                    integer_property("schema_version", i64::from(GRAPH_SCHEMA_VERSION)),
+                ],
+                source_unit: held.unit,
+                evidence: vec![component_evidence(&locator, held, component)],
+            }));
+            if let Some(record) = planned
+                .iter()
+                .find(|record| record.path == held.path && record.name == component.name)
+            {
+                edges.add(id, record.id, DECLARED_BY, held.unit);
             }
             edges.add(file_id, id, CONTAINS, held.unit);
         }
@@ -636,6 +715,95 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
         }
     }
 
+    // Imports, which two analyzers have declared `FactKind::ImportExport` for since they were written
+    // and neither produced. `analysis.imports` was read only by the parse cache and by Spring's
+    // recognition check, so no import has ever reached the graph.
+    //
+    // Resolved by **path correspondence**, not by name. `a.b.C` names `…/a/b/C.<ext>`, so an import is
+    // matched against the paths this build actually scanned. That is what makes it exact: the module
+    // documentation above explains why an unresolved *call* must not become a Placeholder, and an import
+    // is the stronger case, because most imports in any real file name a dependency. This file's own
+    // reported repository imports `org.springframework.boot.runApplication`, and nothing in the project
+    // declares it.
+    //
+    // Matching by last segment instead would have been cheaper and wrong: `import java.util.List` in a
+    // project that declares exactly one `List` would resolve to it, and the graph would assert that a
+    // file imports a class it does not import. A suffix of a real path cannot be produced by an import
+    // that names something outside the project.
+    // Counted with every other reference, because an import is one: a name in one file that either
+    // matches a record in this build or names something outside it.
+    let mut resolved = 0_u64;
+    let mut unresolved = 0_u64;
+    let by_file_path: BTreeMap<&str, LocalNodeId> = units
+        .iter()
+        .enumerate()
+        .map(|(index, held)| (held.path.as_str(), file_nodes[index].1))
+        .collect();
+    // What the scan saw and did not read, which is where an asset comes from.
+    //
+    // `Binary` and `TooLarge` only. An `Ignored` file was excluded on purpose and a `Sensitive` one was
+    // withheld, so importing either must not put it in the graph by another route — the exclusion is the
+    // decision, and an import does not overrule it. A `PermissionDenied` file was never established to
+    // exist at all.
+    let assets_available: BTreeMap<&str, SkipReason> = scan
+        .skipped
+        .iter()
+        .filter(|held| matches!(held.reason, SkipReason::Binary | SkipReason::TooLarge))
+        .filter_map(|held| held.path.as_ref().map(|path| (path.as_str(), held.reason)))
+        .collect();
+    let mut assets: BTreeMap<String, LocalNodeId> = BTreeMap::new();
+
+    for (index, held) in units.iter().enumerate() {
+        let from = file_nodes[index].1;
+        let directory = parent_of(&held.path);
+        for import in &held.analysis.imports {
+            if let Some(target) = imported_file(&import.path, &directory, &by_file_path) {
+                if target != from {
+                    resolved += 1;
+                    edges.add(from, target, IMPORTS, held.unit);
+                    continue;
+                }
+                unresolved += 1;
+                continue;
+            }
+            // Nothing analyzed answers to it. Something the scan skipped may, and that is an asset: a
+            // file this project imports and no analyzer read.
+            match imported_asset(&import.path, &directory, &assets_available) {
+                Some(path) => {
+                    resolved += 1;
+                    let id = *assets.entry(path.clone()).or_insert_with(|| {
+                        existing_asset(graph, &path).unwrap_or_else(|| minter.node())
+                    });
+                    edges.add(from, id, IMPORTS, held.unit);
+                }
+                // A dependency, an ambiguous path, or a path naming nothing at all. Counted like every
+                // other reference that names nothing in this build.
+                None => unresolved += 1,
+            }
+        }
+    }
+
+    // Drafted after the loop so one asset imported by three components is one record. Owned by the tree
+    // unit for the reason a directory is: it is something the scan observed, no analyzer read it, and
+    // owning it through one importing file would delete it when that file stopped importing it while
+    // another still did.
+    for (path, id) in &assets {
+        let reason = assets_available
+            .get(path.as_str())
+            .map_or_else(String::new, ToString::to_string);
+        change_set.push(GraphOperation::UpsertNode(NodeDraft {
+            id: Some(*id),
+            labels: vec![label(ASSET_LABEL)],
+            properties: vec![
+                text_property("path", path),
+                text_property("skipped", &reason),
+                integer_property("schema_version", i64::from(GRAPH_SCHEMA_VERSION)),
+            ],
+            source_unit: tree_unit,
+            evidence: vec![directory_evidence(&locator, path)],
+        }));
+    }
+
     // Containment: from the file to each top-level record, and from each record to its
     // children. Emitted after every node, so no edge can name an endpoint not yet drafted.
     for (index, held) in units.iter().enumerate() {
@@ -654,8 +822,6 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
         }
     }
 
-    let mut resolved = 0_u64;
-    let mut unresolved = 0_u64;
     for record in &planned {
         for reference in &record.references {
             match resolve(&reference.name) {
@@ -676,8 +842,14 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
                 None => unresolved += 1,
             }
         }
+        // A method carries a target when the language states one in the declaration itself, which Go does
+        // with a receiver: `func (s *Service) Do()` says both that `Do` exists and what it is on. Rust
+        // states it on the `impl` block instead, so both kinds reach this edge.
+        //
+        // Nothing else sets `target` on a method, so this is additive: Kotlin, Java, TypeScript, and
+        // Python put a method inside its type's body, where containment already says whose it is.
         if let Some(name) = &record.target
-            && record.kind == ItemKind::Implementation
+            && matches!(record.kind, ItemKind::Implementation | ItemKind::Method)
         {
             match resolve(name) {
                 Some(target) if target != record.id => {
@@ -707,6 +879,7 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
         // them reports zero here, because this is what `plan` predicts as `structural_files`
         // and the two are checked against each other.
         endpoints: endpoints_found,
+        components: components_found,
         frameworks: framework_names.into_iter().collect(),
         uninterpreted_annotations: uninterpreted.into_iter().collect(),
         analyzed_files: units.iter().filter(|held| held.analyzed).count() as u64,
@@ -836,6 +1009,23 @@ pub fn schemas() -> Vec<crate::schema::Schema> {
             vec![text("path"), number("schema_version")],
         ),
         schema(
+            ASSET_LABEL,
+            // `skipped` is why no analyzer read it, carried so a reader can tell an image from a file
+            // too large to open. Without it every asset would look alike and the graph would answer
+            // "why is there nothing inside this" with silence.
+            vec![text("path"), text("skipped"), number("schema_version")],
+        ),
+        schema(
+            COMPONENT_LABEL,
+            vec![
+                text("name"),
+                text("framework"),
+                text("precision"),
+                text("recognised_by"),
+                number("schema_version"),
+            ],
+        ),
+        schema(
             ENDPOINT_LABEL,
             vec![
                 text("method"),
@@ -930,6 +1120,167 @@ pub fn analyzer_owner() -> Owner {
         version: NonEmptyText::new(crate::analyze::rust::VERSION)
             .unwrap_or_else(|_| NonEmptyText::literal("1")),
     }
+}
+
+/// The file in this build that an import path names, when exactly one does.
+///
+/// Two shapes of import reach here, and conflating them was a real defect:
+///
+/// - **a dotted or `::` module name**, which Java, Kotlin, and Rust write. `a.b.C` is `.../a/b/C.kt`, so
+///   the separator is normalized and the result matched as a suffix of a scanned path;
+/// - **a filesystem path**, which TypeScript and JavaScript write. `./assets/logo.png` is already a path,
+///   relative to the importing file's own directory. Normalizing its dots would turn it into
+///   `//assets/logo/png`, which names nothing — and the extension is part of it, not a separator.
+///
+/// Told apart by the leading `.` or an embedded `/`, which a dotted module name never has.
+///
+/// Resolution is exact, never a guess. A relative path is joined to the importing directory and matched
+/// whole; a module name is matched as an anchored suffix. Either way a candidate that two files answer to
+/// resolves to neither, which is the rule the name index uses and for the same reason.
+///
+/// What is deliberately not done is module resolution. `./x` is matched against `x`, `x.ts`, and
+/// `x/index.ts` by comparing stems, because those are the same file under three spellings — but a path
+/// rewritten by a `tsconfig` alias, a package `exports` map, or a bundler is not resolved. Guessing at one
+/// would put a file in the graph that nobody imported.
+fn imported_file(
+    path: &str,
+    from_directory: &str,
+    files: &BTreeMap<&str, LocalNodeId>,
+) -> Option<LocalNodeId> {
+    if path.starts_with('.') {
+        let joined = join_relative(from_directory, path);
+        return only_match(files, |file_path| corresponds_exactly(file_path, &joined));
+    }
+
+    // A path with a separator is already one, so it is matched as written rather than normalized. A bare
+    // name — `react` — is a package and matches nothing, which is correct.
+    let normalized = if path.contains('/') {
+        path.to_owned()
+    } else {
+        path.replace("::", "/").replace('.', "/")
+    };
+    let without_last = parent_of(&normalized);
+    let mut candidates: Vec<&str> = Vec::new();
+    for candidate in [normalized.as_str(), without_last.as_str()] {
+        if candidate.is_empty() || candidate == ROOT_PATH {
+            continue;
+        }
+        candidates.push(candidate);
+        // `crate::x` and `self::x` are `x` relative to the root, so the first segment names no
+        // directory. Stripped rather than special-cased per language: a real directory called `crate`
+        // still matches through the unstripped candidate above.
+        if let Some(rest) = candidate
+            .strip_prefix("crate/")
+            .or_else(|| candidate.strip_prefix("self/"))
+        {
+            candidates.push(rest);
+        }
+    }
+
+    // Longest first, so `a/b/C` is preferred over `a/b` when both name a file.
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.len()));
+    candidates.dedup();
+
+    for candidate in candidates {
+        if let Some(found) = only_match(files, |file_path| corresponds(file_path, candidate)) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// The skipped path an import names, when exactly one does.
+///
+/// Only a **relative** path can name an asset, and that is not a shortcut. A bare specifier like
+/// `react` or a dotted `a.b.C` names a module by a resolution rule this build does not implement, so
+/// matching one against a skipped file would be a guess. `./assets/logo.png` names a location, and the
+/// scan already recorded whether something is there.
+///
+/// Matched with the extension included and no `index` fallback, because an asset is imported by its whole
+/// name: `./logo` is not `./logo.png` to any toolchain without a loader configured, and inventing that
+/// rule would attach a component to a file it does not import.
+fn imported_asset(
+    path: &str,
+    from_directory: &str,
+    available: &BTreeMap<&str, SkipReason>,
+) -> Option<String> {
+    if !path.starts_with('.') {
+        return None;
+    }
+    let joined = join_relative(from_directory, path);
+    available.contains_key(joined.as_str()).then_some(joined)
+}
+
+/// The one file matching a test, or `None` when none or more than one does.
+fn only_match(
+    files: &BTreeMap<&str, LocalNodeId>,
+    matches: impl Fn(&str) -> bool,
+) -> Option<LocalNodeId> {
+    let mut found = files.iter().filter(|(path, _)| matches(path));
+    match (found.next(), found.next()) {
+        (Some((_, id)), None) => Some(*id),
+        // Two files answer to one import path. Neither is the answer.
+        _ => None,
+    }
+}
+
+/// Joins a relative import path to the directory of the file that wrote it, resolving `.` and `..`.
+///
+/// A `..` that climbs past the root is dropped rather than kept as a segment, because a path outside the
+/// scanned tree names no file in this build and a literal `..` component would never match one.
+fn join_relative(from_directory: &str, path: &str) -> String {
+    let mut segments: Vec<&str> = Vec::new();
+    if from_directory != ROOT_PATH {
+        segments.extend(from_directory.split('/').filter(|part| !part.is_empty()));
+    }
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    segments.join("/")
+}
+
+/// Reports whether a scanned file path is the one a joined relative path names.
+///
+/// Three spellings of one file are accepted, and no more: the path as written with its extension, the
+/// path without one, and the path as a directory holding an `index`. Those are the forms every JavaScript
+/// toolchain agrees on; anything beyond them is configuration this build does not read.
+fn corresponds_exactly(file_path: &str, joined: &str) -> bool {
+    if file_path == joined {
+        return true;
+    }
+    let stem = file_path
+        .rsplit_once('.')
+        .map_or(file_path, |(stem, _)| stem);
+    stem == joined
+        || stem
+            .strip_suffix("/index")
+            .is_some_and(|before| before == joined)
+}
+
+/// Reports whether a scanned file path is the one a normalized import candidate names.
+///
+/// The extension is dropped from the file path, because an import never writes one, and a trailing
+/// `/mod` is dropped as well: a directory module lives in `x/mod.rs` and is imported as `x`.
+///
+/// The match is anchored on a separator so `a/b/Cat` is not found by an import of `a/b/at`. A bare
+/// suffix test would make every import that happened to end a real path resolve to it.
+fn corresponds(file_path: &str, candidate: &str) -> bool {
+    let without_extension = file_path
+        .rsplit_once('.')
+        .map_or(file_path, |(stem, _)| stem);
+    let stem = without_extension
+        .strip_suffix("/mod")
+        .unwrap_or(without_extension);
+    stem == candidate
+        || stem
+            .strip_suffix(candidate)
+            .is_some_and(|before| before.ends_with('/'))
 }
 
 /// The source unit and node identifier already persisted for a path, when there is one.
@@ -1039,6 +1390,20 @@ fn existing_directory(graph: &Graph, path: &str) -> Option<LocalNodeId> {
             node.labels
                 .iter()
                 .any(|label| label.as_str() == DIRECTORY_LABEL)
+                && property(node, "path") == Some(path)
+        })
+        .map(|node| node.id)
+}
+
+/// The node an earlier build minted for an asset, so its identifier survives a rebuild.
+fn existing_asset(graph: &Graph, path: &str) -> Option<LocalNodeId> {
+    graph
+        .nodes
+        .iter()
+        .find(|node| {
+            node.labels
+                .iter()
+                .any(|label| label.as_str() == ASSET_LABEL)
                 && property(node, "path") == Some(path)
         })
         .map(|node| node.id)
@@ -1301,6 +1666,46 @@ fn file_evidence(locator: &CanonicalSourceLocator, held: &Unit) -> Evidence {
 /// The range is the handler's, because that is where the route is written. `Deterministic` and
 /// `Extracted` hold: the method and the path were read off an annotation rather than inferred, and a path
 /// this analyzer could not evaluate is recorded as written rather than resolved.
+/// Evidence for a component's record.
+///
+/// The producer is the React analyzer and the confidence is **not** `Extracted` when the component was
+/// recognised by a convention. `Inferred` with a score is what section 11.4 gives a fact that is
+/// pattern-based, and reporting a capitalised function as extracted would say the source declared something
+/// it only implied.
+fn component_evidence(
+    locator: &CanonicalSourceLocator,
+    held: &Unit,
+    component: &crate::analyze::framework::Component,
+) -> Evidence {
+    use crate::analyze::framework::Recognition;
+    Evidence {
+        source: locator.clone(),
+        resolved_revision: None,
+        path: NonEmptyText::new(held.path.as_str()).ok(),
+        content_digest: held.analysis.digest.clone(),
+        range: Some(component.range),
+        producer: NonEmptyText::new(crate::analyze::framework::react::FRAMEWORK)
+            .unwrap_or_else(|_| NonEmptyText::literal("framework")),
+        producer_version: NonEmptyText::new(crate::analyze::framework::react::VERSION)
+            .unwrap_or_else(|_| NonEmptyText::literal("1")),
+        method: EvidenceMethod::Deterministic,
+        confidence: match component.recognised_by {
+            Recognition::Declared => Confidence::Extracted,
+            // A convention every React project follows, and which a helper called `Wrapper` also satisfies.
+            Recognition::Convention => Confidence::Inferred {
+                score: crate::evidence::Score::literal(CONVENTION_CONFIDENCE),
+            },
+        },
+    }
+}
+
+/// The score a component recognised by convention carries.
+///
+/// A number rather than a shrug, because `Inferred` requires one and a reader comparing two facts needs it to
+/// mean something. The capitalisation convention is the one JSX itself enforces — `<Card />` is a component
+/// and `<div />` is a tag — so it holds for nearly every component and fails only for a capitalised helper.
+const CONVENTION_CONFIDENCE: f32 = 0.8;
+
 fn framework_evidence(
     locator: &CanonicalSourceLocator,
     held: &Unit,
@@ -1402,10 +1807,16 @@ mod tests {
             .into_iter()
             .map(|schema| schema.name.as_str().to_owned())
             .collect();
-        let mut written: BTreeSet<String> = [FILE_LABEL, DIRECTORY_LABEL, ENDPOINT_LABEL]
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
+        let mut written: BTreeSet<String> = [
+            FILE_LABEL,
+            DIRECTORY_LABEL,
+            ENDPOINT_LABEL,
+            ASSET_LABEL,
+            COMPONENT_LABEL,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
         written.extend(
             super::EVERY_ITEM_KIND
                 .into_iter()
@@ -1642,6 +2053,478 @@ mod tests {
             relations(&graph, CALLS),
             [("caller".to_owned(), "callee".to_owned())]
         );
+    }
+
+    #[test]
+    fn an_import_naming_a_file_in_this_build_becomes_an_edge() {
+        // `FactKind::ImportExport` has been declared by both analyzers since they were written and
+        // produced by neither: `analysis.imports` reached the parse cache and Spring's recognition
+        // check, and never the graph. The reported repository has 772 `CONTAINS`, 307 `CALLS`, 9
+        // `HANDLED_BY`, and no import edge at all, while its Kotlin sources do import each other.
+        let dir = TempDir::new("imports");
+        let mut service = dir.write(
+            "src/main/kotlin/com/demo/app/Service.kt",
+            "package com.demo.app\n\nimport com.demo.app.data.Payload\n\nclass Service\n",
+        );
+        service.language = "kotlin".to_owned();
+        let mut payload = dir.write(
+            "src/main/kotlin/com/demo/app/data/Payload.kt",
+            "package com.demo.app.data\n\nclass Payload\n",
+        );
+        payload.language = "kotlin".to_owned();
+
+        let mut graph = Graph::default();
+        build(&dir, vec![service, payload], &mut graph, 1);
+
+        assert_eq!(
+            relations(&graph, IMPORTS),
+            [(
+                "src/main/kotlin/com/demo/app/Service.kt".to_owned(),
+                "src/main/kotlin/com/demo/app/data/Payload.kt".to_owned()
+            )],
+            "an import names a path, and that path is a file in this build"
+        );
+    }
+
+    #[test]
+    fn an_import_naming_a_dependency_is_never_matched_by_name() {
+        // The reason resolution is by path and not by name. This project declares exactly one `List`,
+        // so a last-segment match would resolve `java.util.List` to it and the graph would assert that
+        // a file imports a class it does not import. A suffix of a real path cannot be produced by an
+        // import that names something outside the project.
+        let dir = TempDir::new("dependency");
+        let mut using = dir.write(
+            "src/main/kotlin/com/demo/Using.kt",
+            "package com.demo\n\nimport java.util.List\nimport org.springframework.boot.runApplication\n\nclass Using\n",
+        );
+        using.language = "kotlin".to_owned();
+        let mut ours = dir.write(
+            "src/main/kotlin/com/demo/List.kt",
+            "package com.demo\n\nclass List\n",
+        );
+        ours.language = "kotlin".to_owned();
+
+        let mut graph = Graph::default();
+        let draft = build(&dir, vec![using, ours], &mut graph, 1);
+
+        assert!(
+            relations(&graph, IMPORTS).is_empty(),
+            "a dependency must not be resolved to a same-named local declaration: {:?}",
+            relations(&graph, IMPORTS)
+        );
+        assert!(
+            draft.coverage.unresolved_units >= 2,
+            "both dependency imports are counted, not invented"
+        );
+    }
+
+    #[test]
+    fn a_use_naming_a_symbol_resolves_to_the_file_the_module_path_names() {
+        // Kotlin's import ends in the declaration and its file is named for it; Rust's ends in a symbol
+        // inside a module file. Dropping the last segment is what makes one rule serve both, and
+        // `crate` names the root rather than a directory under it.
+        let dir = TempDir::new("use");
+        let main = dir.write("src/main.rs", "use crate::helper::Thing;\nfn main() {}\n");
+        let helper = dir.write("src/helper.rs", "pub struct Thing;\n");
+
+        let mut graph = Graph::default();
+        build(&dir, vec![main, helper], &mut graph, 1);
+
+        assert_eq!(
+            relations(&graph, IMPORTS),
+            [("src/main.rs".to_owned(), "src/helper.rs".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_import_two_files_answer_to_resolves_to_neither() {
+        // The rule the name index already uses, for the reason it uses it: two answers is not an answer.
+        let dir = TempDir::new("ambiguous");
+        let mut using = dir.write(
+            "src/main/kotlin/Using.kt",
+            "import data.Payload\n\nclass Using\n",
+        );
+        using.language = "kotlin".to_owned();
+        let mut first = dir.write("src/a/data/Payload.kt", "class Payload\n");
+        first.language = "kotlin".to_owned();
+        let mut second = dir.write("src/b/data/Payload.kt", "class Payload\n");
+        second.language = "kotlin".to_owned();
+
+        let mut graph = Graph::default();
+        build(&dir, vec![using, first, second], &mut graph, 1);
+
+        assert!(
+            relations(&graph, IMPORTS).is_empty(),
+            "{:?}",
+            relations(&graph, IMPORTS)
+        );
+    }
+
+    #[test]
+    fn correspondence_is_anchored_on_a_separator() {
+        // A bare suffix test would make every import that happened to end a real path resolve to it,
+        // so `a/b/at` must not be found by a file called `a/b/Cat`.
+        let files: BTreeMap<&str, LocalNodeId> = BTreeMap::new();
+        assert!(corresponds("src/a/b/Cat.rs", "a/b/Cat"));
+        assert!(corresponds("src/a/b/Cat.rs", "Cat"));
+        assert!(!corresponds("src/a/b/Cat.rs", "at"));
+        assert!(!corresponds("src/a/b/Cat.rs", "b/at"));
+        // A directory module is imported by the directory's name, not by `mod`.
+        assert!(corresponds("src/analyze/mod.rs", "analyze"));
+        assert!(!corresponds("src/analyze/mod.rs", "analyze/mod"));
+        assert_eq!(imported_file("anything", ROOT_PATH, &files), None);
+    }
+
+    #[test]
+    fn a_relative_path_is_joined_to_the_directory_that_wrote_it() {
+        // TypeScript imports a path, not a name, and the dots in it are not separators. Normalizing them
+        // the way a dotted module name is normalized turned `./assets/logo.png` into `//assets/logo/png`,
+        // which names nothing — so an asset import resolved to no file and every one of them was counted
+        // unresolved.
+        assert_eq!(
+            join_relative("src/components", "./assets/logo.png"),
+            "src/components/assets/logo.png"
+        );
+        assert_eq!(
+            join_relative("src/components", "../shared/util"),
+            "src/shared/util"
+        );
+        assert_eq!(join_relative(ROOT_PATH, "./a/b"), "a/b");
+        // Climbing past the root drops rather than keeping a `..` that could never match a scanned path.
+        assert_eq!(join_relative("src", "../../outside"), "outside");
+    }
+
+    #[test]
+    fn three_spellings_of_one_file_correspond_and_nothing_else_does() {
+        // The forms every JavaScript toolchain agrees on: as written, without the extension, and as a
+        // directory holding an index. A `tsconfig` alias is not among them and is not guessed at.
+        assert!(corresponds_exactly(
+            "src/assets/logo.png",
+            "src/assets/logo.png"
+        ));
+        assert!(corresponds_exactly("src/Button.tsx", "src/Button"));
+        assert!(corresponds_exactly("src/Button/index.ts", "src/Button"));
+        assert!(!corresponds_exactly("src/Button.tsx", "src/Butto"));
+        assert!(!corresponds_exactly("src/other/Button.tsx", "src/Button"));
+    }
+
+    #[test]
+    fn a_typescript_import_of_a_sibling_module_becomes_an_edge() {
+        let dir = TempDir::new("ts-imports");
+        let mut card = dir.write(
+            "src/components/Card.tsx",
+            "import { helper } from \"../shared/helper\";\nexport class Card { }\n",
+        );
+        card.language = "typescript".to_owned();
+        let mut helper = dir.write(
+            "src/shared/helper.ts",
+            "export function helper() { return 1; }\n",
+        );
+        helper.language = "typescript".to_owned();
+
+        let mut graph = Graph::default();
+        build(&dir, vec![card, helper], &mut graph, 1);
+
+        assert_eq!(
+            relations(&graph, IMPORTS),
+            [(
+                "src/components/Card.tsx".to_owned(),
+                "src/shared/helper.ts".to_owned()
+            )]
+        );
+    }
+
+    /// A scan whose skipped list is stated, so an asset test does not depend on what `looks_binary`
+    /// decides about bytes written into a temporary directory.
+    fn build_with_skipped(
+        dir: &TempDir,
+        files: Vec<ScannedFile>,
+        skipped: Vec<(&str, SkipReason)>,
+        graph: &mut Graph,
+    ) -> BuildDraft {
+        let scan = Scan {
+            files,
+            skipped: skipped
+                .into_iter()
+                .map(|(path, reason)| SkippedSource {
+                    source: CanonicalSourceLocator::root(),
+                    path: NonEmptyText::new(path).ok(),
+                    reason,
+                })
+                .collect(),
+        };
+        let mut minter = Minter::new();
+        let draft = super::draft(&request(dir, &scan, graph, 1, false), &mut minter);
+        if !draft.change_set.operations.is_empty() {
+            crate::apply::apply(graph, &draft.change_set, 1, &mut minter)
+                .expect("the draft applies");
+        }
+        draft
+    }
+
+    #[test]
+    fn a_react_component_is_a_record_of_its_own_joined_to_its_declaration() {
+        // A record rather than a second label on the declaration, for the reason `Endpoint` is one: the
+        // framework analyzer declares its own version, and section 11.3 lets it withdraw only its own
+        // contributions. A label on a record the language analyzer owns could not be withdrawn.
+        let dir = TempDir::new("react-components");
+        let mut card = dir.write(
+            "src/Card.tsx",
+            "import React from \"react\";\nexport function Card() { return null; }\nexport function helper() { return 1; }\n",
+        );
+        card.language = "typescript".to_owned();
+
+        let mut graph = Graph::default();
+        let draft = build(&dir, vec![card], &mut graph, 1);
+
+        assert_eq!(draft.components, 1, "the helper is not one");
+        let component = graph
+            .nodes
+            .iter()
+            .find(|node| {
+                node.labels
+                    .iter()
+                    .any(|held| held.as_str() == COMPONENT_LABEL)
+            })
+            .expect("a component record");
+        assert_eq!(property(component, "name"), Some("Card"));
+        assert_eq!(property(component, "framework"), Some("react"));
+        // The analyzer's class, and how this one was recognised. A reader judging the count needs the second.
+        assert_eq!(property(component, "precision"), Some("heuristic"));
+        assert_eq!(property(component, "recognised_by"), Some("convention"));
+        assert_eq!(
+            relations(&graph, DECLARED_BY),
+            [("Card".to_owned(), "Card".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_component_recognised_by_convention_is_evidenced_as_inferred() {
+        // `Extracted` would say the source declared what it only implied. A class extending `Component`
+        // states it, and that one is extracted.
+        let dir = TempDir::new("react-confidence");
+        let mut file = dir.write(
+            "src/Both.tsx",
+            "import React from \"react\";\nexport function Loose() {}\nexport class Strict extends React.Component {}\n",
+        );
+        file.language = "typescript".to_owned();
+
+        let mut graph = Graph::default();
+        build(&dir, vec![file], &mut graph, 1);
+
+        let mut seen: Vec<(String, bool)> = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.labels
+                    .iter()
+                    .any(|held| held.as_str() == COMPONENT_LABEL)
+            })
+            .map(|node| {
+                let extracted = node.contributions.iter().any(|held| {
+                    held.evidence
+                        .iter()
+                        .any(|found| found.confidence == crate::evidence::Confidence::Extracted)
+                });
+                (
+                    property(node, "name").unwrap_or_default().to_owned(),
+                    extracted,
+                )
+            })
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            [("Loose".to_owned(), false), ("Strict".to_owned(), true),]
+        );
+    }
+
+    #[test]
+    fn a_go_receiver_joins_the_method_to_the_type_it_is_on() {
+        // Go states the owner in the declaration rather than by containment, so the edge has to come from
+        // the method's target. Nothing else sets one on a method, so this reaches `FOR_TYPE` the same way
+        // a Rust `impl` block does.
+        let dir = TempDir::new("go-receiver");
+        let mut file = dir.write(
+            "service.go",
+            "package main\n\ntype Service struct {\n\tName string\n}\n\nfunc (s *Service) Do() error {\n\treturn nil\n}\n",
+        );
+        file.language = "go".to_owned();
+
+        let mut graph = Graph::default();
+        build(&dir, vec![file], &mut graph, 1);
+
+        assert_eq!(
+            relations(&graph, FOR_TYPE),
+            [("Do".to_owned(), "Service".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_component_importing_a_skipped_file_is_joined_to_it_as_an_asset() {
+        // The requirement, and the shape of it: a schema, a path, and an edge from what references it.
+        // The binary is never read — it is in the graph because analyzed source names it, which is why
+        // section 17.2's rule that the scanner skips a binary file is untouched.
+        let dir = TempDir::new("asset");
+        let mut card = dir.write(
+            "src/Card.tsx",
+            "import logo from \"./assets/logo.png\";\nexport class Card { }\n",
+        );
+        card.language = "typescript".to_owned();
+
+        let mut graph = Graph::default();
+        build_with_skipped(
+            &dir,
+            vec![card],
+            vec![("src/assets/logo.png", SkipReason::Binary)],
+            &mut graph,
+        );
+
+        assert_eq!(
+            relations(&graph, IMPORTS),
+            [("src/Card.tsx".to_owned(), "src/assets/logo.png".to_owned())]
+        );
+        let asset = graph
+            .nodes
+            .iter()
+            .find(|node| node.labels.iter().any(|held| held.as_str() == ASSET_LABEL))
+            .expect("an asset record");
+        assert_eq!(property(asset, "path"), Some("src/assets/logo.png"));
+        assert_eq!(
+            property(asset, "skipped"),
+            Some("binary"),
+            "why no analyzer read it is part of the record"
+        );
+    }
+
+    #[test]
+    fn one_asset_imported_by_two_components_is_one_record() {
+        let dir = TempDir::new("shared-asset");
+        let mut first = dir.write(
+            "src/A.tsx",
+            "import l from \"./img/l.png\";\nexport class A { }\n",
+        );
+        first.language = "typescript".to_owned();
+        let mut second = dir.write(
+            "src/B.tsx",
+            "import l from \"./img/l.png\";\nexport class B { }\n",
+        );
+        second.language = "typescript".to_owned();
+
+        let mut graph = Graph::default();
+        build_with_skipped(
+            &dir,
+            vec![first, second],
+            vec![("src/img/l.png", SkipReason::Binary)],
+            &mut graph,
+        );
+
+        let assets = graph
+            .nodes
+            .iter()
+            .filter(|node| node.labels.iter().any(|held| held.as_str() == ASSET_LABEL))
+            .count();
+        assert_eq!(assets, 1, "one path is one record, however many import it");
+        assert_eq!(relations(&graph, IMPORTS).len(), 2);
+    }
+
+    #[test]
+    fn an_excluded_file_does_not_become_an_asset_by_being_imported() {
+        // An `Ignored` file was excluded on purpose and a `Sensitive` one was withheld before it was read.
+        // An import must not overrule either: the exclusion is the decision, and a route into the graph
+        // that bypasses it would make `.gitignore` and the sensitive list advisory.
+        let dir = TempDir::new("excluded");
+        let mut app = dir.write(
+            "src/App.tsx",
+            "import a from \"./secret.pem\";\nimport b from \"./build/out.bin\";\nexport class App { }\n",
+        );
+        app.language = "typescript".to_owned();
+
+        let mut graph = Graph::default();
+        let draft = build_with_skipped(
+            &dir,
+            vec![app],
+            vec![
+                ("src/secret.pem", SkipReason::Sensitive),
+                ("src/build/out.bin", SkipReason::Ignored),
+            ],
+            &mut graph,
+        );
+
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| node.labels.iter().any(|held| held.as_str() == ASSET_LABEL)),
+            "neither exclusion may be reached through an import"
+        );
+        assert!(draft.coverage.unresolved_units >= 2);
+    }
+
+    #[test]
+    fn a_file_too_large_to_read_is_an_asset_and_says_so() {
+        let dir = TempDir::new("too-large");
+        let mut player = dir.write(
+            "src/Player.tsx",
+            "import clip from \"./media/clip.mp4\";\nexport class Player { }\n",
+        );
+        player.language = "typescript".to_owned();
+
+        let mut graph = Graph::default();
+        build_with_skipped(
+            &dir,
+            vec![player],
+            vec![("src/media/clip.mp4", SkipReason::TooLarge)],
+            &mut graph,
+        );
+
+        let asset = graph
+            .nodes
+            .iter()
+            .find(|node| node.labels.iter().any(|held| held.as_str() == ASSET_LABEL))
+            .expect("an asset record");
+        assert_eq!(property(asset, "skipped"), Some("too large"));
+    }
+
+    #[test]
+    fn a_bare_specifier_never_names_an_asset() {
+        // Only a relative path names a location. `react` and `a.b.C` name a module by a resolution rule
+        // this build does not implement, so matching either against a skipped file would be a guess.
+        let available: BTreeMap<&str, SkipReason> = [("assets/logo.png", SkipReason::Binary)]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            imported_asset("./assets/logo.png", ROOT_PATH, &available).as_deref(),
+            Some("assets/logo.png")
+        );
+        assert_eq!(
+            imported_asset("assets/logo.png", ROOT_PATH, &available),
+            None
+        );
+        assert_eq!(imported_asset("react", ROOT_PATH, &available), None);
+        // No `index` fallback and no extension guessing: `./logo` is not `./logo.png` to any toolchain
+        // without a loader configured, and inventing that rule would attach a component to a file it does
+        // not import.
+        assert_eq!(imported_asset("./assets/logo", ROOT_PATH, &available), None);
+    }
+
+    #[test]
+    fn a_package_import_names_no_file_and_is_counted() {
+        let dir = TempDir::new("ts-package");
+        let mut app = dir.write(
+            "src/App.tsx",
+            "import React from \"react\";\nexport class App { }\n",
+        );
+        app.language = "typescript".to_owned();
+
+        let mut graph = Graph::default();
+        let draft = build(&dir, vec![app], &mut graph, 1);
+
+        assert!(
+            relations(&graph, IMPORTS).is_empty(),
+            "a package is not a file here"
+        );
+        assert!(draft.coverage.unresolved_units >= 1);
     }
 
     #[test]
@@ -1917,9 +2800,14 @@ mod tests {
         // This test is the reason that survived a whole Stage. It asserted the three lines below
         // and nothing about the graph, so it passed both before and after — a precise pin on the
         // half of the behaviour that was already right.
+        //
+        // Markdown, deliberately. This used to be a `.py` file, and the language gained an analyzer —
+        // which made the test assert the opposite of what it was written to assert while still passing
+        // the two lines below it. A prose format is the durable choice: it is named so the report can say
+        // what it is, and no structural analyzer is ever coming for it.
         let dir = TempDir::new("unsupported");
-        let mut file = dir.write("app.py", "def main(): pass\n");
-        file.language = "python".to_owned();
+        let mut file = dir.write("notes.md", "# Notes\n\nSome prose.\n");
+        file.language = "markdown".to_owned();
         let mut graph = Graph::default();
         let draft = build_with(&dir, vec![file], &mut graph, 1, false);
 
@@ -1939,10 +2827,10 @@ mod tests {
             .filter(|node| node.labels.iter().any(|held| held.as_str() == FILE_LABEL))
             .collect();
         assert_eq!(recorded.len(), 1, "the file is in its own graph");
-        assert_eq!(property(recorded[0], "path"), Some("app.py"));
+        assert_eq!(property(recorded[0], "path"), Some("notes.md"));
         assert_eq!(
             property(recorded[0], "language"),
-            Some("python"),
+            Some("markdown"),
             "the language is named even though nothing analyzes it"
         );
         assert_eq!(
