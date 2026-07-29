@@ -805,6 +805,7 @@ impl Project {
                 coverage: draft.coverage,
                 analyzed_files: draft.analyzed_files,
                 recorded_files: draft.recorded_files,
+                replaced_schemas: Vec::new(),
                 endpoints: draft.endpoints,
                 frameworks: draft.frameworks.clone(),
                 uninterpreted_annotations: draft.uninterpreted_annotations.clone(),
@@ -821,6 +822,14 @@ impl Project {
                     reason: error.to_string(),
                 })?;
 
+        // The schemas describing what the build just wrote.
+        //
+        // Set here rather than proposed in the change set, because there is no change-set operation for a
+        // schema: a set carries contributions and validates their owner, and a schema has no owner in
+        // `nost_language_version` 2. That is the cost of declaring them unowned, and it is why this is the
+        // one thing a build writes outside its change set.
+        let replaced = declare_schemas(&mut graph);
+
         let generation = crate::encoding::commit_graph(&mut database, &graph)?;
         Ok(BuildReport {
             generation,
@@ -829,6 +838,7 @@ impl Project {
             coverage: draft.coverage,
             analyzed_files: draft.analyzed_files,
             recorded_files: draft.recorded_files,
+            replaced_schemas: replaced,
             endpoints: draft.endpoints,
             frameworks: draft.frameworks,
             uninterpreted_annotations: draft.uninterpreted_annotations,
@@ -1324,6 +1334,14 @@ pub struct BuildReport {
     pub analyzed_files: u64,
     /// How many files hold a record, whether or not an analyzer read them.
     pub recorded_files: u64,
+    /// Schemas this build replaced whose stored form differed from what it declares, by name.
+    ///
+    /// Not ownership, which `nost_language_version` 2 cannot express for a schema. It is the honest
+    /// remainder of declaring them unowned: a hand-written schema of the same name is replaced, and this
+    /// says which — so nothing is lost silently even though something is lost.
+    ///
+    /// A stored schema identical to what this build declares is not reported. Nothing was lost.
+    pub replaced_schemas: Vec<String>,
     /// Framework entry points recorded.
     pub endpoints: u64,
     /// The frameworks whose analyzers recognised something, in name order.
@@ -1424,6 +1442,41 @@ pub struct LinkChange {
 }
 
 /// Renders a baseline as the document `sync.json` holds.
+/// Replaces the graph's schemas with the ones this build declares, reporting what differed.
+///
+/// A schema whose stored form matches what the Engine declares is left alone and not reported: nothing
+/// was lost. One that differs is replaced and named, because that is somebody's edit going away.
+///
+/// A schema naming a label the Engine does not write is **kept**. Those are nobody's business here — a
+/// user may declare schemas for their own records, and replacing the whole list would delete them.
+fn declare_schemas(graph: &mut crate::encoding::Graph) -> Vec<String> {
+    let declared = crate::build::schemas();
+    let mine: std::collections::BTreeSet<String> = declared
+        .iter()
+        .map(|held| held.name.as_str().to_owned())
+        .collect();
+    let mut replaced = Vec::new();
+    for schema in &declared {
+        if let Some(stored) = graph
+            .schemas
+            .iter()
+            .find(|held| held.name.as_str() == schema.name.as_str())
+        {
+            if stored != schema {
+                replaced.push(schema.name.as_str().to_owned());
+            }
+        }
+    }
+    graph
+        .schemas
+        .retain(|held| !mine.contains(held.name.as_str()));
+    graph.schemas.extend(declared);
+    graph
+        .schemas
+        .sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+    replaced
+}
+
 fn baseline_json(baseline: &SyncBaseline) -> String {
     let document = serde_json::json!({
         "baseline_version": BASELINE_VERSION,
@@ -2191,6 +2244,99 @@ mod tests {
         assert_eq!(
             report.generation, before,
             "nothing was found, so nothing is committed"
+        );
+    }
+
+    #[test]
+    fn a_materialized_nost_declares_a_schema_for_every_label_it_uses() {
+        // Reported: `.nostdb/root.nost` used `File` and `Endpoint` and declared no schema for either. That
+        // was valid — section 5.3.3 permits an undeclared name as an unvalidated label — and it said
+        // nothing about the shape of anything in the file.
+        let dir = TempDir::new("nost-schemas");
+        let project = Project::initialize(dir.path()).unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/C.kt"),
+            "import org.springframework.web.bind.annotation.RestController\n\n\
+             @RestController\n\
+             class C {\n\x20   @GetMapping(\"/x\")\n\x20   fun f(): String = \"\"\n}\n",
+        )
+        .unwrap();
+
+        let registry = crate::analyze::builtin_registry().unwrap();
+        project
+            .build(&registry, &crate::scan::ScanOptions::default(), false)
+            .unwrap();
+
+        let database = project.open_database().unwrap();
+        let graph = crate::encoding::read_graph(&database).unwrap();
+
+        // Every label a record carries has a schema in the graph.
+        let declared: std::collections::BTreeSet<&str> = graph
+            .schemas
+            .iter()
+            .map(|held| held.name.as_str())
+            .collect();
+        let used: std::collections::BTreeSet<&str> = graph
+            .nodes
+            .iter()
+            .flat_map(|node| node.labels.iter())
+            .map(crate::name::Label::as_str)
+            .collect();
+        for label in &used {
+            assert!(
+                declared.contains(label),
+                "{label} has no schema: {declared:?}"
+            );
+        }
+        assert!(
+            used.contains("Endpoint") && used.contains("File"),
+            "{used:?}"
+        );
+
+        // And the materialized `.nost` still parses and still validates, with the schemas in it.
+        let text = crate::nost::format::format(&crate::nost::convert::from_graph(&graph));
+        assert!(
+            text.contains("schema File {"),
+            "{}",
+            &text[..500.min(text.len())]
+        );
+        assert!(text.contains("schema Endpoint {"), "the reported label");
+        let reparsed = crate::nost::parser::parse(&text).expect("the writer's output parses");
+        // And every record satisfies the schema the Engine declared for it, so declaring them did not
+        // fill the file with violations.
+        let violations = crate::nost::validate::validate(&reparsed);
+        assert!(
+            violations.is_empty(),
+            "a record must satisfy the schema the Engine declares for it: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn replacing_a_differing_schema_is_reported_and_an_identical_one_is_not() {
+        // The cost of declaring these unowned, stated where it is paid. A hand-written schema of the same
+        // name is replaced; this is what says which.
+        let dir = TempDir::new("schema-replaced");
+        let project = Project::initialize(dir.path()).unwrap();
+        fs::write(dir.path().join("notes.md"), "# x\n").unwrap();
+        let registry = crate::analyze::builtin_registry().unwrap();
+        let first = project
+            .build(&registry, &crate::scan::ScanOptions::default(), false)
+            .unwrap();
+        assert!(
+            first.replaced_schemas.is_empty(),
+            "nothing was there to replace: {:?}",
+            first.replaced_schemas
+        );
+
+        // A second build over an unchanged tree replaces its own identical schemas, and reports nothing.
+        let again = project
+            .build(&registry, &crate::scan::ScanOptions::default(), true)
+            .unwrap();
+        assert!(
+            again.replaced_schemas.is_empty(),
+            "an identical schema is not a loss: {:?}",
+            again.replaced_schemas
         );
     }
 

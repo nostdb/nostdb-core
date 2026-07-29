@@ -96,7 +96,7 @@ pub const FOR_TYPE: &str = "FOR_TYPE";
 /// 3 because a second analyzer arrived. A Kotlin file used to assert only that it existed and now
 /// asserts what is declared in it, so a database built before it holds Kotlin records this build
 /// would not write. Reuse would keep them: the bytes did not change.
-pub const GRAPH_SCHEMA_VERSION: u32 = 4;
+pub const GRAPH_SCHEMA_VERSION: u32 = 5;
 
 /// The label a kind of item carries.
 #[must_use]
@@ -756,6 +756,120 @@ fn every_file_unchanged(scan: &Scan, graph: &Graph) -> Option<u64> {
     (count > 0).then_some(count)
 }
 
+/// A schema for every label this module writes.
+///
+/// # Why the Engine declares these at all
+///
+/// `nost_language_version` section 5.3.3 permits a record to name a schema nothing declares, and calls
+/// the consequence "accepted rather than solved": a misspelled schema name is indistinguishable from an
+/// intentional bare label. A materialized `.nost` was therefore valid and said nothing about the shape of
+/// anything in it.
+///
+/// The Engine knows that shape exactly — it wrote the records. Declaring it makes the export
+/// self-describing and turns a hand-edited misspelling into a `NOST_SCHEMA_VIOLATION` warning, which is
+/// the same gap `CYPHER_UNKNOWN_LABEL` closes on the query side.
+///
+/// # These are unowned, and that has a cost
+///
+/// A schema declaration carries no `@by` in version 2 and [`Schema`] carries no owner, so these are
+/// indistinguishable from a schema somebody wrote by hand. **A hand-written schema of the same name is
+/// replaced on the next build.** That was chosen deliberately over a language version bump, and the
+/// build warns when the schema it replaces differed from what it declares — which is not ownership, but
+/// it does mean nothing is lost silently.
+///
+/// They are also not change-set operations, because there is no operation for a schema: a change set
+/// carries contributions and validates their owner, and a thing with no owner does not fit it.
+///
+/// # Node schemas only
+///
+/// No edge schema is declared. An endpoint constraint names one source schema and one target schema, and
+/// `CONTAINS` legitimately runs `Directory -> File`, `Directory -> Directory`, `File -> Struct`,
+/// `File -> Endpoint`, and `Struct -> Method`. One constraint cannot describe that, and declaring any one
+/// of them would raise a violation on every edge of the other shapes.
+#[must_use]
+pub fn schemas() -> Vec<crate::schema::Schema> {
+    use crate::schema::{FieldType, ScalarType, Schema, SchemaField};
+
+    let field = |key: &str, scalar: ScalarType, required: bool| SchemaField {
+        key: PropertyKey::new(key).unwrap_or_else(|_| PropertyKey::literal("unknown")),
+        field_type: FieldType::scalar(scalar),
+        required,
+    };
+    let text = |key: &str| field(key, ScalarType::String, true);
+    let number = |key: &str| field(key, ScalarType::Integer, true);
+    let schema = |name: &str, fields: Vec<SchemaField>| Schema {
+        name: Label::new(name).unwrap_or_else(|_| Label::literal("Unknown")),
+        endpoints: None,
+        fields,
+    };
+
+    // Every item label shares one shape, because `plan_item` writes one set of properties for all of
+    // them. Listed from `label_for` rather than repeated, so a new `ItemKind` cannot gain a label with no
+    // schema — the test below requires every label this module can write to appear here.
+    let item = |name: &str| {
+        schema(
+            name,
+            vec![
+                text("name"),
+                text("qualified_name"),
+                text("path"),
+                number("ordinal"),
+                number("line"),
+                number("end_line"),
+            ],
+        )
+    };
+
+    let mut declared = vec![
+        schema(
+            FILE_LABEL,
+            vec![
+                text("path"),
+                text("language"),
+                text("digest"),
+                text("precision"),
+                number("schema_version"),
+            ],
+        ),
+        schema(
+            DIRECTORY_LABEL,
+            vec![text("path"), number("schema_version")],
+        ),
+        schema(
+            ENDPOINT_LABEL,
+            vec![
+                text("method"),
+                text("path"),
+                text("handler"),
+                text("framework"),
+                text("precision"),
+                number("schema_version"),
+            ],
+        ),
+    ];
+    declared.extend(
+        EVERY_ITEM_KIND
+            .into_iter()
+            .map(|kind| item(label_for(kind))),
+    );
+    declared
+}
+
+/// Every kind an item can be, so nothing that gains a label can miss a schema.
+const EVERY_ITEM_KIND: [ItemKind; 11] = [
+    ItemKind::Module,
+    ItemKind::Struct,
+    ItemKind::Enum,
+    ItemKind::Union,
+    ItemKind::Trait,
+    ItemKind::TypeAlias,
+    ItemKind::Function,
+    ItemKind::Method,
+    ItemKind::Field,
+    ItemKind::Constant,
+    ItemKind::Implementation,
+];
+
 /// The key a file's parse is stored under.
 #[must_use]
 pub fn parse_cache_key(file: &crate::scan::ScannedFile) -> crate::cache::StructuralParseCacheKey {
@@ -1274,6 +1388,72 @@ fn integer_property(key: &str, value: i64) -> (PropertyKey, PropertyValue) {
 
 #[cfg(test)]
 mod tests {
+    /// Every label this module can write has a schema, and every schema names a label it writes.
+    ///
+    /// Both directions. A label with no schema is what prompted this — a materialized `.nost` naming
+    /// `File` and `Endpoint` and declaring neither — and a schema naming a label nothing writes is a
+    /// declaration a reader would look for records under and find none of.
+    ///
+    /// The item labels come from `label_for` rather than a second list, so adding an `ItemKind` fails here
+    /// instead of quietly gaining a label with no schema.
+    #[test]
+    fn every_label_this_build_writes_has_a_schema_and_the_reverse() {
+        let declared: BTreeSet<String> = super::schemas()
+            .into_iter()
+            .map(|schema| schema.name.as_str().to_owned())
+            .collect();
+        let mut written: BTreeSet<String> = [FILE_LABEL, DIRECTORY_LABEL, ENDPOINT_LABEL]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        written.extend(
+            super::EVERY_ITEM_KIND
+                .into_iter()
+                .map(|kind| label_for(kind).to_owned()),
+        );
+        assert_eq!(declared, written);
+
+        // And `EVERY_ITEM_KIND` really is every kind, which nothing else here would notice.
+        assert_eq!(
+            super::EVERY_ITEM_KIND.len(),
+            11,
+            "an ItemKind was added without a schema: {:?}",
+            super::EVERY_ITEM_KIND
+        );
+    }
+
+    #[test]
+    fn a_declared_schema_matches_the_properties_the_record_actually_carries() {
+        // The point of declaring a schema is that it describes what is there. A schema requiring a field
+        // the writer never sets would make every record of that label raise NOST_SCHEMA_VIOLATION.
+        let dir = TempDir::new("schema-shape");
+        let file = dir.write("src/lib.rs", "fn only() {}\n");
+        let mut graph = Graph::default();
+        build(&dir, vec![file], &mut graph, 1);
+
+        for schema in super::schemas() {
+            let name = schema.name.as_str();
+            for node in graph
+                .nodes
+                .iter()
+                .filter(|node| node.labels.iter().any(|held| held.as_str() == name))
+            {
+                let carried: BTreeSet<&str> = node
+                    .properties
+                    .iter()
+                    .map(|(key, _)| key.as_str())
+                    .collect();
+                for field in schema.fields.iter().filter(|field| field.required) {
+                    assert!(
+                        carried.contains(field.key.as_str()),
+                        "{name} requires `{}` and a record carries {carried:?}",
+                        field.key.as_str()
+                    );
+                }
+            }
+        }
+    }
+
     use super::*;
     use crate::analyze::builtin_registry;
     use crate::evidence::ContentDigest;
