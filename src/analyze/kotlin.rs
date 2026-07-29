@@ -41,7 +41,7 @@
 //! reference: claiming a supertype was an interface would be a claim this analyzer cannot check.
 
 use super::kotlin_lexer::{Delimiter, Spanned, Token, tokenize};
-use super::{FileAnalysis, Import, Item, ItemKind, Reference};
+use super::{Annotation, FileAnalysis, Import, Item, ItemKind, Reference};
 use crate::analysis::{AnalyzerCapability, FactKind, PrecisionClass};
 use crate::evidence::{SourcePosition, SourceRange};
 use crate::text::NonEmptyText;
@@ -204,16 +204,29 @@ impl Reader<'_> {
                 self.advance();
                 return items;
             }
-            // Annotations and their arguments sit before a declaration and are not one.
-            if self.peek().is_some_and(|token| token.is_punct('@')) {
-                self.advance();
-                self.advance();
-                if matches!(self.peek(), Some(Token::Open(Delimiter::Paren))) {
-                    self.skip_balanced(Delimiter::Paren);
+            // Annotations sit before a declaration and are not one, so they are collected and carried
+            // onto whatever declaration follows. Discarded, they took every framework fact with them.
+            //
+            // Kotlin allows a use-site target, `@get:JvmName("x")`, and a modifier may sit between an
+            // annotation and its declaration — so this loop gathers annotations and modifiers together
+            // until a declaration keyword arrives.
+            let mut annotations = Vec::new();
+            loop {
+                if self.peek().is_some_and(|token| token.is_punct('@')) {
+                    if let Some(found) = self.annotation() {
+                        annotations.push(found);
+                    }
+                    continue;
                 }
-                continue;
+                break;
             }
             let modifiers = self.modifiers();
+            // A second run, because `private @Inject val x` is legal and so is `@Inject private val x`.
+            while self.peek().is_some_and(|token| token.is_punct('@')) {
+                if let Some(found) = self.annotation() {
+                    annotations.push(found);
+                }
+            }
             match self.peek().and_then(Token::keyword) {
                 Some("package") => {
                     // The package a file joins, not a declaration in it. Consumed so its dots do not
@@ -223,17 +236,20 @@ impl Reader<'_> {
                 }
                 Some("import") => self.import(),
                 Some("class") | Some("interface") => {
-                    if let Some(item) = self.type_declaration(&modifiers) {
+                    if let Some(mut item) = self.type_declaration(&modifiers) {
+                        item.annotations = annotations;
                         items.push(item);
                     }
                 }
                 Some("object") => {
-                    if let Some(item) = self.object_declaration(&modifiers) {
+                    if let Some(mut item) = self.object_declaration(&modifiers) {
+                        item.annotations = annotations;
                         items.push(item);
                     }
                 }
                 Some("typealias") => {
-                    if let Some(item) = self.type_alias() {
+                    if let Some(mut item) = self.type_alias() {
+                        item.annotations = annotations;
                         items.push(item);
                     }
                 }
@@ -243,20 +259,24 @@ impl Reader<'_> {
                     // project would collide on that one name.
                     if self.peek_at(1).and_then(Token::keyword) == Some("interface") {
                         self.advance();
-                        if let Some(item) = self.type_declaration(&modifiers) {
+                        if let Some(mut item) = self.type_declaration(&modifiers) {
+                            item.annotations = annotations;
                             items.push(item);
                         }
-                    } else if let Some(item) = self.function(container) {
+                    } else if let Some(mut item) = self.function(container) {
+                        item.annotations = annotations;
                         items.push(item);
                     }
                 }
                 Some("val") | Some("var") => {
-                    if let Some(item) = self.property(container) {
+                    if let Some(mut item) = self.property(container) {
+                        item.annotations = annotations;
                         items.push(item);
                     }
                 }
                 Some("constructor") => {
-                    if let Some(item) = self.secondary_constructor() {
+                    if let Some(mut item) = self.secondary_constructor() {
+                        item.annotations = annotations;
                         items.push(item);
                     }
                 }
@@ -283,6 +303,81 @@ impl Reader<'_> {
             self.advance();
         }
         seen
+    }
+
+    /// One annotation, with its arguments exactly as written.
+    ///
+    /// A use-site target — `@get:JvmName(...)` — is consumed and the annotation's own name is what is
+    /// recorded. A qualified name keeps only its last segment, because `@org.springframework.\
+    /// web.bind.annotation.GetMapping` and `@GetMapping` are the same annotation and a framework
+    /// analyzer should not have to know which spelling a file used.
+    fn annotation(&mut self) -> Option<Annotation> {
+        let start = self.position();
+        self.advance();
+        let mut name = self.advance().and_then(Token::name)?.to_owned();
+        // A use-site target, which is a keyword followed by `:` before the real name.
+        if self.peek().is_some_and(|token| token.is_punct(':')) {
+            self.advance();
+            name = self.advance().and_then(Token::name)?.to_owned();
+        }
+        while self.peek().is_some_and(|token| token.is_punct('.')) {
+            self.advance();
+            name = self.advance().and_then(Token::name)?.to_owned();
+        }
+        let arguments = match self.peek() {
+            Some(Token::Open(Delimiter::Paren)) => Some(self.argument_text()),
+            _ => None,
+        };
+        Some(Annotation {
+            name,
+            arguments,
+            range: range(start, self.previous_position()),
+        })
+    }
+
+    /// The text between a balanced pair of parentheses, reconstructed from the tokens inside it.
+    ///
+    /// Reconstructed rather than sliced out of the source, because this reader holds tokens and not the
+    /// text. What that costs is exact spacing, and what it keeps is every name, string, and number in
+    /// order — which is what a framework analyzer reads. A string literal is the one thing it cannot
+    /// return, because the lexer reduces a literal to the fact that one was here; that is why
+    /// `argument_strings` below exists and takes them from the source instead.
+    fn argument_text(&mut self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        self.advance();
+        let mut depth = 1_u32;
+        while depth > 0 {
+            match self.peek() {
+                None => break,
+                Some(Token::Open(Delimiter::Paren)) => {
+                    depth += 1;
+                    parts.push("(".to_owned());
+                    self.advance();
+                }
+                Some(Token::Close(Delimiter::Paren)) => {
+                    depth -= 1;
+                    if depth > 0 {
+                        parts.push(")".to_owned());
+                    }
+                    self.advance();
+                }
+                Some(token) => {
+                    parts.push(match token {
+                        Token::Ident { name, .. } => name.clone(),
+                        // Quoted, so a framework analyzer can tell a string from a name. `@GetMapping("/x")`
+                        // and a hypothetical `@GetMapping(x)` are different arguments, and unquoting both
+                        // to `/x` and `x` would lose which was which.
+                        Token::Text(content) => format!("\"{content}\""),
+                        Token::Literal => "<literal>".to_owned(),
+                        Token::Open(delimiter) => delimiter.to_string()[..1].to_owned(),
+                        Token::Close(delimiter) => delimiter.to_string()[1..].to_owned(),
+                        Token::Punct(character) => character.to_string(),
+                    });
+                    self.advance();
+                }
+            }
+        }
+        parts.join(" ")
     }
 
     fn import(&mut self) {
@@ -370,6 +465,7 @@ impl Reader<'_> {
             // claim one. Every supertype is a reference instead.
             implements: None,
             references,
+            annotations: Vec::new(),
             children,
         })
     }
@@ -411,6 +507,7 @@ impl Reader<'_> {
             target: None,
             implements: None,
             references,
+            annotations: Vec::new(),
             children,
         })
     }
@@ -434,6 +531,7 @@ impl Reader<'_> {
             target: None,
             implements: None,
             references,
+            annotations: Vec::new(),
             children: Vec::new(),
         })
     }
@@ -484,6 +582,7 @@ impl Reader<'_> {
             target: None,
             implements: None,
             references,
+            annotations: Vec::new(),
             children: Vec::new(),
         })
     }
@@ -518,6 +617,7 @@ impl Reader<'_> {
             target: None,
             implements: None,
             references,
+            annotations: Vec::new(),
             children: Vec::new(),
         })
     }
@@ -547,6 +647,7 @@ impl Reader<'_> {
             target: None,
             implements: None,
             references,
+            annotations: Vec::new(),
             children: Vec::new(),
         })
     }
@@ -589,6 +690,7 @@ impl Reader<'_> {
                             target: None,
                             implements: None,
                             references,
+                            annotations: Vec::new(),
                             children: Vec::new(),
                         });
                     }
@@ -726,6 +828,10 @@ impl Reader<'_> {
             match self.peek() {
                 None => break,
                 Some(Token::Close(Delimiter::Brace)) => break,
+                // An annotation begins the next declaration, so it ends this expression body. Without
+                // this, `fun a() = 1` followed by `@Test fun b()` swallowed the `@Test` — the
+                // annotation was consumed as part of the previous expression and vanished.
+                Some(token) if token.is_punct('@') => break,
                 Some(token)
                     if matches!(
                         token.keyword(),
@@ -1099,6 +1205,109 @@ class Kept
             ["Constant:m"],
             "nested angle brackets close as two tokens"
         );
+    }
+
+    /// Every annotation on an item, as `name(arguments)`.
+    fn annotated(source: &str) -> Vec<String> {
+        fn walk(items: &[Item], into: &mut Vec<String>) {
+            for item in items {
+                for annotation in &item.annotations {
+                    into.push(match &annotation.arguments {
+                        Some(arguments) => {
+                            format!("{}:{}({arguments})", item.name, annotation.name)
+                        }
+                        None => format!("{}:{}", item.name, annotation.name),
+                    });
+                }
+                walk(&item.children, into);
+            }
+        }
+        let mut found = Vec::new();
+        walk(&items(source), &mut found);
+        found
+    }
+
+    #[test]
+    fn an_annotation_is_kept_on_the_declaration_it_was_written_on() {
+        // The reported failure was a Spring route returning nothing. This is where it was lost: the
+        // annotation was skipped, so the route never reached the graph and no framework analyzer could
+        // have recovered it.
+        let source = "\
+@RestController
+class TempController {
+    @GetMapping(\"/temp\")
+    fun temp(): String = \"ok\"
+
+    @Test
+    fun plain() {}
+}
+";
+        assert_eq!(
+            annotated(source),
+            [
+                "TempController:RestController",
+                // The route itself, which is the whole point: `<literal>` would tell a framework
+                // analyzer that a string was there and not which one.
+                "temp:GetMapping(\"/temp\")",
+                "plain:Test",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_annotation_keeps_its_arguments_as_written() {
+        // Unparsed on purpose. `@GetMapping("/x")` and `@RequestMapping(value = ["/x"], method = ...)`
+        // mean the same thing to Spring and nothing to Kotlin, so normalising them here would be
+        // guessing at a framework this analyzer does not know.
+        let source = "@RequestMapping(value = [\"/api\"], method = [RequestMethod.GET])\nclass C";
+        let found = items(source);
+        let annotation = &found[0].annotations[0];
+        assert_eq!(annotation.name, "RequestMapping");
+        let arguments = annotation.arguments.clone().expect("arguments");
+        assert!(arguments.contains("value"), "{arguments}");
+        assert!(arguments.contains("RequestMethod"), "{arguments}");
+        assert!(arguments.contains("GET"), "{arguments}");
+    }
+
+    #[test]
+    fn no_arguments_and_empty_arguments_are_different() {
+        // `@Test` took none and `@Test()` took none but was called. A framework may care which, and
+        // collapsing them would decide that for it.
+        assert_eq!(items("@Test\nfun a() {}")[0].annotations[0].arguments, None);
+        assert_eq!(
+            items("@Test()\nfun a() {}")[0].annotations[0]
+                .arguments
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn a_qualified_annotation_keeps_only_its_own_name() {
+        let source = "@org.springframework.web.bind.annotation.GetMapping(\"/x\")\nfun f() {}";
+        assert_eq!(items(source)[0].annotations[0].name, "GetMapping");
+    }
+
+    #[test]
+    fn a_use_site_target_is_consumed_and_the_annotation_is_kept() {
+        assert_eq!(
+            items("@get:JvmName(\"x\")\nval v = 1")[0].annotations[0].name,
+            "JvmName"
+        );
+    }
+
+    #[test]
+    fn an_annotation_survives_a_modifier_on_either_side_of_it() {
+        // Both orders are legal Kotlin, and a reader that gathered annotations only before modifiers
+        // would silently drop half of them.
+        for source in ["@Inject private val a = 1", "private @Inject val a = 1"] {
+            let found = items(source);
+            assert_eq!(
+                found[0].annotations.first().map(|held| held.name.as_str()),
+                Some("Inject"),
+                "{source}"
+            );
+        }
     }
 
     #[test]

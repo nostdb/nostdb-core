@@ -117,8 +117,36 @@ pub struct Item {
     pub implements: Option<String>,
     /// Names this item refers to, unresolved.
     pub references: Vec<Reference>,
+    /// Annotations or attributes written on it, in source order.
+    ///
+    /// Kept rather than skipped because this is where a framework's meaning lives. A route, an
+    /// injected dependency, a scheduled job, a serialized field — none of them are facts about the
+    /// language, and all of them are written as annotations on a declaration the language does
+    /// describe. A language analyzer that discarded them left every framework fact unrecoverable, and
+    /// the only sign of it was a query returning nothing.
+    pub annotations: Vec<Annotation>,
     /// Items declared inside it.
     pub children: Vec<Item>,
+}
+
+/// One annotation or attribute written on a declaration.
+///
+/// The arguments are kept **as written**, unparsed. `@GetMapping("/api/x")` and
+/// `@RequestMapping(value = ["/api/x"], method = [RequestMethod.GET])` mean the same thing to Spring
+/// and nothing to Kotlin, so which is which is a framework analyzer's question rather than a language
+/// analyzer's — and a language analyzer that tried to normalise them would be guessing at a framework
+/// it does not know.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Annotation {
+    /// The annotation's name, without the sigil and without its qualifier.
+    pub name: String,
+    /// Everything between the parentheses, exactly as written, or `None` when there were none.
+    ///
+    /// `None` and `Some("")` are different: `@Test` took no arguments and `@Test()` took none but was
+    /// called, and a framework may care which.
+    pub arguments: Option<String>,
+    /// Where it appears.
+    pub range: SourceRange,
 }
 
 impl Item {
@@ -132,6 +160,7 @@ impl Item {
             target: None,
             implements: None,
             references: Vec::new(),
+            annotations: Vec::new(),
             children: Vec::new(),
         }
     }

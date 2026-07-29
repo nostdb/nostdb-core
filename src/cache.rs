@@ -414,6 +414,14 @@ fn encode_item(item: &crate::analyze::Item) -> serde_json::Value {
             "is_method": reference.is_method,
             "range": encode_range(&reference.range),
         })).collect::<Vec<_>>(),
+        // Annotations round-trip, because a cached parse is read back as though the analyzer had just
+        // produced it. Omitted here, a framework analyzer would see them on a first build and not on
+        // the second — the same file yielding different facts depending on whether it was cached.
+        "annotations": item.annotations.iter().map(|annotation| serde_json::json!({
+            "name": annotation.name,
+            "arguments": annotation.arguments,
+            "range": encode_range(&annotation.range),
+        })).collect::<Vec<_>>(),
         "children": item.children.iter().map(encode_item).collect::<Vec<_>>(),
     })
 }
@@ -486,6 +494,29 @@ fn decode_item(entry: &serde_json::Value) -> Option<crate::analyze::Item> {
             .get("implements")
             .and_then(|v| v.as_str())
             .map(str::to_owned),
+        // Absent is empty rather than a decode failure, so an artifact written before annotations
+        // existed is still readable. `ARTIFACT_VERSION` is what refuses one that is genuinely
+        // incompatible, and treating a missing list as unreadable would discard every cached parse for
+        // a field that did not change what the older ones held.
+        annotations: entry
+            .get("annotations")
+            .and_then(|v| v.as_array())
+            .map(|found| {
+                found
+                    .iter()
+                    .filter_map(|annotation| {
+                        Some(crate::analyze::Annotation {
+                            name: annotation.get("name")?.as_str()?.to_owned(),
+                            arguments: annotation
+                                .get("arguments")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned),
+                            range: decode_range(annotation.get("range")?)?,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         references: entry
             .get("references")?
             .as_array()?

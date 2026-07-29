@@ -38,8 +38,19 @@ pub enum Token {
         /// Whether it was written in backticks, which makes it never a keyword.
         quoted: bool,
     },
-    /// A literal of any kind, reduced to the fact that one was here.
+    /// A number or a character literal, reduced to the fact that one was here.
     Literal,
+    /// A string literal, carrying its content.
+    ///
+    /// The content is kept because a framework's meaning is often *inside* a string: a route is
+    /// `@GetMapping("/api/x")`, and an annotation whose arguments read `<literal>` tells a framework
+    /// analyzer that a string was there and not which one. A number never carries that kind of meaning,
+    /// so [`Self::Literal`] stays a bare fact.
+    ///
+    /// A template is kept as written, `${...}` included. A route built by interpolation is not a route
+    /// this build can resolve, and substituting a guess would be worse than reporting what the source
+    /// says.
+    Text(String),
     /// An opening delimiter.
     Open(Delimiter),
     /// A closing delimiter.
@@ -204,10 +215,7 @@ impl Lexer {
                     self.bump();
                     Token::Close(Delimiter::Bracket)
                 }
-                '"' => {
-                    self.string();
-                    Token::Literal
-                }
+                '"' => Token::Text(self.string()),
                 '\'' => {
                     self.character_literal();
                     Token::Literal
@@ -286,41 +294,55 @@ impl Lexer {
         }
     }
 
-    /// A string, raw or not, including any template expressions inside it.
-    fn string(&mut self) {
+    /// A string, raw or not, including any template expressions inside it. Returns its content.
+    fn string(&mut self) -> String {
         if self.matches("\"\"\"") {
-            self.raw_string();
-            return;
+            return self.raw_string();
         }
+        let mut content = String::new();
         self.bump();
         while let Some(character) = self.peek() {
             match character {
                 '\\' => {
-                    self.take(2);
+                    // The escape is kept as written. Interpreting `\n` here would make the content
+                    // differ from the source, and a route is compared against what somebody typed.
+                    content.push(character);
+                    self.bump();
+                    if let Some(escaped) = self.peek() {
+                        content.push(escaped);
+                        self.bump();
+                    }
                 }
                 '"' => {
                     self.bump();
-                    return;
+                    return content;
                 }
                 '\n' => {
                     // A newline ends an unterminated single-quoted string. Kotlin does not allow one
                     // to span lines, so continuing would swallow the rest of the file.
-                    return;
+                    return content;
                 }
-                '$' if self.peek_at(1) == Some('{') => self.template(),
+                '$' if self.peek_at(1) == Some('{') => {
+                    let at = self.at;
+                    self.template();
+                    content.extend(self.characters[at..self.at].iter());
+                }
                 _ => {
+                    content.push(character);
                     self.bump();
                 }
             }
         }
+        content
     }
 
     /// A raw string, which ends at three quotes and holds a lone quote as content.
-    fn raw_string(&mut self) {
+    fn raw_string(&mut self) -> String {
+        let mut content = String::new();
         self.take(3);
         loop {
             if self.peek().is_none() {
-                return;
+                return content;
             }
             if self.matches("\"\"\"") {
                 self.take(3);
@@ -328,13 +350,19 @@ impl Lexer {
                 // extras belong to the content. Consuming the run keeps a following `"` from opening
                 // a new string.
                 while self.peek() == Some('"') {
+                    content.push('"');
                     self.bump();
                 }
-                return;
+                return content;
             }
             if self.peek() == Some('$') && self.peek_at(1) == Some('{') {
+                let at = self.at;
                 self.template();
+                content.extend(self.characters[at..self.at].iter());
                 continue;
+            }
+            if let Some(character) = self.peek() {
+                content.push(character);
             }
             self.bump();
         }
@@ -361,7 +389,9 @@ impl Lexer {
                     self.bump();
                     depth -= 1;
                 }
-                '"' => self.string(),
+                '"' => {
+                    let _ = self.string();
+                }
                 '\'' => self.character_literal(),
                 '/' if self.matches("/*") => self.block_comment(),
                 '/' if self.matches("//") => {
