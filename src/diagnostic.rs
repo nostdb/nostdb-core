@@ -381,29 +381,30 @@ mod tests {
         assert!(DiagnosticCode::from_str("nost_parse_error").is_err());
     }
 
+    /// Exactly these codes are warnings, and every other is an error.
+    ///
+    /// Exactly, with nothing tolerated in between. This test used to skip six codes from its
+    /// error assertion while only three of them were warnings, so `LinkUnavailable`, `LinkCycle`, and
+    /// `LinkLimitExceeded` could have defaulted to either and it would have passed — a list of
+    /// exemptions is a list of things nobody is checking.
+    ///
+    /// The `nostdb-spec` registry is the authority on what a code means, and the root workspace
+    /// verifier compares this function against it. This test is the same claim stated where the
+    /// function lives, so a change here fails locally rather than only across the workspace.
     #[test]
-    fn an_unresolved_endpoint_is_a_warning_and_the_rest_are_errors() {
-        assert_eq!(
-            DiagnosticCode::NostUnresolvedEndpoint.default_severity(),
-            Severity::Warning
-        );
-        assert_eq!(
-            DiagnosticCode::NostSchemaViolation.default_severity(),
-            Severity::Warning
-        );
+    fn exactly_the_declared_codes_are_warnings() {
+        const WARNINGS: [DiagnosticCode; 4] = [
+            DiagnosticCode::NostUnresolvedEndpoint,
+            DiagnosticCode::NostSchemaViolation,
+            DiagnosticCode::OrphanLinkSettings,
+            DiagnosticCode::CypherUnknownLabel,
+        ];
         for code in DiagnosticCode::ALL {
-            if matches!(
-                code,
-                DiagnosticCode::NostUnresolvedEndpoint
-                    | DiagnosticCode::NostSchemaViolation
-                    | DiagnosticCode::OrphanLinkSettings
-                    | DiagnosticCode::LinkUnavailable
-                    | DiagnosticCode::LinkCycle
-                    | DiagnosticCode::LinkLimitExceeded
-            ) {
-                continue;
-            }
-            assert_eq!(code.default_severity(), Severity::Error, "{code}");
+            let expected = match WARNINGS.contains(&code) {
+                true => Severity::Warning,
+                false => Severity::Error,
+            };
+            assert_eq!(code.default_severity(), expected, "{code}");
         }
     }
 
