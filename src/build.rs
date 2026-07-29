@@ -33,7 +33,7 @@
 //! this project declares them. They are counted in
 //! [`crate::coverage::BuildCoverage::unresolved_units`], which is the honest record.
 
-use crate::analysis::CapabilityRegistry;
+use crate::analysis::{CapabilityRegistry, PrecisionClass};
 use crate::analyze::{self, FileAnalysis, Item, ItemKind};
 use crate::change::{EdgeDraft, GraphChangeSet, GraphOperation, NodeDraft};
 use crate::contribution::{ContributionKey, Owner};
@@ -120,6 +120,12 @@ pub struct BuildDraft {
     pub coverage: BuildCoverage,
     /// Files that were read and analyzed.
     pub analyzed_files: u64,
+    /// How many files hold a record, whether or not an analyzer read them.
+    ///
+    /// Separate from `analyzed_files` because the two answer different questions. A project with
+    /// no analyzer for its language records every file and analyzes none, and reporting one number
+    /// for both would either claim coverage the build lacks or hide the graph it committed.
+    pub recorded_files: u64,
     /// References that matched a record in this build.
     pub resolved_references: u64,
     /// Files whose recorded facts were reused rather than re-read.
@@ -153,6 +159,68 @@ struct Planned {
     target: Option<String>,
 }
 
+/// One file's place in a build: its persisted identity, and whatever was learned about it.
+struct Unit {
+    /// The path relative to the scan root.
+    path: String,
+    /// The source unit its contributions belong to.
+    unit: SourceUnitId,
+    /// The file node an earlier build minted for it, when there is one.
+    existing: Option<LocalNodeId>,
+    /// The facts found in it, which for a recorded file is none.
+    analysis: FileAnalysis,
+    /// Whether an analyzer read the file, rather than the scan merely recording it.
+    ///
+    /// Stored rather than derived from the language's precision, because a file whose language
+    /// *is* covered still arrives here unanalyzed when its bytes could not be read. Deriving it
+    /// would count that file as analyzed and report coverage the build does not have.
+    analyzed: bool,
+}
+
+impl Unit {
+    /// A file an analyzer read.
+    fn analyzed(
+        path: String,
+        unit: SourceUnitId,
+        existing: Option<LocalNodeId>,
+        analysis: FileAnalysis,
+    ) -> Self {
+        Self {
+            path,
+            unit,
+            existing,
+            analysis,
+            analyzed: true,
+        }
+    }
+
+    /// A file the scan named and nothing analyzed.
+    ///
+    /// Its bytes are not read. The path, the language, and the digest are all the scan's, so the
+    /// record costs nothing beyond the node itself — which is the point: a language with no
+    /// analyzer is a gap in depth rather than a reason for a repository to be absent from its own
+    /// graph.
+    fn recorded(
+        file: &crate::scan::ScannedFile,
+        held: Option<(SourceUnitId, Option<LocalNodeId>)>,
+        minter: &mut Minter,
+    ) -> Self {
+        let (unit, existing) = held.unwrap_or_else(|| (minter.source_unit(), None));
+        Self {
+            path: file.path.clone(),
+            unit,
+            existing,
+            analysis: FileAnalysis {
+                language: file.language.clone(),
+                digest: file.digest.clone(),
+                items: Vec::new(),
+                imports: Vec::new(),
+            },
+            analyzed: false,
+        }
+    }
+}
+
 /// Builds a change set from a scan.
 ///
 /// Files whose language no analyzer reads are recorded as skipped rather than failed,
@@ -167,7 +235,7 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
     let locator = CanonicalSourceLocator::root();
     let mut coverage = BuildCoverage::empty();
     let mut planned: Vec<Planned> = Vec::new();
-    let mut units: Vec<(String, SourceUnitId, Option<LocalNodeId>, FileAnalysis)> = Vec::new();
+    let mut units: Vec<Unit> = Vec::new();
     let mut cached_parses = 0_u64;
 
     // Reuse is decided before anything is read, and it is all or nothing.
@@ -184,7 +252,7 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
     // matters most and is provably safe — a tree where nothing changed is not read at all.
     // The parse cache below recovers most of the rest, without touching resolution.
     if !request.rebuild
-        && let Some(unchanged) = every_file_unchanged(scan, graph, registry)
+        && let Some(unchanged) = every_file_unchanged(scan, graph)
     {
         // Complete, not skipped. Everything is covered — it was covered by an earlier
         // build and nothing has changed since. Reporting `skipped` would say the opposite
@@ -199,6 +267,7 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
             ),
             coverage,
             analyzed_files: 0,
+            recorded_files: 0,
             resolved_references: 0,
             reused_files: unchanged,
             cached_parses: 0,
@@ -206,16 +275,24 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
     }
 
     // Pass one: read and analyze, and settle each file's persisted identity.
+    //
+    // A file the scan kept always leaves a record. Section 17.3 requires it — an unsupported
+    // language "at minimum produces a source/module record with an explicit capability
+    // diagnostic" — and coverage below says what could not be done with it. What an analyzer
+    // adds is facts *inside* that record, so its absence costs depth and not existence.
     for file in &scan.files {
+        let held = existing_unit(graph, &file.path);
         if !registry.precision(&file.language).is_deterministic() {
+            // The capability diagnostic. Recording the file is not claiming to have read it,
+            // so this entry stays and `structural` stays short of `Complete`.
             coverage.skipped_sources.push(SkippedSource {
                 source: locator.clone(),
                 path: NonEmptyText::new(&file.path).ok(),
                 reason: SkipReason::Unsupported,
             });
+            units.push(Unit::recorded(file, held, minter));
             continue;
         }
-        let held = existing_unit(graph, &file.path);
         // The parse cache is orthogonal to reuse, and deliberately so. A cached parse
         // still enters `units`, so the name index this build resolves against is complete;
         // what is saved is the reading and the parsing, not the resolving. That is the
@@ -224,7 +301,7 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
         if let Some(analysis) = request.cache.get(&parse_key) {
             cached_parses += 1;
             let (unit, existing) = held.unwrap_or_else(|| (minter.source_unit(), None));
-            units.push((file.path.clone(), unit, existing, analysis));
+            units.push(Unit::analyzed(file.path.clone(), unit, existing, analysis));
             continue;
         }
         let Ok(source) = std::fs::read_to_string(root.join(&file.path)) else {
@@ -233,6 +310,7 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
                 path: NonEmptyText::new(&file.path).ok(),
                 reason: SkipReason::PermissionDenied,
             });
+            units.push(Unit::recorded(file, held, minter));
             continue;
         };
         let Some(analysis) = analyze::analyze(&file.language, &source) else {
@@ -243,6 +321,7 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
                 path: NonEmptyText::new(&file.path).ok(),
                 reason: SkipReason::Unsupported,
             });
+            units.push(Unit::recorded(file, held, minter));
             continue;
         };
         let (unit, existing) = held.unwrap_or_else(|| {
@@ -254,12 +333,12 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
         // analyzer, not on whether the transaction that follows succeeds, so an abandoned
         // build still leaves work its successor can use.
         let _ = request.cache.put(&parse_key, &analysis);
-        units.push((file.path.clone(), unit, existing, analysis));
+        units.push(Unit::analyzed(file.path.clone(), unit, existing, analysis));
     }
 
     // A file the source no longer holds must take its records with it. Nothing else would
     // ever remove them: they belong to a unit no scan will name again.
-    let present: BTreeSet<SourceUnitId> = units.iter().map(|(_, unit, _, _)| *unit).collect();
+    let present: BTreeSet<SourceUnitId> = units.iter().map(|held| held.unit).collect();
     let departed: Vec<SourceUnitId> = analyzed_units(graph)
         .into_iter()
         .filter(|unit| !present.contains(unit))
@@ -282,7 +361,7 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
     // claim and restates nothing, which is what removes it.
     for unit in units
         .iter()
-        .map(|(_, unit, _, _)| *unit)
+        .map(|held| held.unit)
         .chain(departed.iter().copied())
     {
         change_set.push(GraphOperation::RemoveContribution(ContributionKey {
@@ -293,34 +372,39 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
 
     // Pass two: settle every identifier before any edge needs one.
     let mut file_nodes: Vec<(usize, LocalNodeId)> = Vec::new();
-    for (index, (path, unit, existing, analysis)) in units.iter().enumerate() {
-        let known = existing_names(graph, *unit);
+    for (index, held) in units.iter().enumerate() {
+        let known = existing_names(graph, held.unit);
         let context = FileContext {
-            unit: *unit,
-            path,
+            unit: held.unit,
+            path: &held.path,
             known: &known,
         };
         let mut seen: BTreeMap<String, i64> = BTreeMap::new();
-        let file_id = existing.unwrap_or_else(|| minter.node());
+        let file_id = held.existing.unwrap_or_else(|| minter.node());
         file_nodes.push((index, file_id));
-        for item in &analysis.items {
+        for item in &held.analysis.items {
             plan_item(item, "", &context, &mut seen, minter, &mut planned);
         }
     }
 
     // Pass three: the drafts themselves, now that every identifier is known.
-    for (index, (path, unit, _, analysis)) in units.iter().enumerate() {
+    for (index, held) in units.iter().enumerate() {
         let file_id = file_nodes[index].1;
         change_set.push(GraphOperation::UpsertNode(NodeDraft {
             id: Some(file_id),
             labels: vec![label(FILE_LABEL)],
             properties: vec![
-                text_property("path", path),
-                text_property("language", &analysis.language),
-                text_property("digest", analysis.digest.as_str()),
+                text_property("path", &held.path),
+                text_property("language", &held.analysis.language),
+                text_property("digest", held.analysis.digest.as_str()),
+                // What a reader may conclude from this record, per section 17.3's requirement
+                // that results not imply equal confidence for every language. `unsupported`
+                // says the file is here and nothing read it, which is a different claim from
+                // an analyzer having found no items in it.
+                text_property("precision", &precision_of(registry, held).to_string()),
             ],
-            source_unit: *unit,
-            evidence: vec![file_evidence(&locator, path, analysis)],
+            source_unit: held.unit,
+            evidence: vec![file_evidence(&locator, held)],
         }));
     }
 
@@ -352,8 +436,8 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
     for record in &planned {
         let analysis = units
             .iter()
-            .find(|(path, _, _, _)| *path == record.path)
-            .map(|(_, _, _, analysis)| analysis);
+            .find(|held| held.path == record.path)
+            .map(|held| &held.analysis);
         let evidence = match analysis {
             Some(analysis) => vec![item_evidence(&locator, record, analysis)],
             None => Vec::new(),
@@ -379,13 +463,13 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
 
     // Containment: from the file to each top-level record, and from each record to its
     // children. Emitted after every node, so no edge can name an endpoint not yet drafted.
-    for (index, (path, unit, _, _)) in units.iter().enumerate() {
+    for (index, held) in units.iter().enumerate() {
         let file_id = file_nodes[index].1;
         for record in planned
             .iter()
-            .filter(|record| &record.path == path && !record.qualified.contains("::"))
+            .filter(|record| record.path == held.path && !record.qualified.contains("::"))
         {
-            edges.add(file_id, record.id, CONTAINS, *unit);
+            edges.add(file_id, record.id, CONTAINS, held.unit);
         }
     }
     for record in &planned {
@@ -444,7 +528,11 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
     BuildDraft {
         change_set,
         coverage,
-        analyzed_files: units.len() as u64,
+        // Recorded is not analyzed. A build that recorded 41 Kotlin files and read none of
+        // them reports zero here, because this is what `plan` predicts as `structural_files`
+        // and the two are checked against each other.
+        analyzed_files: units.iter().filter(|held| held.analyzed).count() as u64,
+        recorded_files: units.len() as u64,
         resolved_references: resolved,
         reused_files: 0,
         cached_parses,
@@ -456,13 +544,13 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
 /// Returns `None` the moment anything differs — a changed file, a new file, a file the
 /// database holds that the scan no longer names — because reuse is all or nothing and
 /// there is nothing to gain from counting further.
-fn every_file_unchanged(scan: &Scan, graph: &Graph, registry: &CapabilityRegistry) -> Option<u64> {
+fn every_file_unchanged(scan: &Scan, graph: &Graph) -> Option<u64> {
     let mut present: BTreeSet<SourceUnitId> = BTreeSet::new();
     let mut count = 0_u64;
+    // Every file the scan kept, not only the analyzable ones. A recorded file holds a digest,
+    // so skipping it here would let an edit to a Kotlin file leave its record stale while the
+    // build reported that nothing had changed.
     for file in &scan.files {
-        if !registry.precision(&file.language).is_deterministic() {
-            continue;
-        }
         let (unit, Some(node)) = existing_unit(graph, &file.path)? else {
             return None;
         };
@@ -754,7 +842,50 @@ fn push_edge(
     }));
 }
 
-fn file_evidence(
+/// What may be concluded from a file's record.
+///
+/// A recorded file reports `Unsupported` whatever its language, because the question this answers
+/// is what was learned about *this file* and not what the build can do in general. A covered
+/// language whose bytes could not be read would otherwise advertise semantic precision over a
+/// record holding nothing.
+fn precision_of(registry: &CapabilityRegistry, held: &Unit) -> PrecisionClass {
+    match held.analyzed {
+        true => registry.precision(&held.analysis.language),
+        false => PrecisionClass::Unsupported,
+    }
+}
+
+/// The producer recorded for a file the scan named and nothing analyzed.
+const SCAN_PRODUCER: &str = "scan";
+
+/// Its version, which moves when what a scan records about a file changes.
+const SCAN_VERSION: &str = "1";
+
+/// Evidence for a file's own record.
+///
+/// `Deterministic` and `Extracted` hold for a recorded file as much as for an analyzed one, and
+/// that is not a loophole: the path and the digest were read off the filesystem rather than
+/// inferred, so the claim being made — this file exists and these are its bytes — is exact. What
+/// changes is the producer, because a scan found it and no analyzer did, and the `precision`
+/// property on the record says nothing was read out of it.
+fn file_evidence(locator: &CanonicalSourceLocator, held: &Unit) -> Evidence {
+    match held.analyzed {
+        true => analyzed_evidence(locator, &held.path, &held.analysis),
+        false => Evidence {
+            producer: NonEmptyText::new(SCAN_PRODUCER)
+                .unwrap_or_else(|_| NonEmptyText::literal("scan")),
+            producer_version: NonEmptyText::new(SCAN_VERSION)
+                .unwrap_or_else(|_| NonEmptyText::literal("1")),
+            ..analyzed_evidence(locator, &held.path, &held.analysis)
+        },
+    }
+}
+
+/// Evidence naming the analyzer that read a file.
+///
+/// Every record an analyzer produced carries this, including the items inside a file, because an
+/// item cannot exist without an analyzer having found it.
+fn analyzed_evidence(
     locator: &CanonicalSourceLocator,
     path: &str,
     analysis: &FileAnalysis,
@@ -793,7 +924,7 @@ fn item_evidence(
             },
         )
         .ok(),
-        ..file_evidence(locator, &record.path, analysis)
+        ..analyzed_evidence(locator, &record.path, analysis)
     }
 }
 
@@ -1257,25 +1388,126 @@ mod tests {
     }
 
     #[test]
-    fn a_file_no_analyzer_reads_is_skipped_rather_than_failed() {
+    fn a_file_no_analyzer_reads_is_recorded_rather_than_dropped() {
+        // Section 17.3: an unsupported language "at minimum produces a source/module record with
+        // an explicit capability diagnostic". It used to produce the diagnostic and no record.
+        //
+        // This test is the reason that survived a whole Stage. It asserted the three lines below
+        // and nothing about the graph, so it passed both before and after — a precise pin on the
+        // half of the behaviour that was already right.
         let dir = TempDir::new("unsupported");
         let mut file = dir.write("app.py", "def main(): pass\n");
         file.language = "python".to_owned();
         let mut graph = Graph::default();
-        let scan = Scan {
-            files: vec![file],
-            skipped: Vec::new(),
-        };
-        let mut minter = Minter::new();
-        let draft = super::draft(&request(&dir, &scan, &graph, 1, false), &mut minter);
-        assert_eq!(draft.analyzed_files, 0);
+        let draft = build_with(&dir, vec![file], &mut graph, 1, false);
+
+        assert_eq!(draft.analyzed_files, 0, "nothing read it");
         assert_eq!(draft.coverage.skipped_sources.len(), 1);
         assert_eq!(
             draft.coverage.skipped_sources[0].reason,
             SkipReason::Unsupported
         );
+        // Recording a file is not claiming to have analyzed it.
         assert_eq!(draft.coverage.structural, CoverageState::Partial);
-        let _ = &mut graph;
+
+        assert_eq!(draft.recorded_files, 1);
+        let recorded: Vec<&crate::graph::Node> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.labels.iter().any(|held| held.as_str() == FILE_LABEL))
+            .collect();
+        assert_eq!(recorded.len(), 1, "the file is in its own graph");
+        assert_eq!(property(recorded[0], "path"), Some("app.py"));
+        assert_eq!(
+            property(recorded[0], "language"),
+            Some("python"),
+            "the language is named even though nothing analyzes it"
+        );
+        assert_eq!(
+            property(recorded[0], "precision"),
+            Some("unsupported"),
+            "and the record says outright that nothing was read out of it"
+        );
+    }
+
+    #[test]
+    fn a_project_holding_only_documents_builds_a_graph() {
+        // The direction this Stage answers: analysis must not depend on the language, and a
+        // repository of documents with no code at all has to be analyzable. Whatever else is
+        // true of such a project, its own files are facts about it.
+        let dir = TempDir::new("documents-only");
+        let files = ["README.md", "docs/design.md", "docs/api.md"]
+            .into_iter()
+            .map(|path| {
+                let mut file = dir.write(path, "# Title\n\nProse.\n");
+                file.language = "markdown".to_owned();
+                file
+            })
+            .collect();
+        let mut graph = Graph::default();
+        let draft = build_with(&dir, files, &mut graph, 1, false);
+
+        assert_eq!(draft.analyzed_files, 0);
+        assert_eq!(draft.recorded_files, 3);
+        assert!(
+            !draft.change_set.operations.is_empty(),
+            "an empty change set is refused, and would commit no generation at all"
+        );
+        let paths = {
+            let mut found: Vec<&str> = graph
+                .nodes
+                .iter()
+                .filter_map(|node| property(node, "path"))
+                .collect();
+            found.sort_unstable();
+            found
+        };
+        assert_eq!(paths, ["README.md", "docs/api.md", "docs/design.md"]);
+    }
+
+    #[test]
+    fn editing_a_recorded_file_is_noticed_even_though_nothing_analyzes_it() {
+        // Reuse compares digests. It used to consider only the analyzable files, so an edit to a
+        // file nothing analyzes left its record holding a digest the file no longer had while the
+        // build reported that every file was unchanged.
+        let dir = TempDir::new("recorded-edit");
+        let mut file = dir.write("notes.md", "# One\n");
+        file.language = "markdown".to_owned();
+        let mut graph = Graph::default();
+        build_with(&dir, vec![file], &mut graph, 1, false);
+
+        let mut edited = dir.write("notes.md", "# One\n\n# Two\n");
+        edited.language = "markdown".to_owned();
+        let digest = edited.digest.as_str().to_owned();
+        let draft = build_with(&dir, vec![edited], &mut graph, 2, false);
+
+        assert_eq!(
+            draft.reused_files, 0,
+            "the file changed, so nothing is reused"
+        );
+        assert_eq!(draft.recorded_files, 1);
+        let stored = graph
+            .nodes
+            .iter()
+            .find_map(|node| property(node, "digest"))
+            .expect("the record is still there");
+        assert_eq!(stored, digest, "and its record holds the new bytes");
+    }
+
+    #[test]
+    fn a_recorded_file_is_reused_when_it_has_not_changed() {
+        let dir = TempDir::new("recorded-reuse");
+        let mut file = dir.write("notes.md", "# One\n");
+        file.language = "markdown".to_owned();
+        let mut graph = Graph::default();
+        build_with(&dir, vec![file.clone()], &mut graph, 1, false);
+
+        let draft = build_with(&dir, vec![file], &mut graph, 2, false);
+        assert_eq!(draft.reused_files, 1);
+        assert!(
+            draft.change_set.operations.is_empty(),
+            "an unchanged tree is not read at all"
+        );
     }
 
     #[test]

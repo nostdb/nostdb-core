@@ -804,6 +804,7 @@ impl Project {
                 summary: crate::apply::ApplySummary::default(),
                 coverage: draft.coverage,
                 analyzed_files: draft.analyzed_files,
+                recorded_files: draft.recorded_files,
                 reused_files: draft.reused_files,
                 cached_parses: draft.cached_parses,
                 resolved_references: draft.resolved_references,
@@ -824,6 +825,7 @@ impl Project {
             summary,
             coverage: draft.coverage,
             analyzed_files: draft.analyzed_files,
+            recorded_files: draft.recorded_files,
             reused_files: draft.reused_files,
             cached_parses: draft.cached_parses,
             resolved_references: draft.resolved_references,
@@ -1314,6 +1316,8 @@ pub struct BuildReport {
     pub coverage: crate::coverage::BuildCoverage,
     /// How many files were read and analyzed.
     pub analyzed_files: u64,
+    /// How many files hold a record, whether or not an analyzer read them.
+    pub recorded_files: u64,
     /// How many files were reused rather than re-read.
     pub reused_files: u64,
     /// How many parses came from the cache rather than from the source.
@@ -2057,6 +2061,58 @@ mod tests {
             "an intent that was never committed is not carried out"
         );
         assert!(!staged.exists(), "its staging file is discarded");
+    }
+
+    #[test]
+    fn a_project_with_no_analyzable_source_still_commits_a_graph_of_itself() {
+        // Reported: a 41-file Kotlin repository built to `0 nodes, 0 edges`. Section 17.3 requires
+        // a source record for an unsupported language, so the empty generation was a defect and
+        // not the language's fault. An analyzer adds facts inside a record; it does not decide
+        // whether the repository appears in its own graph.
+        let dir = TempDir::new("kotlin-only");
+        let project = Project::initialize(dir.path()).unwrap();
+        fs::create_dir_all(dir.path().join("src/main/kotlin")).unwrap();
+        fs::write(
+            dir.path().join("src/main/kotlin/Server.kt"),
+            "package demo\n\nclass Server(val port: Int) {\n    fun start() {}\n}\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("build.gradle.kts"), "plugins { }\n").unwrap();
+
+        let registry = crate::analyze::builtin_registry().unwrap();
+        let before = project.open_database().unwrap().generation();
+        let report = project
+            .build(&registry, &crate::scan::ScanOptions::default(), false)
+            .unwrap();
+
+        assert!(report.generation > before, "a generation is committed");
+        assert_eq!(report.analyzed_files, 0, "no analyzer covers Kotlin");
+        assert_eq!(report.recorded_files, 2, "and both files are in the graph");
+        assert_eq!(report.summary.nodes_created, 2);
+        // Coverage still says what has no analyzer, per section 17.2. A record is not coverage.
+        assert_eq!(
+            report.coverage.structural,
+            crate::coverage::CoverageState::Partial
+        );
+        assert_eq!(report.coverage.skipped_sources.len(), 2);
+
+        // And the graph is queryable as itself, which is what makes the record worth having.
+        let database = project.open_database().unwrap();
+        let graph = crate::encoding::read_graph(&database).unwrap();
+        let mut paths: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                node.properties.iter().find_map(|(key, value)| match value {
+                    crate::property::PropertyValue::String(text) if key.as_str() == "path" => {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["build.gradle.kts", "src/main/kotlin/Server.kt"]);
     }
 
     #[test]
