@@ -128,11 +128,27 @@ mod tests {
     ///
     /// A real child process rather than a fake, because what is being tested is the framing
     /// across a pipe — which a fake transport cannot get wrong in the same way.
+    /// A counter, so two scripts never share a path.
+    ///
+    /// The label alone was the path, in a directory every test and every concurrent run shares. Tests
+    /// in one binary run in parallel, so one could write a script while another was executing it —
+    /// which the operating system reports as `ETXTBSY`, "text file busy", and which passed locally
+    /// for as long as the timing happened not to overlap. Each test also deleted the shared path when
+    /// it finished, so a slower one could lose its program mid-run.
+    ///
+    /// The process id and this counter make the path unique per script rather than per test name.
+    #[cfg(unix)]
+    static SCRIPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
     #[cfg(unix)]
     fn scripted(label: &str, body: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
+        let unique = SCRIPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut path = std::env::temp_dir();
-        path.push(format!("nostdb-provider-{label}.sh"));
+        path.push(format!(
+            "nostdb-provider-{label}-{}-{unique}.sh",
+            std::process::id()
+        ));
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write");
         let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
         permissions.set_mode(0o755);
