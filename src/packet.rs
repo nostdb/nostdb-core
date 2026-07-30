@@ -29,7 +29,6 @@
 //! those are summarized so a model can *see* them, precisely so it is not asked to
 //! rediscover them and cannot present a rediscovery as a new fact.
 
-use crate::contribution::Owner;
 use crate::encoding::Graph;
 use crate::evidence::SourceRange;
 use crate::graph::{Node, NodeReference};
@@ -308,7 +307,7 @@ fn truncated(excerpt: &SourceExcerpt) -> SourceExcerpt {
 fn holds(node: &Node, source_unit: SourceUnitId) -> bool {
     node.contributions.iter().any(|contribution| {
         contribution.source_unit == source_unit
-            && matches!(contribution.owner, Owner::Analyzer { .. })
+            && contribution.owner.kind() == crate::contribution::OwnerKind::Analyzer
     })
 }
 
@@ -316,7 +315,7 @@ fn holds(node: &Node, source_unit: SourceUnitId) -> bool {
 fn unit_of(node: &Node) -> Option<SourceUnitId> {
     node.contributions
         .iter()
-        .find(|contribution| matches!(contribution.owner, Owner::Analyzer { .. }))
+        .find(|contribution| contribution.owner.kind() == crate::contribution::OwnerKind::Analyzer)
         .map(|contribution| contribution.source_unit)
 }
 

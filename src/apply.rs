@@ -434,10 +434,7 @@ mod tests {
     use crate::text::NonEmptyText;
 
     fn analyzer() -> Owner {
-        Owner::Analyzer {
-            name: NonEmptyText::new("rust").unwrap(),
-            version: NonEmptyText::new("1").unwrap(),
-        }
+        Owner::new(NonEmptyText::new("rust").unwrap())
     }
 
     fn unit(byte: u8) -> SourceUnitId {
@@ -591,7 +588,7 @@ mod tests {
         run(
             &mut graph,
             &set(
-                Owner::User,
+                Owner::user(),
                 vec![GraphOperation::UpsertNode(NodeDraft {
                     id: Some(id),
                     labels: vec![Label::new("Reviewed").unwrap()],
@@ -619,7 +616,7 @@ mod tests {
         assert_eq!(summary.nodes_deleted, 0);
         assert_eq!(graph.nodes.len(), 1);
         assert_eq!(graph.nodes[0].contributions.len(), 1);
-        assert_eq!(graph.nodes[0].contributions[0].owner, Owner::User);
+        assert_eq!(graph.nodes[0].contributions[0].owner, Owner::user());
         assert!(
             graph.nodes[0]
                 .labels
@@ -841,7 +838,7 @@ mod tests {
         run(
             &mut graph,
             &set(
-                Owner::User,
+                Owner::user(),
                 vec![GraphOperation::UpsertNode(NodeDraft {
                     id: Some(id),
                     // At least one label is required of every draft, so a second producer
@@ -882,7 +879,7 @@ mod tests {
         let summary = run(
             &mut graph,
             &set(
-                Owner::User,
+                Owner::user(),
                 vec![GraphOperation::UpsertLink(LinkDraft {
                     source: locator.clone(),
                     alias: None,
@@ -895,7 +892,7 @@ mod tests {
         run(
             &mut graph,
             &set(
-                Owner::User,
+                Owner::user(),
                 vec![GraphOperation::UpsertLink(LinkDraft {
                     source: locator.clone(),
                     alias: Some(crate::name::LinkAlias::new("child").unwrap()),
@@ -907,7 +904,7 @@ mod tests {
 
         let summary = run(
             &mut graph,
-            &set(Owner::User, vec![GraphOperation::RemoveLink(locator)]),
+            &set(Owner::user(), vec![GraphOperation::RemoveLink(locator)]),
         );
         assert_eq!(summary.links_removed, 1);
         assert!(graph.links.is_empty());

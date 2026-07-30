@@ -339,30 +339,11 @@ impl Parser {
 
     fn parse_owner(&mut self) -> Result<OwnerDeclaration, ParseError> {
         self.skip_trivia();
-        if self.kind() != TokenKind::Identifier {
-            return Err(self.error("expected `analyzer`, `ai`, or `user` after `@by`"));
-        }
-        let token = self.current().clone();
-        match token.text.as_str() {
-            "analyzer" => {
-                self.index += 1;
-                let name = self.expect_string("a quoted analyzer name")?;
-                let version = self.expect_string("a quoted analyzer version")?;
-                Ok(OwnerDeclaration::Analyzer { name, version })
-            }
-            "ai" => {
-                self.index += 1;
-                let contract_digest = self.expect_string("a quoted analysis contract digest")?;
-                Ok(OwnerDeclaration::Ai { contract_digest })
-            }
-            "user" => {
-                self.index += 1;
-                Ok(OwnerDeclaration::User { range: token.range })
-            }
-            other => Err(self.error(format!(
-                "expected `analyzer`, `ai`, or `user` after `@by`, found `{other}`"
-            ))),
-        }
+        // One string, and the kind follows from it. Version 2 wrote `analyzer "<name>" "<version>"`, `ai
+        // "<digest>"`, or `user`; a document declaring that version is refused at the header, so nothing
+        // reaches here expecting a keyword.
+        let name = self.expect_string("a quoted owner name after `@by`")?;
+        Ok(OwnerDeclaration { name })
     }
 
     fn parse_evidence(&mut self, leading: Vec<Comment>) -> Result<EvidenceBlock, ParseError> {
@@ -700,8 +681,8 @@ mod tests {
 
     #[test]
     fn parses_the_smallest_file() {
-        let file = parse("@nost 2\n").unwrap();
-        assert_eq!(file.version.value, 2);
+        let file = parse("@nost 3\n").unwrap();
+        assert_eq!(file.version.value, 3);
         assert!(file.links.is_empty());
         assert!(file.schemas.is_empty());
         assert!(file.nodes.is_empty());
@@ -710,7 +691,7 @@ mod tests {
 
     #[test]
     fn parses_links_with_and_without_an_alias() {
-        let file = parse("@nost 2\n@link \"./a\"\n@link \"./b\" as b\n").unwrap();
+        let file = parse("@nost 3\n@link \"./a\"\n@link \"./b\" as b\n").unwrap();
         assert_eq!(file.links.len(), 2);
         assert_eq!(file.links[0].source.value, "./a");
         assert!(file.links[0].alias.is_none());
@@ -723,7 +704,7 @@ mod tests {
     #[test]
     fn parses_a_schema_with_required_optional_and_array_fields() {
         let file = parse(
-            "@nost 2\nschema S {\n  a: string,\n  b?: integer,\n  c: double[],\n  d?: bytes,\n}\n",
+            "@nost 3\nschema S {\n  a: string,\n  b?: integer,\n  c: double[],\n  d?: bytes,\n}\n",
         )
         .unwrap();
         let schema = &file.schemas[0];
@@ -739,7 +720,7 @@ mod tests {
 
     #[test]
     fn parses_an_edge_schema_endpoint_constraint() {
-        let file = parse("@nost 2\nschema R (A -> B) {\n  since?: datetime,\n}\n").unwrap();
+        let file = parse("@nost 3\nschema R (A -> B) {\n  since?: datetime,\n}\n").unwrap();
         let constraint = file.schemas[0].endpoints.as_ref().unwrap();
         assert_eq!(constraint.source.value, "A");
         assert_eq!(constraint.target.value, "B");
@@ -747,7 +728,7 @@ mod tests {
 
     #[test]
     fn a_node_may_name_several_schemas() {
-        let file = parse("@nost 2\nnode n: A, B, C {}\n").unwrap();
+        let file = parse("@nost 3\nnode n: A, B, C {}\n").unwrap();
         let names: Vec<&str> = file.nodes[0]
             .schemas
             .iter()
@@ -758,7 +739,7 @@ mod tests {
 
     #[test]
     fn parses_all_three_endpoint_forms() {
-        let source = "@nost 2\n@link \"./c\"\n@link \"./s\" as s\n\
+        let source = "@nost 3\n@link \"./c\"\n@link \"./s\" as s\n\
             node a: L {}\nnode b: L {}\n\
             edge a -> b :CALLS {}\n\
             edge a -> s::x :CALLS {}\n\
@@ -773,32 +754,32 @@ mod tests {
 
     #[test]
     fn a_trailing_comma_is_accepted_and_optional() {
-        assert!(parse("@nost 2\nnode n: L {\n  a: 1,\n  b: 2,\n}\n").is_ok());
-        assert!(parse("@nost 2\nnode n: L {\n  a: 1,\n  b: 2\n}\n").is_ok());
-        assert!(parse("@nost 2\nschema S {\n  a: string,\n}\n").is_ok());
-        assert!(parse("@nost 2\nschema S {\n  a: string\n}\n").is_ok());
+        assert!(parse("@nost 3\nnode n: L {\n  a: 1,\n  b: 2,\n}\n").is_ok());
+        assert!(parse("@nost 3\nnode n: L {\n  a: 1,\n  b: 2\n}\n").is_ok());
+        assert!(parse("@nost 3\nschema S {\n  a: string,\n}\n").is_ok());
+        assert!(parse("@nost 3\nschema S {\n  a: string\n}\n").is_ok());
     }
 
     #[test]
     fn a_property_must_be_separated_by_a_comma() {
         // Without the comma the second key is not read as a property, so the block does
         // not close where the author expected.
-        let error = parse("@nost 2\nnode n: L {\n  a: 1\n  b: 2\n}\n").unwrap_err();
+        let error = parse("@nost 3\nnode n: L {\n  a: 1\n  b: 2\n}\n").unwrap_err();
         assert!(error.message.contains("close a record block"), "{error}");
     }
 
     #[test]
     fn parses_contributions_and_evidence() {
-        let source = "@nost 2\nnode n: L {\n  k: \"v\",\n\n\
-            \x20 @by analyzer \"rust\" \"0.1.0\" unit \"u_1\" {\n\
+        let source = "@nost 3\nnode n: L {\n  k: \"v\",\n\n\
+            \x20 @by \"rust\" unit \"u_1\" {\n\
             \x20   @evidence {\n      source: \"./\",\n      method: deterministic,\n\
-            \x20     confidence: inferred(0.5),\n    }\n  }\n\n  @by user {}\n}\n";
+            \x20     confidence: inferred(0.5),\n    }\n  }\n\n  @by \"user\" {}\n}\n";
         let file = parse(source).unwrap();
         let record = &file.nodes[0].record;
         assert_eq!(record.contributions.len(), 2);
 
         let first = &record.contributions[0];
-        assert!(matches!(first.owner, OwnerDeclaration::Analyzer { .. }));
+        assert_eq!(first.owner.kind(), crate::contribution::OwnerKind::Analyzer);
         assert_eq!(first.unit.as_ref().map(|u| u.value.as_str()), Some("u_1"));
         assert_eq!(first.evidence.len(), 1);
         let fields = &first.evidence[0].fields;
@@ -818,27 +799,24 @@ mod tests {
             }
         );
 
-        assert!(matches!(
-            record.contributions[1].owner,
-            OwnerDeclaration::User { .. }
-        ));
+        assert_eq!(
+            record.contributions[1].owner.kind(),
+            crate::contribution::OwnerKind::User
+        );
         assert!(record.contributions[1].evidence.is_empty());
     }
 
     #[test]
     fn an_ai_owner_carries_its_contract_digest() {
-        let file = parse("@nost 2\nnode n: L {\n  @by ai \"sha256:abc\" {}\n}\n").unwrap();
-        match &file.nodes[0].record.contributions[0].owner {
-            OwnerDeclaration::Ai { contract_digest } => {
-                assert_eq!(contract_digest.value, "sha256:abc");
-            }
-            other => panic!("expected an AI owner, found {other:?}"),
-        }
+        let file = parse("@nost 3\nnode n: L {\n  @by \"ai:sha256:abc\" {}\n}\n").unwrap();
+        let owner = &file.nodes[0].record.contributions[0].owner;
+        assert_eq!(owner.kind(), crate::contribution::OwnerKind::AiAnalysis);
+        assert_eq!(owner.name.value, "ai:sha256:abc");
     }
 
     #[test]
     fn declaration_order_is_preserved() {
-        let file = parse("@nost 2\nnode a: L {}\nschema L {}\nedge a -> a :R {}\n").unwrap();
+        let file = parse("@nost 3\nnode a: L {}\nschema L {}\nedge a -> a :R {}\n").unwrap();
         assert_eq!(
             file.order,
             [
@@ -851,7 +829,7 @@ mod tests {
 
     #[test]
     fn attaches_leading_and_trailing_comments() {
-        let source = "// file\n@nost 2 // version\n\
+        let source = "// file\n@nost 3 // version\n\
             // about the node\nnode n: L {\n\
             \x20 // about the key\n  k: \"v\", // after the key\n}\n";
         let file = parse(source).unwrap();
@@ -876,7 +854,7 @@ mod tests {
 
     #[test]
     fn a_comment_with_nothing_after_it_attaches_to_the_block() {
-        let file = parse("@nost 2\nnode n: L {\n  // nothing follows\n}\n").unwrap();
+        let file = parse("@nost 3\nnode n: L {\n  // nothing follows\n}\n").unwrap();
         assert_eq!(file.nodes[0].record.block_comments.len(), 1);
         assert_eq!(
             file.nodes[0].record.block_comments[0].text,
@@ -886,26 +864,26 @@ mod tests {
 
     #[test]
     fn a_link_after_a_declaration_is_rejected_with_a_useful_message() {
-        let error = parse("@nost 2\nschema S {}\n@link \"./a\"\n").unwrap_err();
+        let error = parse("@nost 3\nschema S {}\n@link \"./a\"\n").unwrap_err();
         assert!(error.message.contains("before every schema"), "{error}");
         assert_eq!(error.range.start().line, 3);
     }
 
     #[test]
     fn a_reserved_word_where_a_name_belongs_is_named_in_the_message() {
-        let error = parse("@nost 2\nschema schema {}\n").unwrap_err();
+        let error = parse("@nost 3\nschema schema {}\n").unwrap_err();
         assert!(error.message.contains("reserved word"), "{error}");
     }
 
     #[test]
     fn the_version_1_module_declaration_no_longer_parses() {
-        let error = parse("@nost 2\nmodule auth id \"m_1\" {\n}\n").unwrap_err();
+        let error = parse("@nost 3\nmodule auth id \"m_1\" {\n}\n").unwrap_err();
         assert!(error.message.contains("expected `schema`"), "{error}");
     }
 
     #[test]
     fn the_version_1_edge_form_no_longer_parses() {
-        let error = parse("@nost 2\nedge e id \"e_1\" :CALLS (a -> b) {}\n").unwrap_err();
+        let error = parse("@nost 3\nedge e id \"e_1\" :CALLS (a -> b) {}\n").unwrap_err();
         assert!(error.message.contains("`->`"), "{error}");
     }
 
@@ -913,29 +891,29 @@ mod tests {
     fn rejects_the_syntax_the_contract_forbids() {
         for (source, note) in [
             ("@link \"./a\"\n", "a missing version header"),
-            ("\u{FEFF}@nost 2\n", "a byte-order mark"),
-            ("@nost 2\nnode n {\n}\n", "a node without a schema"),
+            ("\u{FEFF}@nost 3\n", "a byte-order mark"),
+            ("@nost 3\nnode n {\n}\n", "a node without a schema"),
             (
-                "@nost 2\nnode n: A, {\n}\n",
+                "@nost 3\nnode n: A, {\n}\n",
                 "a trailing comma in a schema list",
             ),
-            ("@nost 2\nnode n: L {\n k: null\n}\n", "a null value"),
+            ("@nost 3\nnode n: L {\n k: null\n}\n", "a null value"),
             (
-                "@nost 2\nnode n: L {\n k: [1, 2,]\n}\n",
+                "@nost 3\nnode n: L {\n k: [1, 2,]\n}\n",
                 "a trailing comma in a list",
             ),
-            ("@nost 2\nnode n: L {\n k: [1, [2]]\n}\n", "a nested list"),
-            ("@nost 2\nedge a -> :R {}\n", "a missing endpoint"),
-            ("@nost 2\nedge a -> b :R :S {}\n", "two relation names"),
+            ("@nost 3\nnode n: L {\n k: [1, [2]]\n}\n", "a nested list"),
+            ("@nost 3\nedge a -> :R {}\n", "a missing endpoint"),
+            ("@nost 3\nedge a -> b :R :S {}\n", "two relation names"),
             (
-                "@nost 2\nschema S {\n name: text,\n}\n",
+                "@nost 3\nschema S {\n name: text,\n}\n",
                 "an unknown field type",
             ),
             (
-                "@nost 2\nschema S {\n g: string[][],\n}\n",
+                "@nost 3\nschema S {\n g: string[][],\n}\n",
                 "a nested array type",
             ),
-            ("@nost 2\nschema S {\n name,\n}\n", "a field without a type"),
+            ("@nost 3\nschema S {\n name,\n}\n", "a field without a type"),
         ] {
             let result = parse(source);
             assert!(result.is_err(), "{note} must be rejected");
@@ -946,7 +924,7 @@ mod tests {
 
     #[test]
     fn an_unknown_field_type_says_what_is_accepted() {
-        let error = parse("@nost 2\nschema S {\n  name: text,\n}\n").unwrap_err();
+        let error = parse("@nost 3\nschema S {\n  name: text,\n}\n").unwrap_err();
         assert!(
             error.message.contains("`text` is not a field type"),
             "{error}"
@@ -956,7 +934,7 @@ mod tests {
 
     #[test]
     fn an_out_of_range_integer_parses_because_that_is_a_semantic_rule() {
-        let file = parse("@nost 2\nnode n: L {\n  k: 9223372036854775808,\n}\n").unwrap();
+        let file = parse("@nost 3\nnode n: L {\n  k: 9223372036854775808,\n}\n").unwrap();
         assert_eq!(
             file.nodes[0].record.properties[0].value.value,
             Value::Integer("9223372036854775808".to_owned())

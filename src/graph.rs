@@ -235,7 +235,7 @@ mod tests {
 
     fn contribution() -> Contribution {
         Contribution {
-            owner: Owner::User,
+            owner: Owner::user(),
             source_unit: SourceUnitId::from_bytes([1; 16]),
             evidence: Vec::new(),
         }

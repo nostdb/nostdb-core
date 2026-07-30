@@ -58,9 +58,12 @@ const VALUE_BYTES: u8 = 5;
 const VALUE_DATETIME: u8 = 6;
 const VALUE_LIST: u8 = 7;
 
-const OWNER_ANALYZER: u8 = 1;
-const OWNER_AI: u8 = 2;
-const OWNER_USER: u8 = 3;
+/// An owner as one interned name, which is the only shape this format holds.
+///
+/// Three earlier tags carried a name and a version, a bare contract digest, and the user. They were read for
+/// one release and are gone: `nostdb_format_version` moved with them, so a database holding them reports an
+/// unsupported version rather than this tag being unknown.
+const OWNER_NAME: u8 = 4;
 
 const METHOD_DETERMINISTIC: u8 = 1;
 const METHOD_AI: u8 = 2;
@@ -370,18 +373,10 @@ fn put_evidence(out: &mut Vec<u8>, strings: &mut Strings, evidence: &Evidence) {
 fn put_contributions(out: &mut Vec<u8>, strings: &mut Strings, contributions: &[Contribution]) {
     put_u32(out, contributions.len() as u32);
     for contribution in contributions {
-        match &contribution.owner {
-            Owner::Analyzer { name, version } => {
-                out.push(OWNER_ANALYZER);
-                put_u32(out, strings.intern(name.as_str()));
-                put_u32(out, strings.intern(version.as_str()));
-            }
-            Owner::AiAnalysis { contract_digest } => {
-                out.push(OWNER_AI);
-                put_u32(out, strings.intern(contract_digest.as_str()));
-            }
-            Owner::User => out.push(OWNER_USER),
-        }
+        // One tag and one interned name. The three legacy tags are read and never written, so a database
+        // converts the first time this build rewrites it.
+        out.push(OWNER_NAME);
+        put_u32(out, strings.intern(contribution.owner.as_str()));
         out.extend_from_slice(contribution.source_unit.as_bytes());
         put_u32(out, contribution.evidence.len() as u32);
         for evidence in &contribution.evidence {
@@ -747,6 +742,17 @@ fn read_evidence(reader: &mut Reader<'_>, table: &Table) -> Result<Evidence, Dec
     })
 }
 
+/// One contribution's owner.
+fn decode_owner(reader: &mut Reader<'_>, table: &Table) -> Result<Owner, DecodeError> {
+    match reader.u8()? {
+        OWNER_NAME => Ok(Owner::new(NonEmptyText::new(table.get(reader.u32()?)?)?)),
+        other => Err(DecodeError::UnknownTag {
+            what: "owner",
+            tag: u32::from(other),
+        }),
+    }
+}
+
 fn read_contributions(
     reader: &mut Reader<'_>,
     table: &Table,
@@ -754,22 +760,7 @@ fn read_contributions(
     let count = reader.count(21)?;
     let mut contributions = Vec::with_capacity(count);
     for _ in 0..count {
-        let owner = match reader.u8()? {
-            OWNER_ANALYZER => Owner::Analyzer {
-                name: NonEmptyText::new(table.get(reader.u32()?)?)?,
-                version: NonEmptyText::new(table.get(reader.u32()?)?)?,
-            },
-            OWNER_AI => Owner::AiAnalysis {
-                contract_digest: ContentDigest::new(table.get(reader.u32()?)?)?,
-            },
-            OWNER_USER => Owner::User,
-            other => {
-                return Err(DecodeError::UnknownTag {
-                    what: "owner",
-                    tag: u32::from(other),
-                });
-            }
-        };
+        let owner = decode_owner(reader, table)?;
         let source_unit = SourceUnitId::from_bytes(reader.id16()?);
         let evidence_count = reader.count(24)?;
         let mut evidence = Vec::with_capacity(evidence_count);
@@ -1063,22 +1054,17 @@ mod tests {
                     ],
                     contributions: vec![
                         Contribution {
-                            owner: Owner::Analyzer {
-                                name: text("rust-structural"),
-                                version: text("0.1.0"),
-                            },
+                            owner: Owner::new(text("rust-structural")),
                             source_unit: SourceUnitId::from_bytes([9; 16]),
                             evidence: vec![evidence()],
                         },
                         Contribution {
-                            owner: Owner::User,
+                            owner: Owner::user(),
                             source_unit: SourceUnitId::from_bytes([8; 16]),
                             evidence: Vec::new(),
                         },
                         Contribution {
-                            owner: Owner::AiAnalysis {
-                                contract_digest: digest(),
-                            },
+                            owner: Owner::ai(&digest()),
                             source_unit: SourceUnitId::from_bytes([7; 16]),
                             evidence: vec![Evidence {
                                 confidence: Confidence::Ambiguous {
@@ -1098,7 +1084,7 @@ mod tests {
                     labels: vec![Label::new("Database").unwrap()],
                     properties: Vec::new(),
                     contributions: vec![Contribution {
-                        owner: Owner::User,
+                        owner: Owner::user(),
                         source_unit: SourceUnitId::from_bytes([1; 16]),
                         evidence: Vec::new(),
                     }],
@@ -1112,7 +1098,7 @@ mod tests {
                     relation: RelationName::new("CALLS").unwrap(),
                     properties: Vec::new(),
                     contributions: vec![Contribution {
-                        owner: Owner::User,
+                        owner: Owner::user(),
                         source_unit: SourceUnitId::from_bytes([1; 16]),
                         evidence: Vec::new(),
                     }],
@@ -1130,7 +1116,7 @@ mod tests {
                         PropertyValue::from("inferred"),
                     )],
                     contributions: vec![Contribution {
-                        owner: Owner::User,
+                        owner: Owner::user(),
                         source_unit: SourceUnitId::from_bytes([1; 16]),
                         evidence: Vec::new(),
                     }],

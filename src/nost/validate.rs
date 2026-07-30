@@ -10,9 +10,10 @@
 
 use super::{
     ContributionBlock, EdgeDeclaration, Endpoint, EvidenceBlock, EvidenceValue, FieldType,
-    LANGUAGE_VERSION, NodeDeclaration, OwnerDeclaration, Property, RecordBody, ScalarType,
-    SchemaDeclaration, SourceFile, Spanned, Value,
+    LANGUAGE_VERSION, NodeDeclaration, Property, RecordBody, ScalarType, SchemaDeclaration,
+    SourceFile, Spanned, Value,
 };
+use crate::contribution::OwnerKind;
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Severity};
 use crate::evidence::SourceRange;
 use crate::id::{LocalEdgeId, LocalNodeId, SourceUnitId};
@@ -504,20 +505,24 @@ fn check_contribution(contribution: &ContributionBlock, found: &mut Vec<Diagnost
     }
 
     // Only a user contribution may omit evidence, because the user is the evidence.
-    if contribution.evidence.is_empty()
-        && !matches!(contribution.owner, OwnerDeclaration::User { .. })
-    {
+    if contribution.evidence.is_empty() && contribution.owner.kind() != OwnerKind::User {
         found.push(diagnostic(
             DiagnosticCode::NostInvalidEvidence,
             contribution.owner.range(),
             format!(
                 "an `{}` contribution must carry evidence",
-                contribution.owner.keyword()
+                contribution.owner.name.value
             ),
         ));
     }
 
-    let inherits_producer = matches!(contribution.owner, OwnerDeclaration::Analyzer { .. });
+    // Only an analyzer supplies a producer name, because only an analyzer's owner *is* one. An AI owner is
+    // the digest of the contract that ran, and putting a digest where a producer name belongs would say the
+    // enricher was called `ai:sha256:…`. A user has no name at all.
+    //
+    // No owner supplies a version, so an evidence block always states its own. This has to agree with the
+    // resolution in `convert::evidence`, or a document validates and then loses a field on the way in.
+    let inherits_producer = contribution.owner.kind() == OwnerKind::Analyzer;
     for evidence in &contribution.evidence {
         check_evidence(evidence, inherits_producer, found);
     }
@@ -556,20 +561,21 @@ fn check_evidence(evidence: &EvidenceBlock, inherits_producer: bool, found: &mut
         ));
     }
 
-    // A producer is inherited from an analyzer owner, and nowhere else.
-    if !inherits_producer {
-        for key in ["producer", "producer_version"] {
-            if !seen.contains(key) {
-                found.push(diagnostic(
-                    DiagnosticCode::NostInvalidEvidence,
-                    evidence.range,
-                    format!(
-                        "`{key}` is required here, because only an `analyzer` owner supplies \
-                         one to inherit"
-                    ),
-                ));
-            }
-        }
+    if !inherits_producer && !seen.contains("producer") {
+        found.push(diagnostic(
+            DiagnosticCode::NostInvalidEvidence,
+            evidence.range,
+            "`producer` is required here, because only an analyzer owner supplies a name to inherit"
+                .to_owned(),
+        ));
+    }
+    if !seen.contains("producer_version") {
+        found.push(diagnostic(
+            DiagnosticCode::NostInvalidEvidence,
+            evidence.range,
+            "`producer_version` is required here, because an owner carries no version to inherit"
+                .to_owned(),
+        ));
     }
 }
 
@@ -736,7 +742,7 @@ mod tests {
 
     #[test]
     fn a_valid_file_reports_nothing() {
-        assert!(codes("@nost 2\nschema L {\n k: integer,\n}\nnode n: L {\n k: 1,\n}\n").is_empty());
+        assert!(codes("@nost 3\nschema L {\n k: integer,\n}\nnode n: L {\n k: 1,\n}\n").is_empty());
     }
 
     #[test]
@@ -758,11 +764,11 @@ mod tests {
     #[test]
     fn reports_duplicate_links() {
         assert_eq!(
-            codes("@nost 2\n@link \"./a\"\n@link \"./a\" as a\n"),
+            codes("@nost 3\n@link \"./a\"\n@link \"./a\" as a\n"),
             vec![DiagnosticCode::NostDuplicateLinkSource]
         );
         assert_eq!(
-            codes("@nost 2\n@link \"./a\" as s\n@link \"./b\" as s\n"),
+            codes("@nost 3\n@link \"./a\" as s\n@link \"./b\" as s\n"),
             vec![DiagnosticCode::NostDuplicateLinkAlias]
         );
     }
@@ -770,7 +776,7 @@ mod tests {
     #[test]
     fn reports_a_duplicate_schema_name() {
         assert_eq!(
-            codes("@nost 2\nschema S {}\nschema S {}\n"),
+            codes("@nost 3\nschema S {}\nschema S {}\n"),
             vec![DiagnosticCode::NostDuplicateSchemaName]
         );
     }
@@ -778,17 +784,17 @@ mod tests {
     #[test]
     fn reports_duplicate_names_ids_and_keys() {
         assert_eq!(
-            codes("@nost 2\nnode d: L {}\nnode d: L {}\n"),
+            codes("@nost 3\nnode d: L {}\nnode d: L {}\n"),
             vec![DiagnosticCode::NostDuplicateDeclarationName]
         );
         assert_eq!(
             codes(&format!(
-                "@nost 2\nnode a: L {{\n id: \"{NODE_ID}\",\n}}\nnode b: L {{\n id: \"{NODE_ID}\",\n}}\n"
+                "@nost 3\nnode a: L {{\n id: \"{NODE_ID}\",\n}}\nnode b: L {{\n id: \"{NODE_ID}\",\n}}\n"
             )),
             vec![DiagnosticCode::NostDuplicateId]
         );
         assert_eq!(
-            codes("@nost 2\nnode a: L {\n k: 1,\n k: 2,\n}\n"),
+            codes("@nost 3\nnode a: L {\n k: 1,\n k: 2,\n}\n"),
             vec![DiagnosticCode::NostDuplicatePropertyKey]
         );
     }
@@ -796,13 +802,13 @@ mod tests {
     #[test]
     fn reports_a_malformed_record_identifier() {
         assert_eq!(
-            codes("@nost 2\nnode a: L {\n id: \"n_1\",\n}\n"),
+            codes("@nost 3\nnode a: L {\n id: \"n_1\",\n}\n"),
             vec![DiagnosticCode::NostInvalidId]
         );
         // A node identifier where an edge identifier belongs is refused by its prefix.
         assert_eq!(
             codes(&format!(
-                "@nost 2\nedge a -> a :R {{\n id: \"{NODE_ID}\",\n}}\n"
+                "@nost 3\nedge a -> a :R {{\n id: \"{NODE_ID}\",\n}}\n"
             ))
             .into_iter()
             .filter(|code| *code == DiagnosticCode::NostInvalidId)
@@ -815,14 +821,14 @@ mod tests {
     fn an_edge_identifier_is_accepted_on_an_edge() {
         let edge_id = format!("e_{}", &NODE_ID[2..]);
         let source =
-            format!("@nost 2\nnode a: L {{}}\nedge a -> a :R {{\n id: \"{edge_id}\",\n}}\n");
+            format!("@nost 3\nnode a: L {{}}\nedge a -> a :R {{\n id: \"{edge_id}\",\n}}\n");
         assert!(codes(&source).is_empty(), "{:?}", codes(&source));
     }
 
     #[test]
     fn two_records_may_state_different_identifiers() {
         let source = format!(
-            "@nost 2\nnode a: L {{\n id: \"{NODE_ID}\",\n}}\nnode b: L {{\n id: \"{OTHER_ID}\",\n}}\n"
+            "@nost 3\nnode a: L {{\n id: \"{NODE_ID}\",\n}}\nnode b: L {{\n id: \"{OTHER_ID}\",\n}}\n"
         );
         assert!(codes(&source).is_empty(), "{:?}", codes(&source));
     }
@@ -830,11 +836,11 @@ mod tests {
     #[test]
     fn reports_a_missing_required_field_and_a_wrong_type() {
         assert_eq!(
-            codes("@nost 2\nschema S {\n name: string,\n}\nnode a: S {}\n"),
+            codes("@nost 3\nschema S {\n name: string,\n}\nnode a: S {}\n"),
             vec![DiagnosticCode::NostSchemaViolation]
         );
         assert_eq!(
-            codes("@nost 2\nschema S {\n name: string,\n}\nnode a: S {\n name: 42,\n}\n"),
+            codes("@nost 3\nschema S {\n name: string,\n}\nnode a: S {\n name: 42,\n}\n"),
             vec![DiagnosticCode::NostSchemaViolation]
         );
     }
@@ -842,7 +848,7 @@ mod tests {
     #[test]
     fn an_optional_field_may_be_omitted_and_a_schema_is_open() {
         assert!(
-            codes("@nost 2\nschema S {\n name?: string,\n}\nnode a: S {\n extra: 1,\n}\n")
+            codes("@nost 3\nschema S {\n name?: string,\n}\nnode a: S {\n extra: 1,\n}\n")
                 .is_empty()
         );
     }
@@ -850,15 +856,15 @@ mod tests {
     #[test]
     fn an_array_field_checks_every_element() {
         assert!(
-            codes("@nost 2\nschema S {\n t: string[],\n}\nnode a: S {\n t: [\"x\", \"y\"],\n}\n")
+            codes("@nost 3\nschema S {\n t: string[],\n}\nnode a: S {\n t: [\"x\", \"y\"],\n}\n")
                 .is_empty()
         );
         assert_eq!(
-            codes("@nost 2\nschema S {\n t: string[],\n}\nnode a: S {\n t: [\"x\", 1],\n}\n"),
+            codes("@nost 3\nschema S {\n t: string[],\n}\nnode a: S {\n t: [\"x\", 1],\n}\n"),
             vec![DiagnosticCode::NostSchemaViolation]
         );
         assert_eq!(
-            codes("@nost 2\nschema S {\n t: string[],\n}\nnode a: S {\n t: \"x\",\n}\n"),
+            codes("@nost 3\nschema S {\n t: string[],\n}\nnode a: S {\n t: \"x\",\n}\n"),
             vec![DiagnosticCode::NostSchemaViolation]
         );
     }
@@ -867,7 +873,7 @@ mod tests {
     fn two_schemas_disagreeing_on_a_field_type_conflict() {
         assert_eq!(
             codes(
-                "@nost 2\nschema A {\n k: string,\n}\nschema B {\n k: integer,\n}\nnode n: A, B {\n k: \"x\",\n}\n"
+                "@nost 3\nschema A {\n k: string,\n}\nschema B {\n k: integer,\n}\nnode n: A, B {\n k: \"x\",\n}\n"
             )
             .into_iter()
             .filter(|code| *code == DiagnosticCode::NostSchemaConflict)
@@ -881,7 +887,7 @@ mod tests {
         // Required in one and optional in the other means required.
         assert_eq!(
             codes(
-                "@nost 2\nschema A {\n k: string,\n}\nschema B {\n k?: string,\n}\nnode n: A, B {}\n"
+                "@nost 3\nschema A {\n k: string,\n}\nschema B {\n k?: string,\n}\nnode n: A, B {}\n"
             ),
             vec![DiagnosticCode::NostSchemaViolation]
         );
@@ -889,12 +895,12 @@ mod tests {
 
     #[test]
     fn an_undeclared_schema_name_is_an_unvalidated_label() {
-        assert!(codes("@nost 2\nnode n: NotDeclared {\n anything: 1,\n}\n").is_empty());
+        assert!(codes("@nost 3\nnode n: NotDeclared {\n anything: 1,\n}\n").is_empty());
     }
 
     #[test]
     fn reports_an_endpoint_constraint_violation() {
-        let source = "@nost 2\nschema A {}\nschema B {}\nschema R (A -> B) {}\n\
+        let source = "@nost 3\nschema A {}\nschema B {}\nschema R (A -> B) {}\n\
             node x: A {}\nnode y: A {}\nedge x -> y :R {}\n";
         assert_eq!(
             codes(source),
@@ -905,7 +911,7 @@ mod tests {
 
     #[test]
     fn reports_an_unknown_alias_or_locator_and_an_unresolved_local_endpoint() {
-        let base = "@nost 2\nnode a: L {}\n";
+        let base = "@nost 3\nnode a: L {}\n";
         assert_eq!(
             codes(&format!("{base}edge a -> absent::x :R {{}}\n")),
             vec![DiagnosticCode::NostUnknownLinkAlias]
@@ -923,7 +929,7 @@ mod tests {
     #[test]
     fn an_unresolved_endpoint_and_a_schema_violation_are_only_warnings() {
         let file =
-            parse("@nost 2\nschema S {\n k: string,\n}\nnode a: S {}\nedge a -> gone :R {}\n")
+            parse("@nost 3\nschema S {\n k: string,\n}\nnode a: S {}\nedge a -> gone :R {}\n")
                 .unwrap();
         let found = validate(&file);
         assert_eq!(found.len(), 2);
@@ -935,7 +941,7 @@ mod tests {
 
     #[test]
     fn reports_value_rules_including_inside_a_list() {
-        let head = "@nost 2\nnode a: L {\n";
+        let head = "@nost 3\nnode a: L {\n";
         assert_eq!(
             codes(&format!("{head} k: 9223372036854775808,\n}}\n")),
             vec![DiagnosticCode::NostIntegerOutOfRange]
@@ -957,25 +963,35 @@ mod tests {
     #[test]
     fn an_ordinary_float_outside_zero_to_one_is_accepted() {
         // The range rule applies to a confidence score, not to every number.
-        assert!(codes("@nost 2\nnode a: L {\n ratio: 7.5,\n}\n").is_empty());
+        assert!(codes("@nost 3\nnode a: L {\n ratio: 7.5,\n}\n").is_empty());
     }
 
     #[test]
     fn the_labels_key_must_hold_a_list_of_strings() {
-        assert!(codes("@nost 2\nnode a: L {\n labels: [\"X\", \"Y\"],\n}\n").is_empty());
+        assert!(codes("@nost 3\nnode a: L {\n labels: [\"X\", \"Y\"],\n}\n").is_empty());
         assert_eq!(
-            codes("@nost 2\nnode a: L {\n labels: \"X\",\n}\n"),
+            codes("@nost 3\nnode a: L {\n labels: \"X\",\n}\n"),
             vec![DiagnosticCode::NostSchemaViolation]
         );
         assert_eq!(
-            codes("@nost 2\nnode a: L {\n labels: [1],\n}\n"),
+            codes("@nost 3\nnode a: L {\n labels: [1],\n}\n"),
             vec![DiagnosticCode::NostSchemaViolation]
         );
     }
 
+    /// One evidence block inside an analyzer contribution.
+    ///
+    /// `producer_version` is supplied unless the body states one, because every block needs it now — no owner
+    /// carries a version to inherit — and these cases are about which *other* keys are accepted. A body
+    /// testing the version itself states it and keeps what it wrote.
     fn evidence(body: &str) -> Vec<DiagnosticCode> {
+        let body = if body.contains("producer_version") {
+            body.to_owned()
+        } else {
+            format!("{body}   producer_version: \"1\",\n")
+        };
         codes(&format!(
-            "@nost 2\nnode a: L {{\n @by analyzer \"r\" \"1\" {{\n  @evidence {{\n{body}  }}\n }}\n}}\n"
+            "@nost 3\nnode a: L {{\n @by \"r\" {{\n  @evidence {{\n{body}  }}\n }}\n}}\n"
         ))
     }
 
@@ -1047,13 +1063,13 @@ mod tests {
 
     #[test]
     fn only_a_user_contribution_may_omit_evidence() {
-        assert!(codes("@nost 2\nnode a: L {\n @by user {}\n}\n").is_empty());
+        assert!(codes("@nost 3\nnode a: L {\n @by \"user\" {}\n}\n").is_empty());
         assert_eq!(
-            codes("@nost 2\nnode a: L {\n @by analyzer \"r\" \"1\" {}\n}\n"),
+            codes("@nost 3\nnode a: L {\n @by \"r\" {}\n}\n"),
             vec![DiagnosticCode::NostInvalidEvidence]
         );
         assert_eq!(
-            codes("@nost 2\nnode a: L {\n @by ai \"sha256:x\" {}\n}\n"),
+            codes("@nost 3\nnode a: L {\n @by \"ai:sha256:x\" {}\n}\n"),
             vec![DiagnosticCode::NostInvalidEvidence]
         );
     }
@@ -1061,7 +1077,7 @@ mod tests {
     #[test]
     fn a_producer_is_required_when_there_is_no_analyzer_to_inherit_from() {
         let found = codes(
-            "@nost 2\nnode a: L {\n @by ai \"sha256:x\" {\n  @evidence {\n   source: \"./\",\n   \
+            "@nost 3\nnode a: L {\n @by \"ai:sha256:x\" {\n  @evidence {\n   source: \"./\",\n   \
              digest: \"sha256:abcdef0123456789abcdef0123456789\",\n   method: ai_inferred,\n   \
              confidence: inferred(0.5),\n  }\n }\n}\n",
         );
@@ -1078,7 +1094,7 @@ mod tests {
     #[test]
     fn a_malformed_source_unit_is_reported() {
         assert_eq!(
-            codes("@nost 2\nnode a: L {\n @by user unit \"u_1\" {}\n}\n"),
+            codes("@nost 3\nnode a: L {\n @by \"user\" unit \"u_1\" {}\n}\n"),
             vec![DiagnosticCode::NostInvalidEvidence]
         );
     }

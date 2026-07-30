@@ -429,7 +429,7 @@ mod tests {
                 labels: vec![Label::new("Function").unwrap()],
                 properties: Vec::new(),
                 contributions: vec![Contribution {
-                    owner: Owner::User,
+                    owner: Owner::user(),
                     source_unit: SourceUnitId::QUERY,
                     evidence: vec![evidence()],
                 }],

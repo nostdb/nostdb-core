@@ -2107,7 +2107,7 @@ mod tests {
 
     fn contribution() -> Contribution {
         Contribution {
-            owner: Owner::User,
+            owner: Owner::user(),
             source_unit: SourceUnitId::from_bytes([1; 16]),
             evidence: Vec::new(),
         }
@@ -2870,7 +2870,7 @@ mod tests {
         let mut target = Graph::default();
         run_on(&mut target, "CREATE (n:Function {name: \"login\"})");
         let contribution = &target.nodes[0].contributions[0];
-        assert_eq!(contribution.owner, Owner::User);
+        assert_eq!(contribution.owner, Owner::user());
         assert_eq!(contribution.source_unit, SourceUnitId::QUERY);
         assert!(contribution.evidence.is_empty());
         assert!(!contribution.owner.requires_evidence());
@@ -3068,10 +3068,7 @@ mod tests {
             &[("name", PropertyValue::from("login"))],
         );
         analyzed.contributions = vec![Contribution {
-            owner: Owner::Analyzer {
-                name: crate::text::NonEmptyText::new("rust-structural").unwrap(),
-                version: crate::text::NonEmptyText::new("0.1.0").unwrap(),
-            },
+            owner: Owner::new(crate::text::NonEmptyText::new("rust-structural").unwrap()),
             source_unit: SourceUnitId::from_bytes([7; 16]),
             evidence: vec![sample_evidence()],
         }];
@@ -3080,8 +3077,8 @@ mod tests {
         run_on(&mut target, "MATCH (n:Function) SET n.reviewed = true");
         let contributions = &target.nodes[0].contributions;
         assert_eq!(contributions.len(), 2);
-        assert!(matches!(contributions[0].owner, Owner::Analyzer { .. }));
-        assert_eq!(contributions[1].owner, Owner::User);
+        assert!(contributions[0].owner.kind() == crate::contribution::OwnerKind::Analyzer);
+        assert_eq!(contributions[1].owner, Owner::user());
 
         // A second write does not add a second user contribution.
         run_on(&mut target, "MATCH (n:Function) SET n.seen = true");

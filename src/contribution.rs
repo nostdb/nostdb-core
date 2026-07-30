@@ -10,47 +10,96 @@ use crate::evidence::{ContentDigest, Evidence};
 use crate::id::SourceUnitId;
 use crate::text::NonEmptyText;
 
-/// Who produced a contribution.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Owner {
-    /// A deterministic analyzer, identified by name and version.
-    ///
-    /// The version is part of the identity, so upgrading an analyzer does not
-    /// silently adopt facts the previous version produced.
-    Analyzer {
-        /// Analyzer name.
-        name: NonEmptyText,
-        /// Analyzer version.
-        version: NonEmptyText,
-    },
-    /// AI analysis, identified by the digest of the analysis contract it ran under.
-    AiAnalysis {
-        /// Digest of the analysis contract.
-        contract_digest: ContentDigest,
-    },
-    /// A user.
-    User,
-}
+/// Who produced a contribution: one name, and nothing beside it.
+///
+/// # Why one string rather than a structure
+///
+/// This was an enum carrying an analyzer's name **and version**, an AI contract digest, or nothing.
+/// The version is what made it a structure, and carrying it produced the defect
+/// [`crate::build::analyzer_owner`] documents: move the version and every record an earlier build wrote
+/// answers to a name no change set names, so nothing can withdraw them and the graph holds two readings
+/// of every file for ever.
+///
+/// `nostdb-spec` justified the version by saying an upgraded analyzer must not "silently adopt the
+/// previous version's facts as the new version's own". Not adopting them was never the behavior anyone
+/// wanted. What section 11.3 needs is that a refresh replaces its **own** prior contributions and leaves
+/// other producers' alone, and that is what one name delivers.
+///
+/// # The kind is derived, not declared
+///
+/// [`RESERVED_USER`] is the user. A name beginning [`AI_PREFIX`] is AI analysis, and what follows is the
+/// digest of the contract it ran under. Anything else is an analyzer. Both spellings are reserved,
+/// because otherwise an analyzer called `user` would silently become the user.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Owner(NonEmptyText);
+
+/// The owner a user's own contributions carry.
+pub const RESERVED_USER: &str = "user";
+
+/// The prefix an AI contribution's owner carries, followed by its contract digest.
+pub const AI_PREFIX: &str = "ai:";
 
 impl Owner {
+    /// An owner from a name, which is any non-empty text.
+    ///
+    /// No validation beyond non-emptiness, deliberately. A third-party analyzer names itself, and a
+    /// closed list here would be the allowlist section 4 forbids wearing a different hat.
+    #[must_use]
+    pub const fn new(name: NonEmptyText) -> Self {
+        Self(name)
+    }
+
+    /// The user.
+    #[must_use]
+    pub fn user() -> Self {
+        Self(NonEmptyText::literal(RESERVED_USER))
+    }
+
+    /// AI analysis under one analysis contract.
+    #[must_use]
+    pub fn ai(contract_digest: &ContentDigest) -> Self {
+        let spelled = format!("{AI_PREFIX}{}", contract_digest.as_str());
+        Self(NonEmptyText::new(spelled).unwrap_or_else(|_| NonEmptyText::literal("ai:unknown")))
+    }
+
+    /// The name as written.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// The contract digest an AI owner names, when this is one.
+    #[must_use]
+    pub fn contract_digest(&self) -> Option<&str> {
+        self.as_str().strip_prefix(AI_PREFIX)
+    }
+
     /// Reports whether this owner must supply evidence.
     ///
     /// An analyzer-created or AI-created record must have provenance, per the root
     /// PRD section 11.4. A user-declared record need not, because the user is the
     /// evidence.
     #[must_use]
-    pub const fn requires_evidence(&self) -> bool {
-        !matches!(self, Self::User)
+    pub fn requires_evidence(&self) -> bool {
+        self.kind() != OwnerKind::User
     }
 
-    /// The owner category, without its identifying detail.
+    /// The owner category, read from the name.
     #[must_use]
-    pub const fn kind(&self) -> OwnerKind {
-        match self {
-            Self::Analyzer { .. } => OwnerKind::Analyzer,
-            Self::AiAnalysis { .. } => OwnerKind::AiAnalysis,
-            Self::User => OwnerKind::User,
+    pub fn kind(&self) -> OwnerKind {
+        if self.as_str() == RESERVED_USER {
+            OwnerKind::User
+        } else if self.as_str().starts_with(AI_PREFIX) {
+            OwnerKind::AiAnalysis
+        } else {
+            OwnerKind::Analyzer
         }
+    }
+}
+
+impl std::fmt::Display for Owner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -104,33 +153,63 @@ mod tests {
     use super::*;
 
     fn analyzer() -> Owner {
-        Owner::Analyzer {
-            name: NonEmptyText::new("rust-structural").unwrap(),
-            version: NonEmptyText::new("0.1.0").unwrap(),
-        }
+        Owner::new(NonEmptyText::new("rust-structural").unwrap())
+    }
+
+    fn digest() -> ContentDigest {
+        ContentDigest::new("sha256:abcdef0123456789abcdef0123456789").unwrap()
     }
 
     #[test]
     fn only_a_user_may_omit_evidence() {
         assert!(analyzer().requires_evidence());
-        assert!(
-            Owner::AiAnalysis {
-                contract_digest: ContentDigest::new("sha256:abcdef0123456789abcdef0123456789")
-                    .unwrap(),
-            }
-            .requires_evidence()
-        );
-        assert!(!Owner::User.requires_evidence());
+        assert!(Owner::ai(&digest()).requires_evidence());
+        assert!(!Owner::user().requires_evidence());
     }
 
     #[test]
-    fn an_analyzer_version_is_part_of_its_identity() {
-        let newer = Owner::Analyzer {
-            name: NonEmptyText::new("rust-structural").unwrap(),
-            version: NonEmptyText::new("0.2.0").unwrap(),
-        };
-        assert_ne!(analyzer(), newer);
-        assert_eq!(analyzer().kind(), newer.kind());
+    fn the_kind_is_read_from_the_name() {
+        // No keyword declares it, so these three spellings are the whole of the rule. An analyzer is
+        // whatever the other two are not, which is what lets a third-party analyzer name itself.
+        assert_eq!(Owner::user().kind(), OwnerKind::User);
+        assert_eq!(Owner::ai(&digest()).kind(), OwnerKind::AiAnalysis);
+        assert_eq!(analyzer().kind(), OwnerKind::Analyzer);
+    }
+
+    #[test]
+    fn an_ai_owner_carries_the_contract_it_ran_under() {
+        // The digest is not decoration: it is how one AI contribution is told from another and withdrawn
+        // on its own. Folding the owner into one string must not lose it.
+        let owner = Owner::ai(&digest());
+        assert_eq!(owner.contract_digest(), Some(digest().as_str()));
+        assert_eq!(analyzer().contract_digest(), None);
+    }
+
+    #[test]
+    fn a_version_is_no_longer_part_of_an_owners_identity() {
+        // It used to be, and `nostdb-spec` justified it by saying an upgraded analyzer must not adopt the
+        // previous version's facts. That is what left records nothing could withdraw when the version
+        // moved. One name means a refresh replaces its own prior work, which is what section 11.3 needs.
+        assert_eq!(
+            Owner::new(NonEmptyText::literal("nostdb")),
+            Owner::new(NonEmptyText::literal("nostdb"))
+        );
+        assert_ne!(analyzer(), Owner::new(NonEmptyText::literal("nostdb")));
+    }
+
+    #[test]
+    fn a_reserved_name_is_not_available_to_an_analyzer() {
+        // Stated as a test because the reservation is only a convention in the type: nothing stops
+        // `Owner::new` from being handed `user`, and what it produces is the user rather than an analyzer
+        // that happens to be called that. The spec says so; this is what makes it true here.
+        assert_eq!(
+            Owner::new(NonEmptyText::literal(RESERVED_USER)).kind(),
+            OwnerKind::User
+        );
+        assert_eq!(
+            Owner::new(NonEmptyText::literal("ai:anything")).kind(),
+            OwnerKind::AiAnalysis
+        );
     }
 
     #[test]

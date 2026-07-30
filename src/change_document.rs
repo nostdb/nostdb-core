@@ -136,11 +136,11 @@ pub fn parse(text: &str) -> Result<GraphChangeSet, Vec<DocumentError>> {
     let owner = match root.get("owner") {
         Some(value) => read_owner(value).unwrap_or_else(|error| {
             errors.push(error);
-            Owner::User
+            Owner::user()
         }),
         None => {
             errors.push(invalid("owner", "expected an object"));
-            Owner::User
+            Owner::user()
         }
     };
     let snapshot = root
@@ -182,35 +182,17 @@ pub fn parse(text: &str) -> Result<GraphChangeSet, Vec<DocumentError>> {
     }
 }
 
+/// The owner a change set declares: one name.
+///
+/// An earlier schema wrote an object with a `kind`, and a `name` and `version` beside it. There is no reader
+/// for it, so a document carrying one is refused for the name it does not supply rather than silently applied
+/// under an owner nothing can withdraw.
 fn read_owner(value: &Value) -> Result<Owner, DocumentError> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| invalid("owner", "expected an object"))?;
-    let text = |key: &str| -> Result<NonEmptyText, DocumentError> {
-        object
-            .get(key)
-            .and_then(Value::as_str)
-            .and_then(|found| NonEmptyText::new(found).ok())
-            .ok_or_else(|| invalid(&format!("owner.{key}"), "expected a non-empty string"))
-    };
-    match object.get("kind").and_then(Value::as_str) {
-        Some("analyzer") => Ok(Owner::Analyzer {
-            name: text("name")?,
-            version: text("version")?,
-        }),
-        Some("ai_analysis") => Ok(Owner::AiAnalysis {
-            contract_digest: object
-                .get("contract_digest")
-                .and_then(Value::as_str)
-                .and_then(|found| ContentDigest::new(found).ok())
-                .ok_or_else(|| invalid("owner.contract_digest", "expected a content digest"))?,
-        }),
-        Some("user") => Ok(Owner::User),
-        _ => Err(invalid(
-            "owner.kind",
-            "expected `analyzer`, `ai_analysis`, or `user`",
-        )),
-    }
+    value
+        .as_str()
+        .and_then(|name| NonEmptyText::new(name).ok())
+        .map(Owner::new)
+        .ok_or_else(|| invalid("owner", "expected a non-empty owner name"))
 }
 
 fn read_operation(

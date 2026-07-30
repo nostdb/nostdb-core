@@ -284,20 +284,10 @@ fn labels_for(
 }
 
 fn owner(declaration: &OwnerDeclaration) -> Result<Owner, ConversionError> {
-    Ok(match declaration {
-        OwnerDeclaration::Analyzer { name, version } => Owner::Analyzer {
-            name: NonEmptyText::new(name.value.clone())
-                .map_err(|error| invalid(name.range, format!("an analyzer name {error}")))?,
-            version: NonEmptyText::new(version.value.clone())
-                .map_err(|error| invalid(version.range, format!("an analyzer version {error}")))?,
-        },
-        OwnerDeclaration::Ai { contract_digest } => Owner::AiAnalysis {
-            contract_digest: ContentDigest::new(contract_digest.value.clone()).map_err(
-                |error| invalid(contract_digest.range, format!("a contract digest: {error}")),
-            )?,
-        },
-        OwnerDeclaration::User { .. } => Owner::User,
-    })
+    Ok(Owner::new(
+        NonEmptyText::new(declaration.name.value.clone())
+            .map_err(|error| invalid(declaration.name.range, format!("an owner name {error}")))?,
+    ))
 }
 
 fn parse_position(text: &str) -> Option<SourcePosition> {
@@ -357,10 +347,7 @@ fn evidence_word<'a>(
         })
 }
 
-fn evidence(
-    block: &EvidenceBlock,
-    inherited: Option<(&str, &str)>,
-) -> Result<Evidence, ConversionError> {
+fn evidence(block: &EvidenceBlock, inherited: Option<&str>) -> Result<Evidence, ConversionError> {
     let at = block.range;
     let (source_text, source_range) = evidence_text(&block.fields, "source")
         .ok_or_else(|| invalid(at, "an evidence block must state `source`"))?;
@@ -392,16 +379,17 @@ fn evidence(
 
     let named_producer = evidence_text(&block.fields, "producer");
     let named_version = evidence_text(&block.fields, "producer_version");
+    // An owner names a producer and carries no version, so a block always states its version and may omit
+    // the producer when an analyzer owner supplies one. Only an analyzer does: an AI owner's name is the
+    // digest of the contract that ran, and a user has no name at all.
     let (producer, producer_version) = match (named_producer, named_version, inherited) {
         (Some((name, _)), Some((version, _)), _) => (name.to_owned(), version.to_owned()),
-        (Some((name, _)), None, Some((_, version))) => (name.to_owned(), version.to_owned()),
-        (None, Some((version, _)), Some((name, _))) => (name.to_owned(), version.to_owned()),
-        (None, None, Some((name, version))) => (name.to_owned(), version.to_owned()),
+        (None, Some((version, _)), Some(name)) => (name.to_owned(), version.to_owned()),
         _ => {
             return Err(invalid(
                 at,
-                "an evidence block must state `producer` and `producer_version` unless its \
-                 owner is an analyzer to inherit them from",
+                "an evidence block must state `producer_version`, and `producer` unless its \
+                 owner is an analyzer to inherit one from",
             ));
         }
     };
@@ -479,12 +467,11 @@ fn contribution(block: &ContributionBlock) -> Result<Contribution, ConversionErr
         Some(unit) => SourceUnitId::from_str(&unit.value)
             .map_err(|error| invalid(unit.range, format!("{}: {error}", unit.value)))?,
     };
-    let inherited = match &block.owner {
-        OwnerDeclaration::Analyzer { name, version } => {
-            Some((name.value.as_str(), version.value.as_str()))
-        }
-        _ => None,
-    };
+    // Only an analyzer supplies a producer name — the same rule `validate` applies, which this has to agree
+    // with or a document validates and then loses a field on the way in. A version comes only from the
+    // keyword form, which wrote one.
+    let inherited = (block.owner.kind() == crate::contribution::OwnerKind::Analyzer)
+        .then_some(block.owner.name.value.as_str());
     let mut collected = Vec::with_capacity(block.evidence.len());
     for entry in &block.evidence {
         collected.push(evidence(entry, inherited)?);
@@ -686,17 +673,20 @@ fn canonicalize(
 }
 
 /// A total order over contributions, matching what the canonical writer emits.
-fn owner_key(contribution: &Contribution) -> (u8, String, String, [u8; 16]) {
-    let (rank, first, second) = match &contribution.owner {
-        Owner::Analyzer { name, version } => {
-            (0, name.as_str().to_owned(), version.as_str().to_owned())
-        }
-        Owner::AiAnalysis { contract_digest } => {
-            (1, contract_digest.as_str().to_owned(), String::new())
-        }
-        Owner::User => (2, String::new(), String::new()),
+fn owner_key(contribution: &Contribution) -> (u8, String, [u8; 16]) {
+    // Ranked by kind so analyzers come before AI and the user comes last, then by the name itself. The
+    // kind is derived from the name, so this stays the order the canonical writer emitted before an owner
+    // became one string.
+    let rank = match contribution.owner.kind() {
+        crate::contribution::OwnerKind::Analyzer => 0,
+        crate::contribution::OwnerKind::AiAnalysis => 1,
+        crate::contribution::OwnerKind::User => 2,
     };
-    (rank, first, second, contribution.source_unit.to_bytes())
+    (
+        rank,
+        contribution.owner.as_str().to_owned(),
+        contribution.source_unit.to_bytes(),
+    )
 }
 
 /// The Placeholder label an unresolved endpoint receives.
@@ -798,7 +788,7 @@ fn render_position(position: SourcePosition) -> String {
     format!("{}:{}:{}", position.line, position.column, position.offset)
 }
 
-fn evidence_block(entry: &Evidence, inherited: Option<(&str, &str)>) -> EvidenceBlock {
+fn evidence_block(entry: &Evidence, inherited: Option<&str>) -> EvidenceBlock {
     let mut fields = vec![evidence_field(
         "source",
         EvidenceValue::Text(entry.source.as_str().to_owned()),
@@ -832,17 +822,17 @@ fn evidence_block(entry: &Evidence, inherited: Option<(&str, &str)>) -> Evidence
     // A producer equal to what the owner supplies is left out, which is what the
     // contract's inheritance rule exists for. Writing it anyway would be noise, and
     // reading it back produces the same value either way.
-    let redundant = inherited == Some((entry.producer.as_str(), entry.producer_version.as_str()));
-    if !redundant {
+    let inherits_producer = inherited == Some(entry.producer.as_str());
+    if !inherits_producer {
         fields.push(evidence_field(
             "producer",
             EvidenceValue::Text(entry.producer.as_str().to_owned()),
         ));
-        fields.push(evidence_field(
-            "producer_version",
-            EvidenceValue::Text(entry.producer_version.as_str().to_owned()),
-        ));
     }
+    fields.push(evidence_field(
+        "producer_version",
+        EvidenceValue::Text(entry.producer_version.as_str().to_owned()),
+    ));
     fields.push(evidence_field(
         "method",
         EvidenceValue::Enumerator {
@@ -882,22 +872,13 @@ fn evidence_block(entry: &Evidence, inherited: Option<(&str, &str)>) -> Evidence
 }
 
 fn contribution_block(entry: &Contribution) -> ContributionBlock {
-    let owner = match &entry.owner {
-        Owner::Analyzer { name, version } => OwnerDeclaration::Analyzer {
-            name: spanned(name.as_str().to_owned()),
-            version: spanned(version.as_str().to_owned()),
-        },
-        Owner::AiAnalysis { contract_digest } => OwnerDeclaration::Ai {
-            contract_digest: spanned(contract_digest.as_str().to_owned()),
-        },
-        Owner::User => OwnerDeclaration::User {
-            range: SourceRange::ORIGIN,
-        },
+    let owner = OwnerDeclaration {
+        name: spanned(entry.owner.as_str().to_owned()),
     };
-    let inherited = match &entry.owner {
-        Owner::Analyzer { name, version } => Some((name.as_str(), version.as_str())),
-        _ => None,
-    };
+    // The owner supplies the producer name and no version, so a block writes its own version. See the
+    // resolution in `evidence`, which this has to agree with or a round trip loses a field.
+    let inherited = (entry.owner.kind() == crate::contribution::OwnerKind::Analyzer)
+        .then(|| entry.owner.as_str());
     // The nil source unit is what a contribution with no stated unit reads back as, so
     // writing it would be redundant.
     let unit =
@@ -1123,7 +1104,7 @@ mod tests {
 
     #[test]
     fn an_empty_document_converts_to_an_empty_graph() {
-        assert!(graph_of("@nost 2\n").is_empty());
+        assert!(graph_of("@nost 3\n").is_empty());
     }
 
     #[test]
@@ -1139,7 +1120,7 @@ mod tests {
     fn a_stated_identifier_is_kept_and_an_absent_one_is_minted() {
         let stated = "n_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
         let graph = graph_of(&format!(
-            "@nost 2\nnode a: L {{\n id: \"{stated}\",\n}}\nnode b: L {{}}\n"
+            "@nost 3\nnode a: L {{\n id: \"{stated}\",\n}}\nnode b: L {{}}\n"
         ));
         assert_eq!(graph.nodes[0].id.to_string(), stated);
         assert_ne!(graph.nodes[1].id.to_string(), stated);
@@ -1148,7 +1129,7 @@ mod tests {
 
     #[test]
     fn schema_names_and_the_labels_key_both_become_labels() {
-        let graph = graph_of("@nost 2\nnode a: Alpha, Beta {\n labels: [\"Gamma\"],\n}\n");
+        let graph = graph_of("@nost 3\nnode a: Alpha, Beta {\n labels: [\"Gamma\"],\n}\n");
         let labels: Vec<&str> = graph.nodes[0]
             .labels
             .iter()
@@ -1160,14 +1141,14 @@ mod tests {
 
     #[test]
     fn a_repeated_label_is_kept_once() {
-        let graph = graph_of("@nost 2\nnode a: Alpha {\n labels: [\"Alpha\"],\n}\n");
+        let graph = graph_of("@nost 3\nnode a: Alpha {\n labels: [\"Alpha\"],\n}\n");
         assert_eq!(graph.nodes[0].labels.len(), 1);
     }
 
     #[test]
     fn every_property_value_type_converts() {
         let graph = graph_of(
-            "@nost 2\nnode a: L {\n flag: true,\n count: 42,\n ratio: 0.5,\n name: \"x\",\n \
+            "@nost 3\nnode a: L {\n flag: true,\n count: 42,\n ratio: 0.5,\n name: \"x\",\n \
              payload: bytes\"dead\",\n at: datetime\"2026-07-27T00:00:00Z\",\n \
              tags: [\"a\", 1],\n}\n",
         );
@@ -1186,7 +1167,7 @@ mod tests {
 
     #[test]
     fn an_out_of_range_integer_is_a_conversion_error_not_a_panic() {
-        let file = parse("@nost 2\nnode a: L {\n k: 9223372036854775808,\n}\n").unwrap();
+        let file = parse("@nost 3\nnode a: L {\n k: 9223372036854775808,\n}\n").unwrap();
         let error = to_graph(&file).unwrap_err();
         assert!(matches!(error, ConversionError::InvalidValue { .. }));
         assert!(error.range().is_some());
@@ -1194,7 +1175,7 @@ mod tests {
 
     #[test]
     fn an_unresolved_endpoint_becomes_a_placeholder_node() {
-        let graph = graph_of("@nost 2\nnode a: L {}\nedge a -> gone :R {}\n");
+        let graph = graph_of("@nost 3\nnode a: L {}\nedge a -> gone :R {}\n");
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.nodes[1].labels[0].as_str(), PLACEHOLDER_LABEL);
         // Never a null endpoint.
@@ -1204,8 +1185,8 @@ mod tests {
     #[test]
     fn an_external_endpoint_is_refused_rather_than_degraded() {
         for source in [
-            "@nost 2\n@link \"./s\" as s\nnode a: L {}\nedge a -> s::x :R {}\n",
-            "@nost 2\n@link \"./c\"\nnode a: L {}\nedge a -> \"./c\"::x :R {}\n",
+            "@nost 3\n@link \"./s\" as s\nnode a: L {}\nedge a -> s::x :R {}\n",
+            "@nost 3\n@link \"./c\"\nnode a: L {}\nedge a -> \"./c\"::x :R {}\n",
         ] {
             let file = parse(source).unwrap();
             let error = to_graph(&file).unwrap_err();
@@ -1219,7 +1200,7 @@ mod tests {
     #[test]
     fn links_and_schemas_convert() {
         let graph = graph_of(
-            "@nost 2\n@link \"./c\"\n@link \"./s\" as s\n\
+            "@nost 3\n@link \"./c\"\n@link \"./s\" as s\n\
              schema Function {\n name: string,\n tags?: string[],\n}\n\
              schema CALLS (Function -> Function) {}\n",
         );
@@ -1252,36 +1233,40 @@ mod tests {
     #[test]
     fn contributions_and_evidence_convert() {
         let graph = graph_of(
-            "@nost 2\nnode a: L {\n \
-             @by analyzer \"rust\" \"0.1.0\" unit \"u_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\" {\n  \
+            "@nost 3\nnode a: L {\n \
+             @by \"rust\" unit \"u_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\" {\n  \
              @evidence {\n   source: \"./\",\n   path: \"src/a.rs\",\n   \
              digest: \"sha256:abcdef0123456789abcdef0123456789\",\n   \
-             range: \"1:1:0-2:1:10\",\n   method: deterministic,\n   confidence: extracted,\n  }\n \
+             range: \"1:1:0-2:1:10\",\n   producer_version: \"1\",\n   method: deterministic,\n   confidence: extracted,\n  }\n \
              }\n \
-             @by user {}\n}\n",
+             @by \"user\" {}\n}\n",
         );
         let contributions = &graph.nodes[0].contributions;
         assert_eq!(contributions.len(), 2);
 
         let analyzer = &contributions[0];
-        assert!(matches!(analyzer.owner, Owner::Analyzer { .. }));
+        assert_eq!(
+            analyzer.owner.kind(),
+            crate::contribution::OwnerKind::Analyzer
+        );
         assert_ne!(analyzer.source_unit, SourceUnitId::QUERY);
         let evidence = &analyzer.evidence[0];
-        // producer is inherited from the analyzer owner.
+        // The producer is inherited from the analyzer owner; the version is stated, because no owner carries
+        // one to inherit.
         assert_eq!(evidence.producer.as_str(), "rust");
-        assert_eq!(evidence.producer_version.as_str(), "0.1.0");
+        assert_eq!(evidence.producer_version.as_str(), "1");
         assert_eq!(evidence.method, EvidenceMethod::Deterministic);
         assert_eq!(evidence.confidence, Confidence::Extracted);
         assert_eq!(evidence.range.unwrap().byte_length(), 10);
 
-        assert_eq!(contributions[1].owner, Owner::User);
+        assert_eq!(contributions[1].owner, Owner::user());
         assert_eq!(contributions[1].source_unit, SourceUnitId::QUERY);
     }
 
     #[test]
     fn a_score_carrying_confidence_converts() {
         let graph = graph_of(
-            "@nost 2\nnode a: L {\n @by ai \"sha256:abcdef0123456789abcdef0123456789\" {\n  \
+            "@nost 3\nnode a: L {\n @by \"ai:sha256:abcdef0123456789abcdef0123456789\" {\n  \
              @evidence {\n   source: \"./\",\n   \
              digest: \"sha256:abcdef0123456789abcdef0123456789\",\n   producer: \"p\",\n   \
              producer_version: \"1\",\n   method: ai_inferred,\n   confidence: inferred(0.25),\n  \
@@ -1309,7 +1294,7 @@ mod tests {
     #[test]
     fn graph_content_survives_a_round_trip() {
         round_trip(
-            "@nost 2\n@link \"./c\"\n@link \"./s\" as s\n\
+            "@nost 3\n@link \"./c\"\n@link \"./s\" as s\n\
              schema Function {\n name: string,\n tags?: string[],\n}\n\
              node login: Function {\n id: \"n_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\",\n \
              name: \"login\",\n tags: [\"a\"],\n labels: [\"Public\"],\n}\n\
@@ -1323,14 +1308,14 @@ mod tests {
     #[test]
     fn contributions_survive_a_round_trip() {
         round_trip(
-            "@nost 2\nnode a: L {\n id: \"n_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\",\n \
-             @by analyzer \"rust\" \"0.1.0\" unit \"u_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\" {\n  \
+            "@nost 3\nnode a: L {\n id: \"n_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\",\n \
+             @by \"rust\" unit \"u_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\" {\n  \
              @evidence {\n   source: \"./\",\n   path: \"src/a.rs\",\n   \
              revision: \"abc\",\n   \
              digest: \"sha256:abcdef0123456789abcdef0123456789\",\n   \
-             range: \"1:1:0-2:1:10\",\n   method: deterministic,\n   \
+             range: \"1:1:0-2:1:10\",\n   producer_version: \"1\",\n   method: deterministic,\n   \
              confidence: ambiguous(0.5),\n  }\n }\n \
-             @by user {}\n}\n",
+             @by \"user\" {}\n}\n",
         );
     }
 
@@ -1340,11 +1325,12 @@ mod tests {
         // would come back owned by the user, and an analyzer refresh would then be free
         // to replace work a person did by hand.
         let (graph, _) = round_trip(
-            "@nost 2\nnode a: L {\n id: \"n_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\",\n \
-             @by analyzer \"rust\" \"0.1.0\" {\n  @evidence {\n   source: \"./\",\n   \
-             digest: \"sha256:abcdef0123456789abcdef0123456789\",\n   method: deterministic,\n   \
+            "@nost 3\nnode a: L {\n id: \"n_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\",\n \
+             @by \"rust\" {\n  @evidence {\n   source: \"./\",\n   \
+             digest: \"sha256:abcdef0123456789abcdef0123456789\",\n   \
+             producer_version: \"1\",\n   method: deterministic,\n   \
              confidence: extracted,\n  }\n }\n \
-             @by user {}\n}\n",
+             @by \"user\" {}\n}\n",
         );
         let owners: Vec<_> = graph.nodes[0]
             .contributions
@@ -1364,7 +1350,7 @@ mod tests {
     fn a_minted_identifier_is_written_out_so_the_next_pass_carries_it() {
         // The first export is where a minted identifier becomes durable. Before it, two
         // conversions of the same text produce different graphs; after it, they do not.
-        let source = "@nost 2\nnode a: L {}\n";
+        let source = "@nost 3\nnode a: L {}\n";
         let exported = format(&from_graph(&graph_of(source)));
         assert!(exported.contains("id: \"n_"), "{exported}");
         assert_eq!(graph_of(&exported), graph_of(&exported));

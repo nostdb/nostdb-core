@@ -1166,44 +1166,25 @@ fn producer_version_of_a_build() -> String {
 
 /// The owner every record this module produces belongs to.
 ///
-/// **Still one value, and still named for Rust.** That is wrong with a second analyzer and it is not
-/// changed here, because changing it cannot be done without deciding something the product contract
-/// has not decided.
+/// `nostdb`, and one string. It was `Analyzer { name: "rust", version: "1" }` — named for the only analyzer
+/// that existed when it was written, which was wrong from the second analyzer onward, and carrying a version
+/// that made renaming it unsafe.
 ///
-/// `docs/PRD.md` section 11.3 lets a change set remove only contributions owned by its own owner, and
-/// `GraphChangeSet::validate` enforces it. So renaming this owner would leave every record an earlier
-/// build wrote owned by a name nothing can withdraw: `existing_unit` would not find them, fresh units
-/// would be minted beside them, and the graph would hold both readings of every file forever.
-///
-/// Retiring a superseded owner is the same question as retiring a superseded analyzer *version*, which
-/// section 11.3 also leaves open. Both are recorded in the root `IMPLEMENTATION_PROGRESS.md` awaiting
-/// the owning contract. Until then the honest state is one stable owner with per-language provenance
-/// in evidence — which is what section 11.4 dedicates `Evidence` to, and where it now is.
+/// What made it unsafe is gone. `docs/PRD.md` section 11.3 lets a change set remove only contributions owned
+/// by its own owner, so a rename used to leave every record an earlier build wrote answering to a name nothing
+/// could withdraw. There is no such record to strand: `nostdb_format_version` moved, so a database written
+/// under the previous owner reports an unsupported version and is rebuilt rather than read.
 #[must_use]
 pub fn analyzer_owner() -> Owner {
-    Owner::Analyzer {
-        name: NonEmptyText::new(OWNER_NAME).unwrap_or_else(|_| NonEmptyText::literal("rust")),
-        version: NonEmptyText::new(OWNER_VERSION).unwrap_or_else(|_| NonEmptyText::literal("1")),
-    }
+    Owner::new(NonEmptyText::new(OWNER_NAME).unwrap_or_else(|_| NonEmptyText::literal("nostdb")))
 }
 
-/// The name half of [`analyzer_owner`], frozen.
+/// The owner [`analyzer_owner`] names.
 ///
-/// It read `rust::LANGUAGE` when Rust was the only analyzer, and it is a literal now that no analyzer
-/// declares a version to borrow. The value must not move for the reason above.
-const OWNER_NAME: &str = "rust";
-
-/// The version half of [`analyzer_owner`], frozen at what every existing database already holds.
-///
-/// **Not an analyzer's version.** No analyzer declares one — `AnalyzerCapability` carries no version, because
-/// which reader produced a record is not something a query acts on. This is one half of a contribution's
-/// owner, which `nostdb-spec` declares and `.nost` requires as grammar, and it is a constant here precisely
-/// so that removing analyzer versions could not move it.
-///
-/// Moving it would leave every record an earlier build wrote owned by a name nothing can withdraw. That is
-/// the hazard [`analyzer_owner`] documents, and the test pinning this value is what keeps it from happening
-/// by accident.
-const OWNER_VERSION: &str = "1";
+/// Every deterministic analyzer this build ships contributes under it. Which of them read a given file is in
+/// the record's evidence, where section 11.4 puts provenance, rather than in the owner — Stage 22 established
+/// that attribution is not identity, and this is the last place that had confused the two.
+pub const OWNER_NAME: &str = "nostdb";
 
 /// The file in this build that an import path names, when exactly one does.
 ///
@@ -1967,11 +1948,12 @@ mod tests {
         // withdraw: `existing_unit` stops finding them, fresh units are minted beside them, and the graph
         // holds both readings of every file for ever. That is a defect no later change can repair, because
         // the unreachable records are already in somebody's database.
-        let Owner::Analyzer { name, version } = analyzer_owner() else {
-            panic!("the builtin owner is an analyzer");
-        };
-        assert_eq!(name.as_str(), "rust");
-        assert_eq!(version.as_str(), "1");
+        assert_eq!(analyzer_owner().as_str(), "nostdb");
+        assert_eq!(
+            analyzer_owner().kind(),
+            crate::contribution::OwnerKind::Analyzer,
+            "the kind is read from the name, so a rename must not make this the user or an AI owner"
+        );
     }
 
     #[test]

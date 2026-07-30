@@ -221,18 +221,12 @@ fn write_record_body(writer: &mut Writer, depth: usize, head: &str, record: &Rec
     });
 }
 
-fn owner_key(owner: &OwnerDeclaration) -> (u8, String, String) {
-    match owner {
-        OwnerDeclaration::Analyzer { name, version } => {
-            (0, name.value.clone(), version.value.clone())
-        }
-        OwnerDeclaration::Ai { contract_digest } => {
-            (1, contract_digest.value.clone(), String::new())
-        }
-        OwnerDeclaration::User { .. } => (2, String::new(), String::new()),
-    }
+/// An owner, which is one string.
+fn render_owner(owner: &OwnerDeclaration) -> String {
+    escape_string(&owner.name.value)
 }
 
+/// Contribution blocks in the order a canonical writer emits them.
 fn sorted_contributions(contributions: &[ContributionBlock]) -> Vec<&ContributionBlock> {
     let mut sorted: Vec<&ContributionBlock> = contributions.iter().collect();
     sorted.sort_by(|left, right| {
@@ -247,18 +241,14 @@ fn sorted_contributions(contributions: &[ContributionBlock]) -> Vec<&Contributio
     sorted
 }
 
-fn render_owner(owner: &OwnerDeclaration) -> String {
-    match owner {
-        OwnerDeclaration::Analyzer { name, version } => format!(
-            "analyzer {} {}",
-            escape_string(&name.value),
-            escape_string(&version.value)
-        ),
-        OwnerDeclaration::Ai { contract_digest } => {
-            format!("ai {}", escape_string(&contract_digest.value))
-        }
-        OwnerDeclaration::User { .. } => "user".to_owned(),
-    }
+/// A total order over contribution blocks, matching what `convert`'s own key emits.
+fn owner_key(owner: &OwnerDeclaration) -> (u8, String) {
+    let rank = match owner.kind() {
+        crate::contribution::OwnerKind::Analyzer => 0,
+        crate::contribution::OwnerKind::AiAnalysis => 1,
+        crate::contribution::OwnerKind::User => 2,
+    };
+    (rank, owner.name.value.clone())
 }
 
 fn write_contribution(writer: &mut Writer, depth: usize, contribution: &ContributionBlock) {
@@ -464,11 +454,11 @@ mod tests {
     #[test]
     fn formatting_is_idempotent() {
         for source in [
-            "@nost 2\n",
-            "@nost 2\n@link \"./b\"\n@link \"./a\" as a\n",
-            "@nost 2\nschema L {\n b?: integer,\n a: string,\n}\nnode z: B, A {\n k: 1,\n}\nnode a: L {}\nedge a -> z :R {\n q: [1, 2],\n}\n",
-            "// lead\n@nost 2 // trail\n\n// about\nnode n: L {\n // key\n k: \"v\", // after\n}\n",
-            "@nost 2\nnode n: L {\n k: 1,\n\n @by analyzer \"r\" \"1\" unit \"u_1\" {\n  @evidence {\n   source: \"./\",\n   confidence: inferred(0.5),\n  }\n }\n\n @by user {}\n}\n",
+            "@nost 3\n",
+            "@nost 3\n@link \"./b\"\n@link \"./a\" as a\n",
+            "@nost 3\nschema L {\n b?: integer,\n a: string,\n}\nnode z: B, A {\n k: 1,\n}\nnode a: L {}\nedge a -> z :R {\n q: [1, 2],\n}\n",
+            "// lead\n@nost 3 // trail\n\n// about\nnode n: L {\n // key\n k: \"v\", // after\n}\n",
+            "@nost 3\nnode n: L {\n k: 1,\n\n @by \"r\" unit \"u_1\" {\n  @evidence {\n   source: \"./\",\n   confidence: inferred(0.5),\n  }\n }\n\n @by \"user\" {}\n}\n",
         ] {
             let once = round_trip(source);
             let twice = round_trip(&once);
@@ -479,7 +469,7 @@ mod tests {
     #[test]
     fn output_is_sorted_deterministically() {
         let formatted = round_trip(
-            "@nost 2\n@link \"./z\"\n@link \"./a\"\nnode z: L {}\nnode a: L {}\nschema L {}\n",
+            "@nost 3\n@link \"./z\"\n@link \"./a\"\nnode z: L {}\nnode a: L {}\nschema L {}\n",
         );
         assert!(formatted.find("\"./a\"").unwrap() < formatted.find("\"./z\"").unwrap());
         assert!(formatted.find("node a").unwrap() < formatted.find("node z").unwrap());
@@ -490,7 +480,7 @@ mod tests {
     #[test]
     fn schema_names_and_keys_are_sorted_and_nodes_precede_edges() {
         let formatted =
-            round_trip("@nost 2\nedge a -> a :R {}\nnode a: Zed, Alpha {\n zz: 1,\n aa: 2,\n}\n");
+            round_trip("@nost 3\nedge a -> a :R {}\nnode a: Zed, Alpha {\n zz: 1,\n aa: 2,\n}\n");
         assert!(formatted.contains("node a: Alpha, Zed"), "{formatted}");
         assert!(formatted.find("aa: 2").unwrap() < formatted.find("zz: 1").unwrap());
         assert!(formatted.find("node a").unwrap() < formatted.find("edge a").unwrap());
@@ -499,7 +489,7 @@ mod tests {
     #[test]
     fn edges_sort_by_endpoints_then_relation_then_identifier() {
         let formatted =
-            round_trip("@nost 2\nedge b -> a :R {}\nedge a -> b :Z {}\nedge a -> b :A {}\n");
+            round_trip("@nost 3\nedge b -> a :R {}\nedge a -> b :Z {}\nedge a -> b :A {}\n");
         let first = formatted.find("edge a -> b :A").unwrap();
         let second = formatted.find("edge a -> b :Z").unwrap();
         let third = formatted.find("edge b -> a :R").unwrap();
@@ -508,7 +498,7 @@ mod tests {
 
     #[test]
     fn properties_are_comma_separated_with_no_trailing_comma() {
-        let formatted = round_trip("@nost 2\nnode n: L {\n a: 1,\n b: 2,\n}\n");
+        let formatted = round_trip("@nost 3\nnode n: L {\n a: 1,\n b: 2,\n}\n");
         assert!(formatted.contains("a: 1,\n"), "{formatted}");
         assert!(formatted.contains("b: 2\n"), "{formatted}");
         assert!(!formatted.contains("b: 2,"), "{formatted}");
@@ -516,20 +506,20 @@ mod tests {
 
     #[test]
     fn an_optional_field_keeps_its_question_mark() {
-        let formatted = round_trip("@nost 2\nschema S {\n a?: string[],\n b: integer,\n}\n");
+        let formatted = round_trip("@nost 3\nschema S {\n a?: string[],\n b: integer,\n}\n");
         assert!(formatted.contains("a?: string[],"), "{formatted}");
         assert!(formatted.contains("b: integer\n"), "{formatted}");
     }
 
     #[test]
     fn an_endpoint_constraint_is_reproduced() {
-        let formatted = round_trip("@nost 2\nschema R (A -> B) {\n s?: datetime,\n}\n");
+        let formatted = round_trip("@nost 3\nschema R (A -> B) {\n s?: datetime,\n}\n");
         assert!(formatted.contains("schema R (A -> B) {"), "{formatted}");
     }
 
     #[test]
     fn an_empty_block_is_written_as_braces() {
-        let formatted = round_trip("@nost 2\nnode a: L {\n}\nschema L {\n}\n");
+        let formatted = round_trip("@nost 3\nnode a: L {\n}\nschema L {\n}\n");
         assert!(formatted.contains("node a: L {}"), "{formatted}");
         assert!(formatted.contains("schema L {}"), "{formatted}");
     }
@@ -537,12 +527,12 @@ mod tests {
     #[test]
     fn contributions_sort_analyzer_then_ai_then_user() {
         let formatted = round_trip(
-            "@nost 2\nnode n: L {\n @by user {}\n @by ai \"sha256:a\" {}\n @by analyzer \"z\" \"1\" {}\n @by analyzer \"a\" \"1\" {}\n}\n",
+            "@nost 3\nnode n: L {\n @by \"user\" {}\n @by \"ai:sha256:a\" {}\n @by \"z\" {}\n @by \"a\" {}\n}\n",
         );
-        let analyzer_a = formatted.find("@by analyzer \"a\"").unwrap();
-        let analyzer_z = formatted.find("@by analyzer \"z\"").unwrap();
-        let ai = formatted.find("@by ai").unwrap();
-        let user = formatted.find("@by user").unwrap();
+        let analyzer_a = formatted.find("@by \"a\"").unwrap();
+        let analyzer_z = formatted.find("@by \"z\"").unwrap();
+        let ai = formatted.find("@by \"ai:sha256:a\"").unwrap();
+        let user = formatted.find("@by \"user\"").unwrap();
         assert!(analyzer_a < analyzer_z, "{formatted}");
         assert!(analyzer_z < ai, "{formatted}");
         assert!(ai < user, "{formatted}");
@@ -550,7 +540,7 @@ mod tests {
 
     #[test]
     fn every_comment_survives_a_round_trip() {
-        let source = "// one\n@nost 2 // two\n\n// three\n@link \"./a\"\n\n\
+        let source = "// one\n@nost 3 // two\n\n// three\n@link \"./a\"\n\n\
             // four\nnode n: L { // five\n k: 1, // six\n // seven\n}\n\n// eight\n";
         let parsed = parse(source).unwrap();
         let before = parsed.all_comments().len();
@@ -564,7 +554,7 @@ mod tests {
 
     #[test]
     fn a_comment_inside_a_contribution_survives() {
-        let source = "@nost 2\nnode n: L {\n @by user { // owner\n  // inside\n }\n}\n";
+        let source = "@nost 3\nnode n: L {\n @by \"user\" { // owner\n  // inside\n }\n}\n";
         let parsed = parse(source).unwrap();
         assert_eq!(parsed.all_comments().len(), 2);
         let formatted = format(&parsed);
@@ -575,7 +565,7 @@ mod tests {
 
     #[test]
     fn a_number_is_normalized_when_it_can_be_read() {
-        let formatted = round_trip("@nost 2\nnode a: L {\n i: 007,\n f: 2E+1,\n}\n");
+        let formatted = round_trip("@nost 3\nnode a: L {\n i: 007,\n f: 2E+1,\n}\n");
         assert!(formatted.contains("i: 7"), "{formatted}");
         assert!(formatted.contains("f: 20.0"), "{formatted}");
     }
@@ -584,21 +574,21 @@ mod tests {
     fn an_unreadable_number_is_left_exactly_as_written() {
         // An out-of-range integer is a semantic diagnostic, so the formatter must not
         // silently alter the text a diagnostic will quote.
-        let formatted = round_trip("@nost 2\nnode a: L {\n i: 9223372036854775808,\n}\n");
+        let formatted = round_trip("@nost 3\nnode a: L {\n i: 9223372036854775808,\n}\n");
         assert!(formatted.contains("i: 9223372036854775808"), "{formatted}");
     }
 
     #[test]
     fn bytes_digits_are_lower_cased_and_strings_are_re_escaped() {
         let formatted =
-            round_trip("@nost 2\nnode a: L {\n b: bytes\"DEADbeef\",\n s: \"tab\\there\",\n}\n");
+            round_trip("@nost 3\nnode a: L {\n b: bytes\"DEADbeef\",\n s: \"tab\\there\",\n}\n");
         assert!(formatted.contains("bytes\"deadbeef\""), "{formatted}");
         assert!(formatted.contains("\"tab\\there\""), "{formatted}");
     }
 
     #[test]
     fn the_file_ends_with_exactly_one_newline() {
-        for source in ["@nost 2\n", "@nost 2\nnode a: L {}\n"] {
+        for source in ["@nost 3\n", "@nost 3\nnode a: L {}\n"] {
             let formatted = round_trip(source);
             assert!(formatted.ends_with('\n'));
             assert!(!formatted.ends_with("\n\n"), "{formatted:?}");

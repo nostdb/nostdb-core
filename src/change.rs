@@ -406,10 +406,7 @@ mod tests {
     }
 
     fn analyzer() -> Owner {
-        Owner::Analyzer {
-            name: text("rust-structural"),
-            version: text("0.1.0"),
-        }
+        Owner::new(text("rust-structural"))
     }
 
     fn evidence() -> Evidence {
@@ -495,7 +492,7 @@ mod tests {
                 .contains(&ChangeSetError::MissingEvidence { index: 0 })
         );
 
-        let user_set = set(Owner::User, vec![GraphOperation::UpsertNode(draft)]);
+        let user_set = set(Owner::user(), vec![GraphOperation::UpsertNode(draft)]);
         assert_eq!(user_set.validate(), Ok(()));
     }
 
@@ -576,10 +573,7 @@ mod tests {
 
     #[test]
     fn a_set_may_only_remove_contributions_it_owns() {
-        let other = Owner::Analyzer {
-            name: text("other-analyzer"),
-            version: text("1.0.0"),
-        };
+        let other = Owner::new(text("other-analyzer"));
         let change = set(
             analyzer(),
             vec![GraphOperation::RemoveContribution(ContributionKey {
@@ -640,7 +634,7 @@ mod tests {
 
     #[test]
     fn push_appends_in_order() {
-        let mut change = GraphChangeSet::new(Owner::User, text("snapshot-1"), 0);
+        let mut change = GraphChangeSet::new(Owner::user(), text("snapshot-1"), 0);
         change.push(GraphOperation::UpsertNode(node_draft(None, vec!["A"])));
         change.push(GraphOperation::RemoveLink(
             CanonicalSourceLocator::new("./gone").unwrap(),

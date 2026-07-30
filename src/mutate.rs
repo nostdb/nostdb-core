@@ -3,7 +3,7 @@
 //! # What a Cypher write owns
 //!
 //! A write made through the query language is user-owned. It adds or updates a
-//! [`Owner::User`] contribution and leaves every other contribution in place, so refreshing
+//! [`Owner::user()`] contribution and leaves every other contribution in place, so refreshing
 //! an analyzer later still replaces only that analyzer's work. Nothing here can produce an
 //! analyzer-owned or AI-owned contribution, which is why the ownership separation the root
 //! product contract requires cannot be broken by a query.
@@ -96,7 +96,7 @@ fn invalid_name(what: &str, value: &str, error: NameError, range: SourceRange) -
 /// The contribution a query-authored record carries.
 fn user_contribution() -> Contribution {
     Contribution {
-        owner: Owner::User,
+        owner: Owner::user(),
         source_unit: SourceUnitId::QUERY,
         evidence: Vec::new(),
     }
@@ -109,7 +109,7 @@ fn user_contribution() -> Contribution {
 fn note_user_ownership(contributions: &mut Vec<Contribution>) {
     let already = contributions
         .iter()
-        .any(|contribution| contribution.owner == Owner::User);
+        .any(|contribution| contribution.owner == Owner::user());
     if !already {
         contributions.push(user_contribution());
     }

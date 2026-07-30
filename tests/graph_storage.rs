@@ -42,7 +42,7 @@ impl Drop for TempDir {
 
 fn user_contribution() -> Contribution {
     Contribution {
-        owner: Owner::User,
+        owner: Owner::user(),
         source_unit: SourceUnitId::from_bytes([1; 16]),
         evidence: Vec::new(),
     }
@@ -207,7 +207,7 @@ fn a_nost_document_survives_a_trip_through_a_real_database_file() {
     // it to a real file, reopen that file, and write the document back out.
     use nostdb_core::nost::{format, from_graph, parse, to_graph};
 
-    let source = "@nost 2\n\
+    let source = "@nost 3\n\
         \n\
         @link \"./packages/child\"\n\
         @link \"./packages/shared\" as shared\n\
@@ -224,19 +224,20 @@ fn a_nost_document_survives_a_trip_through_a_real_database_file() {
         \x20 aliases: [\"signin\"],\n\
         \x20 labels: [\"Public\"],\n\
         \n\
-        \x20 @by analyzer \"rust-structural\" \"0.1.0\" \
+        \x20 @by \"rust-structural\" \
         unit \"u_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\" {\n\
         \x20   @evidence {\n\
         \x20     source: \"./\",\n\
         \x20     path: \"src/auth.rs\",\n\
         \x20     digest: \"sha256:cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30\",\n\
         \x20     range: \"12:1:340-40:2:1180\",\n\
+        \x20     producer_version: \"1\",\n\
         \x20     method: deterministic,\n\
         \x20     confidence: extracted,\n\
         \x20   }\n\
         \x20 }\n\
         \n\
-        \x20 @by user {}\n\
+        \x20 @by \"user\" {}\n\
         }\n\
         \n\
         node primary: Function {\n\
@@ -271,8 +272,8 @@ fn a_nost_document_survives_a_trip_through_a_real_database_file() {
     // be free to replace what a person wrote by hand.
     let contributions = &stored.nodes[0].contributions;
     assert_eq!(contributions.len(), 2);
-    assert!(matches!(contributions[0].owner, Owner::Analyzer { .. }));
-    assert_eq!(contributions[1].owner, Owner::User);
+    assert!(contributions[0].owner.kind() == nostdb_core::contribution::OwnerKind::Analyzer);
+    assert_eq!(contributions[1].owner, Owner::user());
     assert_eq!(
         contributions[0].evidence[0].producer.as_str(),
         "rust-structural"

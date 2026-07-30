@@ -134,9 +134,14 @@ pub struct Spanned<T> {
 
 /// The language version this build reads and writes.
 ///
-/// Version 1 is refused rather than parsed best-effort, because it required a module
-/// declaration version 2 has no production for.
-pub const LANGUAGE_VERSION: u32 = 2;
+/// Exactly one, and an earlier one is refused rather than parsed best-effort. Version 1 required a module
+/// declaration later versions have no production for; version 2 wrote a contribution's owner as one of three
+/// keyword forms, and version 3 writes it as one string with no reader left for the others.
+///
+/// Refusing at the header is the point. A version 2 document reaching a version 3 parser would otherwise fail
+/// at `@by` with a parse error, which reads as a malformed document rather than as one written to a contract
+/// this build no longer implements.
+pub const LANGUAGE_VERSION: u32 = 3;
 
 /// A parsed `.nost` file.
 #[derive(Clone, Debug, PartialEq)]
@@ -340,45 +345,36 @@ pub struct ContributionBlock {
 
 /// Who produced a contribution, as written.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum OwnerDeclaration {
-    /// `analyzer "<name>" "<version>"`
-    Analyzer {
-        /// The analyzer name.
-        name: Spanned<String>,
-        /// The analyzer version, which is part of its identity.
-        version: Spanned<String>,
-    },
-    /// `ai "<contract-digest>"`
-    Ai {
-        /// Digest of the analysis contract the run used.
-        contract_digest: Spanned<String>,
-    },
-    /// `user`
-    User {
-        /// Where the keyword appeared.
-        range: SourceRange,
-    },
+pub struct OwnerDeclaration {
+    /// The owner name, whose kind follows from it.
+    pub name: Spanned<String>,
 }
 
 impl OwnerDeclaration {
-    /// The keyword this owner is written with.
+    /// The owner category this declaration names.
+    ///
+    /// Read from the name, exactly as [`crate::contribution::Owner::kind`] reads it — `user` is the user, an
+    /// `ai:` prefix is AI analysis, and anything else is an analyzer.
+    ///
+    /// Held here so the validator and the converter cannot disagree about what `@by "user"` means. They did:
+    /// the validator matched on a keyword variant and required evidence of every contribution not written with
+    /// the `user` keyword, which made a document spelling the user as a name invalid.
     #[must_use]
-    pub const fn keyword(&self) -> &'static str {
-        match self {
-            Self::Analyzer { .. } => "analyzer",
-            Self::Ai { .. } => "ai",
-            Self::User { .. } => "user",
+    pub fn kind(&self) -> crate::contribution::OwnerKind {
+        use crate::contribution::{AI_PREFIX, OwnerKind, RESERVED_USER};
+        if self.name.value == RESERVED_USER {
+            OwnerKind::User
+        } else if self.name.value.starts_with(AI_PREFIX) {
+            OwnerKind::AiAnalysis
+        } else {
+            OwnerKind::Analyzer
         }
     }
 
     /// Where the owner was written.
     #[must_use]
     pub const fn range(&self) -> SourceRange {
-        match self {
-            Self::Analyzer { name, .. } => name.range,
-            Self::Ai { contract_digest } => contract_digest.range,
-            Self::User { range } => *range,
-        }
+        self.name.range
     }
 }
 

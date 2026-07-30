@@ -30,17 +30,23 @@ use std::fmt;
 /// CRLF translation during transfer.
 pub const MAGIC: [u8; 8] = [0x4E, 0x4F, 0x53, 0x54, 0x44, 0x42, 0x1A, 0x0A];
 
-/// Header length in format version 1.
+/// Header length, unchanged across every format version this build has written.
 pub const HEADER_LENGTH: u64 = 48;
 
 /// Length of one section table entry.
 pub const SECTION_ENTRY_LENGTH: u64 = 32;
 
 /// Format versions this build reads and writes.
-pub const SUPPORTED_FORMAT_VERSIONS: [u32; 1] = [1];
+///
+/// Version 1 is **not** among them, and that is deliberate. A contribution's owner was three tagged shapes in
+/// version 1 and is one interned name in version 2, with no reader left for the earlier tags. Keeping version 1
+/// here would mean an old database decoded until it reached an owner byte and then reported an unknown tag,
+/// which is what a corrupt file reports. Refusing it at the header instead says what is true: a database to
+/// rebuild, not a database to fear.
+pub const SUPPORTED_FORMAT_VERSIONS: [u32; 1] = [2];
 
 /// The version this build writes.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Largest permitted section count.
 ///
@@ -715,14 +721,18 @@ mod tests {
 
     #[test]
     fn an_unsupported_version_is_distinguished_from_corruption() {
-        let mut bytes = built(1, &[]);
-        bytes[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        // Version 1 is the live case, not a hypothetical one: it is what every database written before an
+        // owner became one interned name declares, and there is no reader left for the owner tags it holds.
+        // Refusing it here rather than at the tag is what makes it a database to rebuild instead of one that
+        // looks corrupt.
+        let mut bytes = built(FORMAT_VERSION.into(), &[]);
+        bytes[8..12].copy_from_slice(&1_u32.to_le_bytes());
         // Repair the checksum so only the version check can fire.
         let crc = crc32c(&bytes[..HEADER_CRC_OFFSET]);
         bytes[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
         assert_eq!(
             Container::parse(&bytes),
-            Err(ContainerError::UnsupportedVersion { found: 2 })
+            Err(ContainerError::UnsupportedVersion { found: 1 })
         );
         assert_eq!(
             Container::parse(&bytes).unwrap_err().code(),

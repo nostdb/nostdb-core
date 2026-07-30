@@ -1687,7 +1687,7 @@ mod tests {
 
         let mut database = project.open_database().unwrap();
         let graph = crate::nost::to_graph(
-            &crate::nost::parse("@nost 2\nnode seed: Function {\n  name: \"seed\",\n}\n").unwrap(),
+            &crate::nost::parse("@nost 3\nnode seed: Function {\n  name: \"seed\",\n}\n").unwrap(),
         )
         .unwrap();
         crate::encoding::commit_graph(&mut database, &graph).unwrap();
@@ -1816,7 +1816,7 @@ mod tests {
 
         fs::write(
             project.nost_path(),
-            "@nost 2\nnode a: L {\n  id: \"n_1\",\n}\n",
+            "@nost 3\nnode a: L {\n  id: \"n_1\",\n}\n",
         )
         .unwrap();
         let error = project.synchronize().unwrap_err();
