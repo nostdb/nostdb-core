@@ -391,6 +391,10 @@ pub fn encode_analysis(analysis: &crate::analyze::FileAnalysis) -> String {
         "artifact_version": ARTIFACT_VERSION,
         "language": analysis.language,
         "digest": analysis.digest.as_str(),
+        // Round-trips for the reason annotations do: a cached parse is read back as though the analyzer had
+        // just produced it, and a package missing from the artifact would make the same file resolve its
+        // imports one way on a first build and another way on the second.
+        "package": analysis.package,
         "items": analysis.items.iter().map(encode_item).collect::<Vec<_>>(),
         "imports": analysis.imports.iter().map(|import| serde_json::json!({
             "path": import.path,
@@ -442,6 +446,14 @@ pub fn decode_analysis(text: &str) -> Option<crate::analyze::FileAnalysis> {
     Some(crate::analyze::FileAnalysis {
         language: document.get("language")?.as_str()?.to_owned(),
         digest: ContentDigest::new(document.get("digest")?.as_str()?).ok()?,
+        // Absent reads as `None`, like `alias` below, because most languages declare no package and writing
+        // the key as null for all of them would say nothing. An artifact written before the key existed is
+        // not reachable through leniency either way: the analyzer version and the graph schema version are
+        // both part of the key, and both moved when this field arrived.
+        package: document
+            .get("package")
+            .and_then(|held| held.as_str())
+            .map(str::to_owned),
         items: document
             .get("items")?
             .as_array()?
@@ -841,18 +853,24 @@ mod tests {
     }
 
     #[test]
-    fn a_new_analyzer_version_never_reads_the_previous_ones_work_back() {
-        let dir = TempDir::new("analyzer-version");
+    fn one_analyzer_never_reads_anothers_work_back() {
+        // No builtin analyzer declares a version any more, so the identity this guards is the analyzer
+        // itself rather than a newer revision of one: `build::parse_cache_key` writes the language here, and
+        // a Kotlin parse handed to whichever reader asked for Rust would be facts nothing produced.
+        //
+        // What replaced the version half is `graph_schema_version`, a separate component of the same key,
+        // covered by the test above.
+        let dir = TempDir::new("analyzer-identity");
         let cache = ParseCache::new(CacheLayout::none().with_project(&dir.0));
         cache.put(&parse_key(), &analysis()).expect("it stores");
 
-        let upgraded = StructuralParseCacheKey {
-            analyzer_digest: "rust/2".to_owned(),
+        let another = StructuralParseCacheKey {
+            analyzer_digest: "kotlin".to_owned(),
             ..parse_key()
         };
         assert!(
-            cache.get(&upgraded).is_none(),
-            "an analyzer that reads differently must not adopt facts it did not produce"
+            cache.get(&another).is_none(),
+            "an analyzer must not adopt facts it did not produce"
         );
     }
 

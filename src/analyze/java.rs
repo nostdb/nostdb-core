@@ -12,7 +12,7 @@
 //!
 //! | Written | Recorded as |
 //! | --- | --- |
-//! | `package a.b;` | consumed, and not recorded — see below |
+//! | `package a.b;` | the file's package, on the file and on no qualified name — see below |
 //! | `import a.b.C;`, `import static a.b.C.d;`, `import a.b.*;` | an import |
 //! | `class`, `record` | [`ItemKind::Struct`] |
 //! | `interface`, `@interface` | [`ItemKind::Trait`] |
@@ -38,11 +38,15 @@
 //! cannot tell which name is a class, so claiming one would be a guess. Every supertype is a reference,
 //! which is what Kotlin's analyzer concluded from the same problem.
 //!
-//! # Why the package is consumed rather than recorded
+//! # Why the package is recorded on the file and on nothing else
 //!
-//! For the reason Kotlin's is: a qualified name is an identity, and putting the package on one would
-//! retire and re-mint every record in every existing database. Unlike Kotlin's, this file does not claim
-//! otherwise — the row above says consumed.
+//! The objection that kept it out stands: a qualified name is an identity, and putting the package on one
+//! would retire and re-mint every record in every existing database. So it goes nowhere near an item. It is
+//! recorded on the **file**, where it names no record and changes no identity.
+//!
+//! It is recorded at all because an import names a declaration, and the resolver had nothing else to match
+//! one against but a file name. Java's file names are constrained enough for that to have worked here;
+//! Kotlin's are not, and both languages are resolved by the same rule.
 
 use super::java_lexer::{Delimiter, Spanned, Token, tokenize};
 use super::{Annotation, FileAnalysis, Import, Item, ItemKind, Reference};
@@ -52,9 +56,6 @@ use crate::text::NonEmptyText;
 
 /// The language this analyzer reads.
 pub const LANGUAGE: &str = "java";
-
-/// This analyzer's version, which is part of its identity for ownership purposes.
-pub const VERSION: &str = "1";
 
 /// How precisely it reads.
 pub const PRECISION: PrecisionClass = PrecisionClass::DeterministicSyntactic;
@@ -79,7 +80,6 @@ pub fn capability() -> AnalyzerCapability {
             FactKind::SourceRange,
             FactKind::ContentHash,
         ],
-        version: NonEmptyText::new(VERSION).unwrap_or_else(|_| NonEmptyText::literal("1")),
     }
 }
 
@@ -93,12 +93,14 @@ pub fn analyze(source: &str) -> FileAnalysis {
     let mut reader = Reader {
         tokens: &tokens,
         at: 0,
+        package: None,
         imports: Vec::new(),
     };
     let items = reader.declarations(None);
     FileAnalysis {
         language: LANGUAGE.to_owned(),
         digest: crate::sync::digest_bytes(source.as_bytes()),
+        package: reader.package,
         items,
         imports: reader.imports,
     }
@@ -130,6 +132,7 @@ const TYPE_KEYWORDS: [&str; 4] = ["class", "enum", "interface", "record"];
 struct Reader<'a> {
     tokens: &'a [Spanned],
     at: usize,
+    package: Option<String>,
     imports: Vec<Import>,
 }
 
@@ -212,10 +215,15 @@ impl Reader<'_> {
             }
             match self.name_here() {
                 Some("package") => {
-                    // The package a file joins, not a declaration in it. Consumed so its dots do not
-                    // read as anything else.
+                    // The package a file joins, not a declaration in it — so it is recorded on the file
+                    // and never on an item, for the reason the module documentation gives. Kept rather
+                    // than dropped because an import names a declaration, and the resolver had nothing
+                    // else to match one against but a file name.
                     self.advance();
-                    self.qualified_name();
+                    let found = self.qualified_name();
+                    if self.package.is_none() && !found.is_empty() {
+                        self.package = Some(found);
+                    }
                     self.skip_statement_end();
                 }
                 Some("import") => self.import(),
@@ -891,12 +899,22 @@ mod tests {
     }
 
     #[test]
-    fn the_package_is_consumed_and_is_not_a_declaration() {
-        // Kotlin's analyzer documents putting the package on every qualified name and does not. This one
-        // says consumed, and this test is what keeps the statement true.
+    fn the_package_is_recorded_on_the_file_and_is_not_a_declaration() {
+        // Both halves matter. It is held, because an import names a declaration and the resolver has
+        // nothing else to match one against. And it is on the file only: `A` stays `A`, because a qualified
+        // name is an identity and moving the package into one would re-mint every record in every database.
         let found = analyze("package com.demo.app;\nclass A { }\n");
+        assert_eq!(found.package.as_deref(), Some("com.demo.app"));
         assert_eq!(names("package com.demo.app;\nclass A { }\n"), ["A"]);
         assert!(found.imports.is_empty());
+    }
+
+    #[test]
+    fn a_file_declaring_no_package_says_absent_rather_than_empty() {
+        // Absent is what the resolver reads to fall back to matching paths, so an empty string in its place
+        // would claim a package named "" and route the file's imports through a rule that cannot answer them.
+        let found = analyze("class A { }\n");
+        assert_eq!(found.package, None);
     }
 
     #[test]

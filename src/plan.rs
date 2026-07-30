@@ -438,7 +438,6 @@ mod tests {
                 language: NonEmptyText::new(language).unwrap(),
                 precision,
                 facts: vec![FactKind::Function],
-                version: NonEmptyText::new("1").unwrap(),
             })
             .expect("a valid capability");
         registry

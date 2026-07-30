@@ -53,17 +53,14 @@ pub const LANGUAGE: &str = "typescript";
 /// The language this analyzer reads when the source is JavaScript.
 pub const JAVASCRIPT: &str = "javascript";
 
-/// This analyzer's version, which is part of its identity for ownership purposes.
-pub const VERSION: &str = "1";
-
 /// How precisely it reads.
 pub const PRECISION: PrecisionClass = PrecisionClass::DeterministicSyntactic;
 
 /// What this analyzer declares it extracts, for one of the two languages it reads.
 ///
 /// Two capabilities rather than one, because a capability is keyed by language and a caller asking about
-/// `javascript` must get an answer. They declare the same facts and carry the same version, which is the
-/// truth: it is one analyzer.
+/// `javascript` must get an answer. They declare the same facts and the same precision, which is the truth:
+/// it is one analyzer.
 #[must_use]
 pub fn capability_for(language: &str) -> AnalyzerCapability {
     AnalyzerCapability {
@@ -86,7 +83,6 @@ pub fn capability_for(language: &str) -> AnalyzerCapability {
             FactKind::SourceRange,
             FactKind::ContentHash,
         ],
-        version: NonEmptyText::new(VERSION).unwrap_or_else(|_| NonEmptyText::literal("1")),
     }
 }
 
@@ -108,6 +104,9 @@ pub fn analyze_as(language: &str, source: &str) -> FileAnalysis {
     FileAnalysis {
         language: language.to_owned(),
         digest: crate::sync::digest_bytes(source.as_bytes()),
+        // TypeScript and JavaScript declare no package. An import here is a filesystem path, which is
+        // resolved as one.
+        package: None,
         items,
         imports: reader.imports,
     }
@@ -1333,11 +1332,10 @@ mod tests {
     }
 
     #[test]
-    fn both_languages_declare_the_same_capability_and_version() {
+    fn both_languages_declare_the_same_capability() {
         let typescript = capability_for(LANGUAGE);
         let javascript = capability_for(JAVASCRIPT);
         assert_eq!(typescript.facts, javascript.facts);
-        assert_eq!(typescript.version, javascript.version);
         assert_eq!(typescript.precision, javascript.precision);
         assert_eq!(javascript.language.as_str(), "javascript");
         // Declared and produced, each with a test above.

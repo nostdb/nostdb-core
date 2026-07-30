@@ -125,6 +125,15 @@ impl fmt::Display for FactKind {
 }
 
 /// What one analyzer declares about one language.
+///
+/// Coverage and precision, and deliberately **not** attribution. There is no version here: which named
+/// reader among this build's own deterministic analyzers produced a record is not something a query can act
+/// on, and what a reader does act on is [`PrecisionClass`], `EvidenceMethod`, and `Confidence`. Versioning
+/// what a build asserts about a file is one number — [`crate::build::GRAPH_SCHEMA_VERSION`] — rather than one
+/// per analyzer.
+///
+/// This says nothing about `Owner::Analyzer`, whose version *is* part of a contribution's identity, is
+/// declared in `nostdb-spec`, and is required grammar in `.nost`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnalyzerCapability {
     /// The language, as a free string. There is no closed list.
@@ -133,8 +142,6 @@ pub struct AnalyzerCapability {
     pub precision: PrecisionClass,
     /// What it extracts.
     pub facts: Vec<FactKind>,
-    /// Analyzer version, which is part of its identity for ownership purposes.
-    pub version: NonEmptyText,
 }
 
 impl AnalyzerCapability {
@@ -285,7 +292,6 @@ mod tests {
             language: text(language),
             precision,
             facts: vec![FactKind::Function, FactKind::Call, FactKind::SourceRange],
-            version: text("0.1.0"),
         }
     }
 

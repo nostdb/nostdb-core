@@ -58,9 +58,6 @@ pub const CPP: &str = "cpp";
 /// capability is registered under a name a report can name rather than being folded into `cpp`.
 pub const OBJCPP: &str = "objcpp";
 
-/// This analyzer's version, which is part of its identity for ownership purposes.
-pub const VERSION: &str = "1";
-
 /// How precisely it reads.
 pub const PRECISION: PrecisionClass = PrecisionClass::DeterministicSyntactic;
 
@@ -86,7 +83,6 @@ pub fn capability_for(language: &str) -> AnalyzerCapability {
             FactKind::SourceRange,
             FactKind::ContentHash,
         ],
-        version: NonEmptyText::new(VERSION).unwrap_or_else(|_| NonEmptyText::literal("1")),
     }
 }
 
@@ -105,6 +101,9 @@ pub fn analyze_as(language: &str, source: &str) -> FileAnalysis {
     FileAnalysis {
         language: language.to_owned(),
         digest: crate::sync::digest_bytes(source.as_bytes()),
+        // C and C++ declare no package. An `#include` names a path and is resolved as one; a C++ namespace
+        // is a declaration rather than a file-level fact.
+        package: None,
         items,
         imports: reader.imports,
     }
@@ -1109,11 +1108,10 @@ mod tests {
     }
 
     #[test]
-    fn every_language_declares_the_same_capability_and_version() {
+    fn every_language_declares_the_same_capability() {
         let c = capability_for(LANGUAGE);
         let cpp = capability_for(CPP);
         assert_eq!(c.facts, cpp.facts);
-        assert_eq!(c.version, cpp.version);
         for fact in [
             FactKind::Method,
             FactKind::Field,

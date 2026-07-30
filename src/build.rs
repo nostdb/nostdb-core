@@ -117,21 +117,31 @@ pub const FOR_TYPE: &str = "FOR_TYPE";
 /// answer it. What it can state exactly is which file in this project the path names.
 pub const IMPORTS: &str = "IMPORTS";
 
-/// Version of the record shape this module produces.
+/// Version of what this module asserts about a file.
 ///
 /// Part of every parse cache key, so changing a label, a property, or a relation makes
 /// every stored artifact miss instead of being read back into a shape that no longer
 /// matches. Bump it whenever what a build asserts about a file changes.
+///
+/// **It is now the only such number, which widens what "changes" means.** No analyzer declares a version, so
+/// a change to one language's reader is no longer invalidated by that reader's own constant — this is what has
+/// to move for it, even when every label and property stays identical. A parser that starts recording a
+/// declaration it used to skip changes what a build asserts, and a warm cache will serve the old answer until
+/// this moves.
+///
+/// Coarser than a version per analyzer, deliberately: one hand-maintained number is one thing to forget
+/// rather than two. The trade is recorded in Stage 22.
 ///
 /// It is also recorded on every file node, and reuse requires the stored value to match. Without
 /// that, a database written by an earlier shape keeps it forever: reuse compares digests, an
 /// unchanged tree is never read, and so nothing would ever rewrite records that predate a new
 /// property. A version bump is the migration — the next build redraws what it holds.
 ///
-/// 3 because a second analyzer arrived. A Kotlin file used to assert only that it existed and now
-/// asserts what is declared in it, so a database built before it holds Kotlin records this build
-/// would not write. Reuse would keep them: the bytes did not change.
-pub const GRAPH_SCHEMA_VERSION: u32 = 8;
+/// 9 because a file node now carries the package it declares, and because a qualified import is resolved
+/// against what a file declares rather than against what it is named. A database built before this holds
+/// `IMPORTS` edges the current rule would not draw — and is missing ones it would — and reuse would keep
+/// them, because the bytes did not change.
+pub const GRAPH_SCHEMA_VERSION: u32 = 9;
 
 /// The label a kind of item carries.
 #[must_use]
@@ -287,6 +297,8 @@ impl Unit {
             analysis: FileAnalysis {
                 language: file.language.clone(),
                 digest: file.digest.clone(),
+                // Nothing read this file, so it declares nothing — including no package.
+                package: None,
                 items: Vec::new(),
                 imports: Vec::new(),
             },
@@ -490,20 +502,27 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
     // Pass three: the drafts themselves, now that every identifier is known.
     for (index, held) in units.iter().enumerate() {
         let file_id = file_nodes[index].1;
+        let mut properties = vec![
+            text_property("path", &held.path),
+            text_property("language", &held.analysis.language),
+            text_property("digest", held.analysis.digest.as_str()),
+            // What a reader may conclude from this record, per section 17.3's requirement
+            // that results not imply equal confidence for every language. `unsupported`
+            // says the file is here and nothing read it, which is a different claim from
+            // an analyzer having found no items in it.
+            text_property("precision", &precision_of(registry, held).to_string()),
+            integer_property("schema_version", i64::from(GRAPH_SCHEMA_VERSION)),
+        ];
+        // Written only when the file declared one, because absent and empty are different answers: a Rust
+        // file has no package to name, and a Kotlin file in the default package wrote none. An empty string
+        // would make the two indistinguishable and would claim a package named "".
+        if let Some(package) = &held.analysis.package {
+            properties.push(text_property("package", package));
+        }
         change_set.push(GraphOperation::UpsertNode(NodeDraft {
             id: Some(file_id),
             labels: vec![label(FILE_LABEL)],
-            properties: vec![
-                text_property("path", &held.path),
-                text_property("language", &held.analysis.language),
-                text_property("digest", held.analysis.digest.as_str()),
-                // What a reader may conclude from this record, per section 17.3's requirement
-                // that results not imply equal confidence for every language. `unsupported`
-                // says the file is here and nothing read it, which is a different claim from
-                // an analyzer having found no items in it.
-                text_property("precision", &precision_of(registry, held).to_string()),
-                integer_property("schema_version", i64::from(GRAPH_SCHEMA_VERSION)),
-            ],
+            properties,
             source_unit: held.unit,
             evidence: vec![file_evidence(&locator, held)],
         }));
@@ -719,17 +738,24 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
     // and neither produced. `analysis.imports` was read only by the parse cache and by Spring's
     // recognition check, so no import has ever reached the graph.
     //
-    // Resolved by **path correspondence**, not by name. `a.b.C` names `…/a/b/C.<ext>`, so an import is
-    // matched against the paths this build actually scanned. That is what makes it exact: the module
-    // documentation above explains why an unresolved *call* must not become a Placeholder, and an import
-    // is the stronger case, because most imports in any real file name a dependency. This file's own
-    // reported repository imports `org.springframework.boot.runApplication`, and nothing in the project
-    // declares it.
+    // Resolved by one of two rules, chosen by whether the importing file declared a package:
     //
-    // Matching by last segment instead would have been cheaper and wrong: `import java.util.List` in a
-    // project that declares exactly one `List` would resolve to it, and the graph would assert that a
-    // file imports a class it does not import. A suffix of a real path cannot be produced by an import
-    // that names something outside the project.
+    // - **by declared name**, where it did. `com.demo.app.Payload` is answered by the file declaring
+    //   `Payload` in package `com.demo.app`, whatever that file is called. This is the only sound rule for
+    //   Kotlin, which does not require a declaration to sit in a file of its own name;
+    // - **by path correspondence**, where it did not. `a::b` names `…/a/b.<ext>`, so the import is matched
+    //   against the paths this build actually scanned.
+    //
+    // Either way it is exact, never a guess: the module documentation above explains why an unresolved
+    // *call* must not become a Placeholder, and an import is the stronger case, because most imports in any
+    // real file name a dependency. This file's own reported repository imports
+    // `org.springframework.boot.runApplication`, and nothing in the project declares it.
+    //
+    // Matching by last segment would be cheaper and wrong under either rule: `import java.util.List` in a
+    // project that declares exactly one `List` would resolve to it, and the graph would assert that a file
+    // imports a class it does not import. Resolving a *package-qualified* name is what rules that out
+    // exactly, rather than relying on a path suffix being hard to produce by accident.
+    //
     // Counted with every other reference, because an import is one: a name in one file that either
     // matches a record in this build or names something outside it.
     let mut resolved = 0_u64;
@@ -753,11 +779,50 @@ pub fn draft(request: &BuildRequest<'_>, minter: &mut Minter) -> BuildDraft {
         .collect();
     let mut assets: BTreeMap<String, LocalNodeId> = BTreeMap::new();
 
+    // Every declaration this build makes available under a package, mapped to the file declaring it.
+    //
+    // This is what a dotted import is matched against, and it exists because a file name cannot answer one.
+    // Kotlin does not require `class Payload` to be declared in `Payload.kt`, so a path match either misses
+    // the declaration or attaches the import to whatever file happens to carry the name — and the second is
+    // the graph asserting an import of something a file does not declare, which is the error the
+    // last-segment rule was rejected for.
+    //
+    // Top-level declarations only. An import naming a nested type is answered by walking back to the outer
+    // one, which is in here.
+    //
+    // `None` marks a name two files declare, for the reason [`only_match`] gives: neither is the answer. Two
+    // declarations of one name in the *same* file — overloads — are not a collision and stay resolvable.
+    let mut by_declared_name: BTreeMap<String, Option<LocalNodeId>> = BTreeMap::new();
+    for (index, held) in units.iter().enumerate() {
+        let Some(package) = &held.analysis.package else {
+            continue;
+        };
+        let file_id = file_nodes[index].1;
+        for item in &held.analysis.items {
+            by_declared_name
+                .entry(format!("{package}.{}", item.name))
+                .and_modify(|found| {
+                    if *found != Some(file_id) {
+                        *found = None;
+                    }
+                })
+                .or_insert(Some(file_id));
+        }
+    }
+
     for (index, held) in units.iter().enumerate() {
         let from = file_nodes[index].1;
         let directory = parent_of(&held.path);
         for import in &held.analysis.imports {
-            if let Some(target) = imported_file(&import.path, &directory, &by_file_path) {
+            // A file that declared a package writes its imports as qualified names of declarations, so they
+            // are resolved as that and not as paths. There is deliberately no path fallback here: path
+            // correspondence is the guess being removed, and an unresolved import is the honest answer,
+            // because most imports in any real file name a dependency this build never scanned.
+            let found = match &held.analysis.package {
+                Some(_) => imported_declaration(&import.path, &by_declared_name),
+                None => imported_file(&import.path, &directory, &by_file_path),
+            };
+            if let Some(target) = found {
                 if target != from {
                     resolved += 1;
                     edges.add(from, target, IMPORTS, held.unit);
@@ -970,6 +1035,7 @@ pub fn schemas() -> Vec<crate::schema::Schema> {
     };
     let text = |key: &str| field(key, ScalarType::String, true);
     let number = |key: &str| field(key, ScalarType::Integer, true);
+    let optional_text = |key: &str| field(key, ScalarType::String, false);
     let schema = |name: &str, fields: Vec<SchemaField>| Schema {
         name: Label::new(name).unwrap_or_else(|_| Label::literal("Unknown")),
         endpoints: None,
@@ -1002,6 +1068,9 @@ pub fn schemas() -> Vec<crate::schema::Schema> {
                 text("digest"),
                 text("precision"),
                 number("schema_version"),
+                // Optional, because most languages declare no package and a file that declares none carries
+                // no such property. Required would make every Rust and TypeScript file a warning.
+                optional_text("package"),
             ],
         ),
         schema(
@@ -1066,35 +1135,33 @@ pub fn parse_cache_key(file: &crate::scan::ScannedFile) -> crate::cache::Structu
     crate::cache::StructuralParseCacheKey {
         content_digest: file.digest.clone(),
         language: file.language.clone(),
-        // The analyzer's version is part of its identity, so a new analyzer never reads an
-        // old one's work back as its own.
+        // The language alone. No analyzer declares a version to put here, so what keeps a stored parse
+        // from being read back into a shape that no longer matches is `graph_schema_version` below — the
+        // one number that has to move when what a build asserts about a file changes.
         //
-        // Named per language rather than fixed to Rust. With one analyzer the two were the same
-        // string; with two, a Kotlin parse would be stored under the Rust analyzer's identity, so
-        // bumping the Kotlin analyzer would not invalidate Kotlin parses and bumping the Rust one
-        // would invalidate them for no reason.
-        analyzer_digest: format!("{}/{}", file.language, analyzer_version(&file.language)),
+        // Still named per language rather than fixed, because two analyzers must not share one identity:
+        // a Kotlin parse stored under Rust's would be handed to whichever reader asked for it.
+        //
+        // The trade this makes is recorded in Stage 22. A change to one language's reader that leaves the
+        // record shape alone is no longer invalidated by that reader's own version, so `GRAPH_SCHEMA_VERSION`
+        // is what has to move for it — one hand-maintained number where there were two.
+        analyzer_digest: file.language.clone(),
         analyzer_config_digest: "default".to_owned(),
         graph_schema_version: GRAPH_SCHEMA_VERSION,
     }
 }
 
-/// The version the analyzer for a language declares, or `"0"` when nothing analyzes it.
+/// The version a structural record's evidence names as its producer's.
 ///
-/// Read from the declared capability rather than from a constant, because the capability is where an
-/// analyzer states its version and a second copy of it is a second answer. `"0"` for an unanalyzed
-/// language is deliberate: a recorded file's provenance is the scan's, so nothing reaches this with a
-/// language no analyzer covers, and a value that could not belong to a real analyzer makes a mistake
-/// visible instead of plausible.
-fn analyzer_version(language: &str) -> String {
-    crate::analyze::builtin_registry()
-        .ok()
-        .and_then(|registry| {
-            registry
-                .capability(language)
-                .map(|found| found.version.as_str().to_owned())
-        })
-        .unwrap_or_else(|| "0".to_owned())
+/// [`GRAPH_SCHEMA_VERSION`], because that is the number tracking what a build asserts about a file. It
+/// replaced a per-analyzer version that this read from the declared capability, and section 11.4 still
+/// requires `producer_version` to carry something — attribution stopped being versioned, provenance did not
+/// stop being required.
+///
+/// One number rather than one per language, which is the trade recorded in Stage 22: a change to a single
+/// language's reader is no longer invalidated by that reader's own version, so this is what has to move.
+fn producer_version_of_a_build() -> String {
+    GRAPH_SCHEMA_VERSION.to_string()
 }
 
 /// The owner every record this module produces belongs to.
@@ -1115,21 +1182,42 @@ fn analyzer_version(language: &str) -> String {
 #[must_use]
 pub fn analyzer_owner() -> Owner {
     Owner::Analyzer {
-        name: NonEmptyText::new(crate::analyze::rust::LANGUAGE)
-            .unwrap_or_else(|_| NonEmptyText::literal("rust")),
-        version: NonEmptyText::new(crate::analyze::rust::VERSION)
-            .unwrap_or_else(|_| NonEmptyText::literal("1")),
+        name: NonEmptyText::new(OWNER_NAME).unwrap_or_else(|_| NonEmptyText::literal("rust")),
+        version: NonEmptyText::new(OWNER_VERSION).unwrap_or_else(|_| NonEmptyText::literal("1")),
     }
 }
 
+/// The name half of [`analyzer_owner`], frozen.
+///
+/// It read `rust::LANGUAGE` when Rust was the only analyzer, and it is a literal now that no analyzer
+/// declares a version to borrow. The value must not move for the reason above.
+const OWNER_NAME: &str = "rust";
+
+/// The version half of [`analyzer_owner`], frozen at what every existing database already holds.
+///
+/// **Not an analyzer's version.** No analyzer declares one — `AnalyzerCapability` carries no version, because
+/// which reader produced a record is not something a query acts on. This is one half of a contribution's
+/// owner, which `nostdb-spec` declares and `.nost` requires as grammar, and it is a constant here precisely
+/// so that removing analyzer versions could not move it.
+///
+/// Moving it would leave every record an earlier build wrote owned by a name nothing can withdraw. That is
+/// the hazard [`analyzer_owner`] documents, and the test pinning this value is what keeps it from happening
+/// by accident.
+const OWNER_VERSION: &str = "1";
+
 /// The file in this build that an import path names, when exactly one does.
+///
+/// Reached by a file that declared **no package**. One that did names declarations rather than locations,
+/// and [`imported_declaration`] answers it — Java and Kotlin no longer arrive here, because a Kotlin file
+/// name is not required to agree with anything declared in it and matching a path was therefore a guess.
 ///
 /// Two shapes of import reach here, and conflating them was a real defect:
 ///
-/// - **a dotted or `::` module name**, which Java, Kotlin, and Rust write. `a.b.C` is `.../a/b/C.kt`, so
-///   the separator is normalized and the result matched as a suffix of a scanned path;
-/// - **a filesystem path**, which TypeScript and JavaScript write. `./assets/logo.png` is already a path,
-///   relative to the importing file's own directory. Normalizing its dots would turn it into
+/// - **a dotted or `::` module name**, which Rust writes and which Python's dotted form matches, because
+///   there a package *is* a directory. `a::b` is `.../a/b.rs`, so the separator is normalized and the result
+///   matched as a suffix of a scanned path;
+/// - **a filesystem path**, which TypeScript, JavaScript, Go, and C write. `./assets/logo.png` is already a
+///   path, relative to the importing file's own directory. Normalizing its dots would turn it into
 ///   `//assets/logo/png`, which names nothing — and the extension is part of it, not a separator.
 ///
 /// Told apart by the leading `.` or an embedded `/`, which a dotted module name never has.
@@ -1187,6 +1275,42 @@ fn imported_file(
         }
     }
     None
+}
+
+/// The file declaring what a qualified import names, when exactly one does.
+///
+/// Written by a language that declares packages, where an import is a **declaration's** name rather than a
+/// location. `com.demo.app.Payload` is answered by the file declaring `Payload` in package `com.demo.app`,
+/// whatever that file is called.
+///
+/// Trailing segments are dropped one at a time, because an import may name something inside a declaration
+/// rather than the declaration: `a.b.Outer.Inner` is a nested type and `a.b.C.CONSTANT` is a static member,
+/// and the index holds `a.b.Outer` and `a.b.C`. The walk stops at two segments, since one segment cannot be
+/// a package and a name together.
+///
+/// Returns `None` for a name two files declare, and stops rather than shortening: the specific name was
+/// found and was ambiguous, and answering with a shorter one would be a guess.
+fn imported_declaration(
+    path: &str,
+    declared: &BTreeMap<String, Option<LocalNodeId>>,
+) -> Option<LocalNodeId> {
+    // A star import names a package, not a declaration, so nothing in this index answers it. Rejected
+    // outright rather than walked back: `a.b.*` shortened to `a.b` would resolve to a declaration called `b`
+    // in package `a`, which is a different thing that happens to share a name.
+    if path.ends_with('*') {
+        return None;
+    }
+    let mut candidate = path;
+    loop {
+        if let Some(found) = declared.get(candidate) {
+            return *found;
+        }
+        let (before, _) = candidate.rsplit_once('.')?;
+        if !before.contains('.') {
+            return None;
+        }
+        candidate = before;
+    }
 }
 
 /// The skipped path an import names, when exactly one does.
@@ -1743,7 +1867,7 @@ fn analyzed_evidence(
         range: None,
         producer: NonEmptyText::new(analysis.language.as_str())
             .unwrap_or_else(|_| NonEmptyText::literal("unknown")),
-        producer_version: NonEmptyText::new(analyzer_version(&analysis.language).as_str())
+        producer_version: NonEmptyText::new(producer_version_of_a_build().as_str())
             .unwrap_or_else(|_| NonEmptyText::literal("1")),
         method: EvidenceMethod::Deterministic,
         confidence: Confidence::Extracted,
@@ -1831,6 +1955,35 @@ mod tests {
             "an ItemKind was added without a schema: {:?}",
             super::EVERY_ITEM_KIND
         );
+    }
+
+    #[test]
+    fn the_analyzer_owner_is_frozen_at_what_existing_databases_hold() {
+        // Removing analyzer versions must not move this. `analyzer_owner` read `rust::VERSION` for its
+        // version half, and that constant is gone — so the literal is pinned here instead of being trusted
+        // to stay right by inspection.
+        //
+        // Moving either half leaves every record an earlier build wrote owned by a name nothing can
+        // withdraw: `existing_unit` stops finding them, fresh units are minted beside them, and the graph
+        // holds both readings of every file for ever. That is a defect no later change can repair, because
+        // the unreachable records are already in somebody's database.
+        let Owner::Analyzer { name, version } = analyzer_owner() else {
+            panic!("the builtin owner is an analyzer");
+        };
+        assert_eq!(name.as_str(), "rust");
+        assert_eq!(version.as_str(), "1");
+    }
+
+    #[test]
+    fn a_declared_capability_carries_coverage_and_not_attribution() {
+        // The registry answers "what is covered, and how precisely". It does not answer "which reader",
+        // because no query acts on that — and a version field invited a second migration axis beside
+        // `GRAPH_SCHEMA_VERSION` for no reader's benefit.
+        let registry = crate::analyze::builtin_registry().expect("the builtin registry");
+        let declared = registry.capability("kotlin").expect("kotlin is covered");
+        assert_eq!(declared.language.as_str(), "kotlin");
+        assert!(declared.precision.is_deterministic());
+        assert!(declared.extracts(crate::analysis::FactKind::ImportExport));
     }
 
     #[test]
@@ -2115,6 +2268,124 @@ mod tests {
         assert!(
             draft.coverage.unresolved_units >= 2,
             "both dependency imports are counted, not invented"
+        );
+    }
+
+    #[test]
+    fn a_kotlin_declaration_in_a_differently_named_file_resolves() {
+        // Kotlin does not require `class Payload` to be declared in `Payload.kt`. Resolving by path
+        // correspondence missed every declaration whose file was named for something else, silently: the
+        // import was counted unresolved and no edge was drawn.
+        let dir = TempDir::new("declared");
+        let mut service = dir.write(
+            "src/main/kotlin/com/demo/app/Service.kt",
+            "package com.demo.app\n\nimport com.demo.app.data.Payload\n\nclass Service\n",
+        );
+        service.language = "kotlin".to_owned();
+        let mut models = dir.write(
+            "src/main/kotlin/com/demo/app/data/Models.kt",
+            "package com.demo.app.data\n\nclass Payload\n\nclass Envelope\n",
+        );
+        models.language = "kotlin".to_owned();
+
+        let mut graph = Graph::default();
+        build(&dir, vec![service, models], &mut graph, 1);
+
+        assert_eq!(
+            relations(&graph, IMPORTS),
+            [(
+                "src/main/kotlin/com/demo/app/Service.kt".to_owned(),
+                "src/main/kotlin/com/demo/app/data/Models.kt".to_owned()
+            )],
+            "an import names a declaration, and the file declaring it is the answer whatever it is called"
+        );
+    }
+
+    #[test]
+    fn a_file_named_for_an_import_it_does_not_declare_gets_no_edge() {
+        // The wrong edge path correspondence drew. `Payload.kt` is exactly where the old rule looked, and
+        // what it declares is `Other` — so the graph asserted that a file imports a class the target does
+        // not declare, which is the error the last-segment rule was rejected for.
+        let dir = TempDir::new("misnamed");
+        let mut service = dir.write(
+            "src/main/kotlin/com/demo/app/Service.kt",
+            "package com.demo.app\n\nimport com.demo.app.data.Payload\n\nclass Service\n",
+        );
+        service.language = "kotlin".to_owned();
+        let mut named = dir.write(
+            "src/main/kotlin/com/demo/app/data/Payload.kt",
+            "package com.demo.app.data\n\nclass Other\n",
+        );
+        named.language = "kotlin".to_owned();
+
+        let mut graph = Graph::default();
+        let draft = build(&dir, vec![service, named], &mut graph, 1);
+
+        assert!(
+            relations(&graph, IMPORTS).is_empty(),
+            "a file named for a declaration it does not make is not the answer: {:?}",
+            relations(&graph, IMPORTS)
+        );
+        assert!(
+            draft.coverage.unresolved_units >= 1,
+            "the import is counted rather than attached to the file that shares its name"
+        );
+    }
+
+    #[test]
+    fn a_java_import_resolves_by_declaration_rather_than_by_file_name() {
+        // Java constrains a public top-level class to a file of its own name, so path correspondence
+        // agreed with the language here and resolving by declaration must keep agreeing. It also reaches
+        // what a path never could: `Helper` is a second top-level class in a file named for the first.
+        let dir = TempDir::new("java-declared");
+        let mut app = dir.write(
+            "src/main/java/com/demo/App.java",
+            "package com.demo;\n\nimport com.demo.data.Payload;\nimport com.demo.data.Helper;\n\nclass App { }\n",
+        );
+        app.language = "java".to_owned();
+        let mut payload = dir.write(
+            "src/main/java/com/demo/data/Payload.java",
+            "package com.demo.data;\n\npublic class Payload { }\n\nclass Helper { }\n",
+        );
+        payload.language = "java".to_owned();
+
+        let mut graph = Graph::default();
+        build(&dir, vec![app, payload], &mut graph, 1);
+
+        assert_eq!(
+            relations(&graph, IMPORTS),
+            [(
+                "src/main/java/com/demo/App.java".to_owned(),
+                "src/main/java/com/demo/data/Payload.java".to_owned()
+            )],
+            "both imports name declarations in one file, and one file is one edge"
+        );
+    }
+
+    #[test]
+    fn a_star_import_names_a_package_and_draws_no_edge() {
+        // `a.b.*` names a package rather than a declaration. Shortening it to `a.b` would resolve to a
+        // declaration called `b` in package `a` — a different thing that happens to share a name — and the
+        // old path rule matched it against a file called `b.kt` for the same reason.
+        let dir = TempDir::new("star");
+        let mut using = dir.write(
+            "src/main/kotlin/com/demo/Using.kt",
+            "package com.demo\n\nimport com.demo.data.*\n\nclass Using\n",
+        );
+        using.language = "kotlin".to_owned();
+        let mut data = dir.write(
+            "src/main/kotlin/com/demo/data.kt",
+            "package com.demo\n\nclass data\n",
+        );
+        data.language = "kotlin".to_owned();
+
+        let mut graph = Graph::default();
+        build(&dir, vec![using, data], &mut graph, 1);
+
+        assert!(
+            relations(&graph, IMPORTS).is_empty(),
+            "a star import resolves to no single file: {:?}",
+            relations(&graph, IMPORTS)
         );
     }
 

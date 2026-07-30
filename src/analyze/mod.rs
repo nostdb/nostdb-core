@@ -205,6 +205,22 @@ pub struct FileAnalysis {
     pub language: String,
     /// The digest of the bytes that were read, which is half of the parse cache key.
     pub digest: ContentDigest,
+    /// The package the file declares, where its language has one and it wrote one.
+    ///
+    /// Held because an import names a **declaration**, and without this the only thing left to match one
+    /// against is a file name. That is sound in Java, whose file names are constrained to agree with the
+    /// class in them, and unsound in Kotlin, whose are not: `class Payload` may be declared in `Models.kt`,
+    /// and matching by path then either misses it or attaches the import to whatever `Payload.kt` happens
+    /// to declare.
+    ///
+    /// A file-level fact, deliberately. It is not joined onto any item's [`Item::name`] or qualified name,
+    /// because a qualified name is an identity and moving the package into one would retire and re-mint
+    /// every record in every existing database.
+    ///
+    /// `None` where the language declares no package, and also where it has the concept and the file wrote
+    /// nothing — Kotlin's default package is absent rather than empty, and absent is what a resolver needs
+    /// to know to fall back.
+    pub package: Option<String>,
     /// Top-level items, in source order.
     pub items: Vec<Item>,
     /// What the file brings in.

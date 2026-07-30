@@ -17,7 +17,7 @@
 //!
 //! | Written | Recorded as |
 //! | --- | --- |
-//! | `package a.b` | the file's package, on every qualified name below |
+//! | `package a.b` | the file's package, on the file and on no qualified name |
 //! | `import a.b.C`, `import a.b.C as D` | an import, with its alias |
 //! | `class`, `data class`, `sealed class`, `value class` | [`ItemKind::Struct`] |
 //! | `interface`, `fun interface` | [`ItemKind::Trait`] |
@@ -49,9 +49,6 @@ use crate::text::NonEmptyText;
 /// The language this analyzer reads.
 pub const LANGUAGE: &str = "kotlin";
 
-/// This analyzer's version, which is part of its identity for ownership purposes.
-pub const VERSION: &str = "1";
-
 /// How precisely it reads.
 pub const PRECISION: PrecisionClass = PrecisionClass::DeterministicSyntactic;
 
@@ -81,7 +78,6 @@ pub fn capability() -> AnalyzerCapability {
             FactKind::SourceRange,
             FactKind::ContentHash,
         ],
-        version: NonEmptyText::new(VERSION).unwrap_or_else(|_| NonEmptyText::literal("1")),
     }
 }
 
@@ -96,12 +92,14 @@ pub fn analyze(source: &str) -> FileAnalysis {
     let mut reader = Reader {
         tokens: &tokens,
         at: 0,
+        package: None,
         imports: Vec::new(),
     };
     let items = reader.declarations(None);
     FileAnalysis {
         language: LANGUAGE.to_owned(),
         digest: crate::sync::digest_bytes(source.as_bytes()),
+        package: reader.package,
         items,
         imports: reader.imports,
     }
@@ -145,6 +143,7 @@ const MODIFIERS: [&str; 27] = [
 struct Reader<'a> {
     tokens: &'a [Spanned],
     at: usize,
+    package: Option<String>,
     imports: Vec<Import>,
 }
 
@@ -229,10 +228,18 @@ impl Reader<'_> {
             }
             match self.peek().and_then(Token::keyword) {
                 Some("package") => {
-                    // The package a file joins, not a declaration in it. Consumed so its dots do not
-                    // read as anything else.
+                    // The package a file joins, not a declaration in it — so it is recorded on the file
+                    // and never on an item. Kept rather than dropped because an import names a
+                    // declaration, and a Kotlin file name is not required to agree with anything declared
+                    // in it, so this is the only thing an import can honestly be matched against.
+                    //
+                    // Read whatever follows even when a package was already seen. A second `package` line
+                    // does not compile, and the first is the one that means anything.
                     self.advance();
-                    self.qualified_name();
+                    let found = self.qualified_name();
+                    if self.package.is_none() && !found.is_empty() {
+                        self.package = Some(found);
+                    }
                 }
                 Some("import") => self.import(),
                 Some("class") | Some("interface") => {
@@ -1147,6 +1154,29 @@ class Kept
     }
 
     #[test]
+    fn the_package_is_recorded_on_the_file_and_is_not_a_declaration() {
+        // The module documentation used to claim this went onto every qualified name below it, and it never
+        // did. It goes on the file, and `Payload` stays `Payload`: a qualified name is an identity, and
+        // moving a package into one would retire and re-mint every record in every existing database.
+        //
+        // It is held at all because a Kotlin file name is free — this declaration is in `Models.kt` as far
+        // as anything here knows — so the package is the only thing an import can be resolved against.
+        let found = analyze("package com.demo.app.data\n\nclass Payload\n");
+        assert_eq!(found.package.as_deref(), Some("com.demo.app.data"));
+        assert_eq!(
+            flat("package com.demo.app.data\n\nclass Payload\n"),
+            ["Struct:Payload"]
+        );
+    }
+
+    #[test]
+    fn a_file_in_the_default_package_says_absent_rather_than_empty() {
+        // Kotlin's default package is written by writing nothing, and absent is what the resolver reads to
+        // fall back to matching paths. An empty string would claim a package named "".
+        assert_eq!(analyze("class Payload\n").package, None);
+    }
+
+    #[test]
     fn an_import_is_recorded_with_its_alias() {
         let analysis = analyze("import a.b.C\nimport d.e.F as G\nimport h.*\n");
         let paths: Vec<(&str, Option<&str>)> = analysis
@@ -1397,7 +1427,6 @@ class TempController {
     fn the_declared_capability_says_what_it_does_and_does_not_extract() {
         let declared = capability();
         assert_eq!(declared.language.as_str(), LANGUAGE);
-        assert_eq!(declared.version.as_str(), VERSION);
         assert_eq!(declared.precision, PrecisionClass::DeterministicSyntactic);
         assert!(declared.extracts(FactKind::Call));
         assert!(

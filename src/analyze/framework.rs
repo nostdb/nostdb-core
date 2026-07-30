@@ -4,12 +4,16 @@
 //!
 //! A route is not a language fact. `@GetMapping` means nothing to Kotlin — it is an annotation like any
 //! other — and it means something specific to Spring. Putting Spring knowledge into the Kotlin analyzer
-//! would move the Kotlin analyzer's declared version for reasons having nothing to do with Kotlin, and
-//! the same framework reached from Java would need the knowledge written a second time.
+//! would make a Spring change a Kotlin change, and the same framework reached from Java would need the
+//! knowledge written a second time.
 //!
 //! So a framework analyzer consumes what a language analyzer produced. The language layer says what the
 //! source declares; this layer says what those declarations mean to a framework. Each declares its own
-//! capability and carries its own version.
+//! capability.
+//!
+//! A framework analyzer still names a version, unlike a language analyzer, which declares none: its
+//! evidence is what tells a reader that a route was found by `spring/1` rather than by a later reader with
+//! wider coverage, and a framework's own precision is its own.
 //!
 //! # What happens when no analyzer covers a framework
 //!
@@ -268,6 +272,9 @@ mod tests {
         FileAnalysis {
             language: "kotlin".to_owned(),
             digest: crate::sync::digest_bytes(b""),
+            // A framework analyzer reads declarations and annotations. It is handed no path and asks for no
+            // package, so what these tests set here would change nothing.
+            package: None,
             items,
             imports: imports
                 .into_iter()

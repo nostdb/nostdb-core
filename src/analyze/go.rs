@@ -43,9 +43,6 @@ use crate::text::NonEmptyText;
 /// The language this analyzer reads.
 pub const LANGUAGE: &str = "go";
 
-/// This analyzer's version, which is part of its identity for ownership purposes.
-pub const VERSION: &str = "1";
-
 /// How precisely it reads.
 pub const PRECISION: PrecisionClass = PrecisionClass::DeterministicSyntactic;
 
@@ -68,7 +65,6 @@ pub fn capability() -> AnalyzerCapability {
             FactKind::SourceRange,
             FactKind::ContentHash,
         ],
-        version: NonEmptyText::new(VERSION).unwrap_or_else(|_| NonEmptyText::literal("1")),
     }
 }
 
@@ -87,6 +83,12 @@ pub fn analyze(source: &str) -> FileAnalysis {
     FileAnalysis {
         language: LANGUAGE.to_owned(),
         digest: crate::sync::digest_bytes(source.as_bytes()),
+        // `None` although Go writes `package main`, and this is a decision rather than an omission. Go's
+        // package is a property of a directory, and a Go import names that directory rather than the
+        // package clause inside it — `import "example.com/m/internal/util"` is a path and resolves as one.
+        // Recording the clause would put a fact in the graph that nothing resolves through, and would
+        // switch every Go import onto a name-based rule that cannot answer it.
+        package: None,
         items,
         imports: reader.imports,
     }

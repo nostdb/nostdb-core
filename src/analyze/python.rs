@@ -42,9 +42,6 @@ use crate::text::NonEmptyText;
 /// The language this analyzer reads.
 pub const LANGUAGE: &str = "python";
 
-/// This analyzer's version, which is part of its identity for ownership purposes.
-pub const VERSION: &str = "1";
-
 /// How precisely it reads.
 pub const PRECISION: PrecisionClass = PrecisionClass::DeterministicSyntactic;
 
@@ -69,7 +66,6 @@ pub fn capability() -> AnalyzerCapability {
             FactKind::SourceRange,
             FactKind::ContentHash,
         ],
-        version: NonEmptyText::new(VERSION).unwrap_or_else(|_| NonEmptyText::literal("1")),
     }
 }
 
@@ -88,6 +84,9 @@ pub fn analyze(source: &str) -> FileAnalysis {
     FileAnalysis {
         language: LANGUAGE.to_owned(),
         digest: crate::sync::digest_bytes(source.as_bytes()),
+        // Python declares no package in a source file. A package is a directory, so a dotted import already
+        // names a path and is resolved as one.
+        package: None,
         items,
         imports: reader.imports,
     }
