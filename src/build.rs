@@ -132,6 +132,10 @@ pub const IMPORTS: &str = "IMPORTS";
 /// Coarser than a version per analyzer, deliberately: one hand-maintained number is one thing to forget
 /// rather than two. The trade is recorded in Stage 22.
 ///
+/// 10 because the Kotlin analyzer keeps the annotations on a primary-constructor property, which it used to
+/// drop. A database built before it holds no record of `@NotBlank` on a `data class` field and the bytes did
+/// not change, so reuse would keep that absence for ever.
+///
 /// It is also recorded on every file node, and reuse requires the stored value to match. Without
 /// that, a database written by an earlier shape keeps it forever: reuse compares digests, an
 /// unchanged tree is never read, and so nothing would ever rewrite records that predate a new
@@ -141,7 +145,7 @@ pub const IMPORTS: &str = "IMPORTS";
 /// against what a file declares rather than against what it is named. A database built before this holds
 /// `IMPORTS` edges the current rule would not draw — and is missing ones it would — and reuse would keep
 /// them, because the bytes did not change.
-pub const GRAPH_SCHEMA_VERSION: u32 = 9;
+pub const GRAPH_SCHEMA_VERSION: u32 = 10;
 
 /// The label a kind of item carries.
 #[must_use]

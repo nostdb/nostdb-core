@@ -665,6 +665,10 @@ impl Reader<'_> {
     /// is not recorded. `class Server(val port: Int, timeout: Long)` declares one property.
     fn primary_constructor(&mut self) -> Vec<Item> {
         let mut properties = Vec::new();
+        // Annotations read since the last property, handed to the next one. A modifier may sit between an
+        // annotation and its `val`, and a parameter that is not a property discards whatever preceded it —
+        // an annotation on a plain parameter belongs to no record here.
+        let mut pending: Vec<Annotation> = Vec::new();
         self.advance();
         let mut depth = 1_u32;
         while depth > 0 {
@@ -677,6 +681,17 @@ impl Reader<'_> {
                 Some(Token::Close(Delimiter::Paren)) => {
                     depth -= 1;
                     self.advance();
+                }
+                // An annotation on a primary-constructor property, which is where Kotlin idiomatically puts
+                // one: `data class NewUser(@NotBlank val email: String)`. They were read and dropped, so a
+                // build reported none of them — every validation constraint in an idiomatic Kotlin request
+                // type was invisible, while the same annotation on a Java field was reported. A framework
+                // layer reads annotations, so dropping these made the two languages unequal at exactly the
+                // place a Kotlin project states its constraints.
+                Some(token) if depth == 1 && token.is_punct('@') => {
+                    if let Some(found) = self.annotation() {
+                        pending.push(found);
+                    }
                 }
                 Some(token) if depth == 1 && matches!(token.keyword(), Some("val" | "var")) => {
                     let start = self.position();
@@ -697,10 +712,17 @@ impl Reader<'_> {
                             target: None,
                             implements: None,
                             references,
-                            annotations: Vec::new(),
+                            annotations: std::mem::take(&mut pending),
                             children: Vec::new(),
                         });
                     }
+                }
+                // A parameter boundary. Whatever was read since the last one belonged to a parameter that
+                // declared no property, so it has no record to sit on — carrying it forward would attribute a
+                // constraint to the next field, which is worse than losing it.
+                Some(token) if depth == 1 && token.is_punct(',') => {
+                    pending.clear();
+                    self.advance();
                 }
                 _ => {
                     self.advance();
@@ -1420,6 +1442,59 @@ class TempController {
         assert_eq!(
             flat("class Whole {}\nclass Trunc"),
             ["Struct:Whole", "Struct:Trunc"]
+        );
+    }
+
+    #[test]
+    fn an_annotation_on_a_primary_constructor_property_is_kept() {
+        // Where Kotlin idiomatically states a constraint. These were read and dropped, so a build reported
+        // none of them: the same `@NotBlank` on a Java field was reported uninterpreted and on a Kotlin
+        // `data class` property was not, which made the two languages unequal at exactly the place a Kotlin
+        // project writes its validation.
+        let found = analyze(
+            "data class NewUser(\n  @NotBlank val email: String,\n  @Size(min = 8) val password: String\n)\n",
+        );
+        let held = &found.items[0];
+        let fields: Vec<(&str, Vec<&str>)> = held
+            .children
+            .iter()
+            .map(|child| {
+                (
+                    child.name.as_str(),
+                    child
+                        .annotations
+                        .iter()
+                        .map(|annotation| annotation.name.as_str())
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            [("email", vec!["NotBlank"]), ("password", vec!["Size"])]
+        );
+        // And the arguments, which is what a framework layer reads. Asserted by shape rather than exactly,
+        // because the lexer renders a numeric literal as `<literal>` — a string survives, which is what
+        // `spring::first_string` depends on, and a number does not. That is this analyzer's existing
+        // behavior and not something this fix changes.
+        let arguments = held.children[1].annotations[0]
+            .arguments
+            .clone()
+            .expect("arguments");
+        assert!(arguments.contains("min"), "{arguments}");
+    }
+
+    #[test]
+    fn an_annotation_on_a_plain_constructor_parameter_belongs_to_no_property() {
+        // A parameter that is not a `val` declares nothing, so there is no record for an annotation on it to
+        // sit on. Carrying it forward to the next property would attribute a constraint to the wrong field.
+        let found = analyze("class C(@Inject dependency: Service, val kept: String)\n");
+        let kept = &found.items[0].children[0];
+        assert_eq!(kept.name, "kept");
+        assert!(
+            kept.annotations.is_empty(),
+            "an annotation on a plain parameter must not move to the next property: {:?}",
+            kept.annotations
         );
     }
 

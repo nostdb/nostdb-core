@@ -290,33 +290,9 @@ fn owner(declaration: &OwnerDeclaration) -> Result<Owner, ConversionError> {
     ))
 }
 
-fn parse_position(text: &str) -> Option<SourcePosition> {
-    let mut parts = text.split(':');
-    let line = parts.next()?.parse().ok()?;
-    let column = parts.next()?.parse().ok()?;
-    let offset = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(SourcePosition {
-        line,
-        column,
-        offset,
-    })
-}
-
 fn parse_range(text: &str, at: SourceRange) -> Result<SourceRange, ConversionError> {
-    let (start, end) = text.split_once('-').ok_or_else(|| {
-        invalid(
-            at,
-            format!("a range is written line:column:offset-line:column:offset, found {text}"),
-        )
-    })?;
-    let start = parse_position(start)
-        .ok_or_else(|| invalid(at, format!("{start} is not a line:column:offset position")))?;
-    let end = parse_position(end)
-        .ok_or_else(|| invalid(at, format!("{end} is not a line:column:offset position")))?;
-    SourceRange::new(start, end).map_err(|error| invalid(at, format!("{text}: {error}")))
+    // The spelling lives on `SourceRange`, so this reader and the change-set reader cannot disagree about it.
+    SourceRange::from_text(text).map_err(|error| invalid(at, error))
 }
 
 fn evidence_text<'a>(
@@ -424,25 +400,16 @@ fn evidence(block: &EvidenceBlock, inherited: Option<&str>) -> Result<Evidence, 
         })?;
         Score::new(number).map_err(|error| invalid(confidence_range, format!("{text}: {error}")))
     };
-    let confidence = match confidence_word {
-        "extracted" => {
-            if confidence_score.is_some() {
-                return Err(invalid(confidence_range, "`extracted` carries no score"));
-            }
-            Confidence::Extracted
-        }
-        "inferred" => Confidence::Inferred {
-            score: score(confidence_score)?,
-        },
-        "ambiguous" => Confidence::Ambiguous {
-            score: score(confidence_score)?,
-        },
-        other => {
-            return Err(invalid(
-                confidence_range,
-                format!("`{other}` is not a confidence"),
-            ));
-        }
+    // Which three words exist and which carry a score is `Confidence`'s rule, so both readers into a graph
+    // apply the same one. This reader has the word and the score apart already, which is why it calls
+    // `from_parts` rather than the text form the change-set reader uses.
+    let confidence = {
+        let held = match confidence_score {
+            None => None,
+            Some(_) => Some(score(confidence_score)?),
+        };
+        Confidence::from_parts(confidence_word, held)
+            .map_err(|error| invalid(confidence_range, error))?
     };
 
     Ok(Evidence {

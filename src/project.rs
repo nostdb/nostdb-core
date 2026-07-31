@@ -3058,4 +3058,28 @@ mod tests {
             "nothing but a refresh may move it"
         );
     }
+    #[test]
+    fn a_kotlin_data_class_reports_the_constraints_on_its_constructor_properties() {
+        // Where an idiomatic Kotlin request type states its validation. The analyzer read those annotations
+        // and dropped them, so a build reported none of them — the same `@NotBlank` on a Java field *was*
+        // reported, which made the capability diagnostic unequal between the two languages at exactly the
+        // place a Kotlin project writes a constraint. A model reading the report to decide what needs
+        // enrichment would have been told there was nothing to read.
+        let dir = TempDir::new("kotlin-constructor-annotations");
+        let project = Project::initialize(dir.path()).unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/NewUser.kt"),
+            "package demo\n\ndata class NewUser(\n  @NotBlank val email: String,\n  \
+             @Size(min = 8) val password: String,\n)\n",
+        )
+        .unwrap();
+
+        let registry = crate::analyze::builtin_registry().unwrap();
+        let report = project
+            .build(&registry, &crate::scan::ScanOptions::default(), false)
+            .unwrap();
+
+        assert_eq!(report.uninterpreted_annotations, ["NotBlank", "Size"]);
+    }
 }

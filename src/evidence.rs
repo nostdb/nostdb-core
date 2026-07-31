@@ -185,6 +185,97 @@ impl fmt::Display for ScoreError {
 
 impl std::error::Error for ScoreError {}
 
+impl SourceRange {
+    /// A range written `line:column:offset-line:column:offset`.
+    ///
+    /// The spelling `.nost` uses, held here so the language reader and the change-set reader share one rather
+    /// than each carrying a copy. They did not: a change set dropped the range entirely, and a copy in the
+    /// second reader would have been a second chance to spell it differently.
+    ///
+    /// # Errors
+    ///
+    /// Returns the text that could not be read, so a caller can name it in its own diagnostic.
+    pub fn from_text(text: &str) -> Result<Self, String> {
+        let position = |part: &str| -> Option<SourcePosition> {
+            let mut parts = part.split(':');
+            let line = parts.next()?.parse().ok()?;
+            let column = parts.next()?.parse().ok()?;
+            let offset = parts.next()?.parse().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(SourcePosition {
+                line,
+                column,
+                offset,
+            })
+        };
+        let (start, end) = text.split_once('-').ok_or_else(|| {
+            format!("a range is written line:column:offset-line:column:offset, found {text}")
+        })?;
+        let start = position(start)
+            .ok_or_else(|| format!("{start} is not a line:column:offset position"))?;
+        let end =
+            position(end).ok_or_else(|| format!("{end} is not a line:column:offset position"))?;
+        Self::new(start, end).map_err(|error| format!("{text}: {error}"))
+    }
+}
+
+impl Confidence {
+    /// A confidence written `extracted`, `inferred(<score>)`, or `ambiguous(<score>)`.
+    ///
+    /// One spelling for both routes into a graph. A change set used to name a confidence and have it thrown
+    /// away — every proposal was stored as [`Self::Extracted`], the value reserved for a fact read directly
+    /// out of source — while the `.nost` reader honored the same three words. Two readers of one graph
+    /// disagreed about what evidence meant.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason, so a caller can name the field it came from. A score outside `0.0..=1.0` is
+    /// refused rather than clamped: a producer that computed 1.4 has a defect, and storing 1.0 would hide it.
+    pub fn from_text(text: &str) -> Result<Self, String> {
+        let (word, score) = match text.split_once('(') {
+            Some((word, rest)) => {
+                let inner = rest
+                    .strip_suffix(')')
+                    .ok_or_else(|| format!("{text}: a score is closed with `)`"))?;
+                let value: f32 = inner
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("{inner} is not a score"))?;
+                (
+                    word.trim(),
+                    Some(Score::new(value).map_err(|error| format!("{inner}: {error}"))?),
+                )
+            }
+            None => (text.trim(), None),
+        };
+        Self::from_parts(word, score)
+    }
+
+    /// A confidence from the word and the score a reader already separated.
+    ///
+    /// The `.nost` parser hands those apart — a confidence is an enumerator with an optional score there —
+    /// so this is where the rule lives that both readers need: which three words exist, and which of them
+    /// carry a score.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason, so a caller can name the field or the source range it came from.
+    pub fn from_parts(word: &str, score: Option<Score>) -> Result<Self, String> {
+        match (word, score) {
+            ("extracted", None) => Ok(Self::Extracted),
+            ("extracted", Some(_)) => Err("`extracted` carries no score".to_owned()),
+            ("inferred", Some(score)) => Ok(Self::Inferred { score }),
+            ("ambiguous", Some(score)) => Ok(Self::Ambiguous { score }),
+            ("inferred" | "ambiguous", None) => {
+                Err(format!("`{word}` is written with a score, as {word}(0.8)"))
+            }
+            (other, _) => Err(format!("`{other}` is not a confidence")),
+        }
+    }
+}
+
 /// How confident a graph fact is.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Confidence {

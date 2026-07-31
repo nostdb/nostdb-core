@@ -459,7 +459,23 @@ fn read_evidence(value: &Value, field: &str) -> Result<Evidence, DocumentError> 
             .and_then(Value::as_str)
             .and_then(|found| ContentDigest::new(found).ok())
             .ok_or_else(|| invalid(&format!("{field}.content_digest"), "expected a digest"))?,
-        range: None,
+        // Also read rather than dropped. A range is half of what evidence is for: a proposal that names a file
+        // and not a place in it cannot be checked against the source it claims to have read.
+        range: match object.get("range") {
+            None => None,
+            Some(value) => {
+                let text = value.as_str().ok_or_else(|| {
+                    invalid(
+                        &format!("{field}.range"),
+                        "expected line:column:offset-line:column:offset",
+                    )
+                })?;
+                Some(
+                    crate::evidence::SourceRange::from_text(text)
+                        .map_err(|error| invalid(&format!("{field}.range"), &error))?,
+                )
+            }
+        },
         producer: text("producer")?,
         producer_version: text("producer_version")?,
         method: match object.get("method").and_then(Value::as_str) {
@@ -473,7 +489,27 @@ fn read_evidence(value: &Value, field: &str) -> Result<Evidence, DocumentError> 
                 ));
             }
         },
-        confidence: Confidence::Extracted,
+        // Read rather than substituted. This was `Confidence::Extracted` unconditionally, which stored every
+        // proposal at the confidence reserved for a fact read directly out of source — so an AI's inference
+        // and an analyzer's extraction were indistinguishable in the graph, which the root contract's
+        // section 17.3 forbids in as many words.
+        //
+        // Absent means `extracted`, which is what the published fixture declares and what a deterministic
+        // producer means. A malformed one is refused rather than downgraded: a producer that wrote a score of
+        // 1.4 has a defect, and recording `extracted` instead would bury it.
+        confidence: match object.get("confidence") {
+            None => Confidence::Extracted,
+            Some(value) => {
+                let text = value.as_str().ok_or_else(|| {
+                    invalid(
+                        &format!("{field}.confidence"),
+                        "expected `extracted`, `inferred(<score>)`, or `ambiguous(<score>)`",
+                    )
+                })?;
+                Confidence::from_text(text)
+                    .map_err(|error| invalid(&format!("{field}.confidence"), &error))?
+            }
+        },
     })
 }
 
@@ -481,4 +517,117 @@ fn read_evidence(value: &Value, field: &str) -> Result<Evidence, DocumentError> 
 #[must_use]
 pub const fn writes_version() -> u32 {
     CHANGE_SET_VERSION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::change::GraphOperation;
+
+    /// One node operation whose evidence carries whatever is passed in.
+    fn document(evidence: &str) -> String {
+        format!(
+            r#"{{
+              "change_set_version": 1,
+              "base_generation": 1,
+              "owner": "ai:sha256:abababababababababababababababab",
+              "source_snapshot": "tree:sha256:abababababababababababababababab",
+              "operations": [{{
+                "operation": "upsert_node",
+                "labels": ["Request"],
+                "properties": {{ "name": "NewUser" }},
+                "source_unit": "u_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d",
+                "evidence": [{{
+                  "source": ".",
+                  "path": "src/Api.java",
+                  "content_digest": "sha256:abababababababababababababababab",
+                  "producer": "springboot-preset",
+                  "producer_version": "1",
+                  "method": "ai_inferred"{evidence}
+                }}]
+              }}]
+            }}"#
+        )
+    }
+
+    fn only_evidence(text: &str) -> crate::evidence::Evidence {
+        let set = parse(text).expect("a document this test built");
+        match set.operations.into_iter().next().expect("one operation") {
+            GraphOperation::UpsertNode(draft) => {
+                draft.evidence.into_iter().next().expect("one evidence")
+            }
+            other => panic!("expected a node draft, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_declared_confidence_survives_rather_than_being_replaced() {
+        // This read `Confidence::Extracted` unconditionally, so an AI's inference was stored at the
+        // confidence reserved for a fact read directly out of source. Nothing caught it: the contract never
+        // said what an evidence entry contains, and the one published fixture declares `extracted` — the
+        // single value the substitution happened to produce.
+        let held = only_evidence(&document(r#", "confidence": "inferred(0.82)""#));
+        match held.confidence {
+            Confidence::Inferred { score } => assert!((score.get() - 0.82).abs() < 1e-6),
+            other => panic!("expected an inferred confidence, found {other:?}"),
+        }
+
+        let held = only_evidence(&document(r#", "confidence": "ambiguous(0.4)""#));
+        assert!(matches!(held.confidence, Confidence::Ambiguous { .. }));
+    }
+
+    #[test]
+    fn an_absent_confidence_is_extracted_and_an_absent_range_is_none() {
+        // Absent is what a deterministic producer means and what the published fixture relies on, so this is
+        // the one case where the old behavior was right.
+        let held = only_evidence(&document(""));
+        assert_eq!(held.confidence, Confidence::Extracted);
+        assert_eq!(held.range, None);
+    }
+
+    #[test]
+    fn a_declared_range_survives_rather_than_being_dropped() {
+        // A range is half of what evidence is for. A proposal naming a file and not a place in it cannot be
+        // checked against the source it claims to have read.
+        let held = only_evidence(&document(r#", "range": "12:1:340-40:2:1180""#));
+        let range = held.range.expect("a range this test declared");
+        assert_eq!(range.start().line, 12);
+        assert_eq!(range.end().offset, 1180);
+    }
+
+    #[test]
+    fn a_score_outside_the_range_is_refused_rather_than_clamped() {
+        // A producer that computed 1.4 has a defect. Clamping to 1.0 would store a confident claim and hide
+        // it; storing `extracted` — which is what happened before — would store a *more* confident one.
+        let errors = parse(&document(r#", "confidence": "inferred(1.4)""#))
+            .expect_err("a score above one is refused");
+        assert!(
+            errors
+                .iter()
+                .any(|error| format!("{error}").contains("confidence")),
+            "the refusal names the field: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_confidence_that_is_not_one_of_the_three_is_refused() {
+        for spelled in ["certain", "inferred", "extracted(0.5)", "inferred()"] {
+            let text = document(&format!(r#", "confidence": "{spelled}""#));
+            assert!(
+                parse(&text).is_err(),
+                "`{spelled}` is not a confidence and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_range_is_refused_rather_than_ignored() {
+        for spelled in ["12:1:340", "12:1-40:2", "not a range"] {
+            let text = document(&format!(r#", "range": "{spelled}""#));
+            assert!(
+                parse(&text).is_err(),
+                "`{spelled}` is not a range and must be refused"
+            );
+        }
+    }
 }
