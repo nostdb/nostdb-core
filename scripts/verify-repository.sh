@@ -92,7 +92,11 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 cargo fmt --check
-cargo check --all-targets --all-features
+# `--locked`, so a manifest whose version moved without its lock fails here rather than in a release.
+# Release 0.1.5 lost four build jobs to exactly that in a sibling repository, whose verifier ran no
+# cargo command at all — and this one ran `cargo check`, which refreshes the lock as a side effect and
+# would have reported a pass on the same disagreement.
+cargo check --locked --all-targets --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 
