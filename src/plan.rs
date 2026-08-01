@@ -15,11 +15,17 @@
 //!
 //! # What is counted, and what is spent
 //!
-//! `semantic_candidates` counts files that *could* be enriched, which is a fact about the
-//! source. The token estimates describe what *this* run would spend, which is zero when
-//! [`AiMode::Off`] is configured. Keeping them separate is what lets a plan say "412 files
-//! could be enriched, and this run will spend nothing" instead of implying one from the
-//! other.
+//! `semantic_candidates` counts the files AI *would* read. The token estimates describe what
+//! *this* run would spend, which is zero when [`AiMode::Off`] is configured. Keeping them
+//! separate is what lets a plan say "412 files could be enriched, and this run will spend
+//! nothing" instead of implying one from the other.
+//!
+//! What AI would read depends on the mode, because the modes ask for different things.
+//! [`AiMode::Auto`] asks for a second pass over what the analyzers could not cover;
+//! [`AiMode::Full`] asks for AI *instead of* them, so every scanned file is read. A plan that
+//! counted only the unsupported files in `Full` would under-report the whole run — and the
+//! budget is checked against this plan, so under-reporting it is how a hard limit gets passed
+//! without anything noticing.
 
 use crate::analysis::{CapabilityRegistry, PrecisionClass};
 use crate::coverage::SkipReason;
@@ -328,6 +334,29 @@ pub fn estimate_output(units: u64) -> TokenRange {
     )
 }
 
+/// Whether AI would read a file at this precision, in this mode.
+///
+/// [`AiMode::Full`] is the whole tree, because in that mode **AI is the reader** rather than the second
+/// pass: the caller asked for it instead of the analyzers, not on top of them. Every other mode reads what
+/// an analyzer could not cover, which is what [`PrecisionClass::eligible_for_ai`] names.
+///
+/// [`AiMode::Off`] answers as [`AiMode::Auto`] does, and deliberately. The count is what AI *would* read,
+/// and the estimate below is what this run spends — so a plan can say "412 files could be enriched, and this
+/// run will spend nothing" rather than implying one from the other. Returning nothing here would collapse
+/// that into a zero a reader cannot tell from "there is nothing to enrich".
+///
+/// This is the first thing in the crate that tells `Full` from `Auto`. Until now the only branch on
+/// `ai_mode` anywhere was the `Off` test below, so a mode documented as "enrichment is required" estimated
+/// exactly what the optional one did.
+const fn reads(mode: AiMode, precision: PrecisionClass) -> bool {
+    match mode {
+        // Unsupported text is the fallback path, not a dead end. A heuristic analyzer's output is also
+        // eligible, because it is the case enrichment exists to improve.
+        AiMode::Off | AiMode::Auto => precision.eligible_for_ai(),
+        AiMode::Full => true,
+    }
+}
+
 /// Produces the plan for one scan.
 ///
 /// Pure: it reads no file and spends nothing. Everything it reports comes from the scan
@@ -355,9 +384,7 @@ pub fn plan(scan: &Scan, registry: &CapabilityRegistry, analysis: &AnalysisSetti
         if precision == PrecisionClass::Unsupported {
             unsupported_files += files;
         }
-        // Unsupported text is the fallback path, not a dead end. A heuristic analyzer's
-        // output is also eligible, because it is the case enrichment exists to improve.
-        if precision.eligible_for_ai() {
+        if reads(analysis.ai_mode, precision) {
             candidate_files += files;
             candidate_bytes += bytes;
         }
@@ -510,6 +537,48 @@ mod tests {
             report.plan.semantic_candidates, 1,
             "enrichment exists to improve exactly this case"
         );
+    }
+
+    #[test]
+    fn asking_for_ai_instead_of_the_analyzers_counts_every_file() {
+        // `Full` asks for AI *instead of* the analyzers, not on top of them, so a file an analyzer covers is
+        // still read. Counting only the unsupported ones would under-report the whole run — and the budget
+        // is checked against this plan, which is how a hard limit gets passed without anything noticing.
+        let scan = scanned(vec![
+            file("a.rs", "rust", 4_000),
+            file("b.py", "python", 6_000),
+            file("notes.md", "markdown", 2_000),
+        ]);
+        let registry = crate::analyze::builtin_registry().expect("registry");
+
+        let auto = plan(&scan, &registry, &settings());
+        assert_eq!(
+            auto.plan.semantic_candidates, 1,
+            "by default AI reads what an analyzer could not: the Markdown, and neither of the other two"
+        );
+
+        let full = plan(
+            &scan,
+            &registry,
+            &AnalysisSettings {
+                ai_mode: AiMode::Full,
+                ..settings()
+            },
+        );
+        assert_eq!(
+            full.plan.semantic_candidates, 3,
+            "asked for AI instead of the analyzers, it reads the whole tree"
+        );
+        assert!(
+            full.plan.estimated_input_tokens.low > auto.plan.estimated_input_tokens.low,
+            "and the estimate covers what it reads: {:?} against {:?}",
+            full.plan.estimated_input_tokens,
+            auto.plan.estimated_input_tokens
+        );
+        // The source facts do not move with the mode. Which files an analyzer covers is a property of the
+        // source and the registry, and only what AI reads is being asked differently.
+        assert_eq!(full.plan.structural_files, auto.plan.structural_files);
+        assert_eq!(full.plan.unsupported_files, auto.plan.unsupported_files);
     }
 
     #[test]
