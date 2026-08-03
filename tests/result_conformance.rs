@@ -12,7 +12,7 @@ use nostdb_core::generation::Generation;
 use nostdb_core::id::{LocalEdgeId, LocalNodeId};
 use nostdb_core::mutate::WriteSummary;
 use nostdb_core::property::FiniteF64;
-use nostdb_core::result::ResultEnvelope;
+use nostdb_core::result::{RESULT_VERSION, ResultEnvelope};
 use nostdb_core::text::NonEmptyText;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -57,14 +57,12 @@ fn registry_codes() -> BTreeSet<String> {
 /// make agreement automatic and therefore meaningless.
 fn violation(document: &Value, codes: &BTreeSet<String>) -> Option<String> {
     let object = document.as_object()?;
-    // Both supported versions are accepted. An envelope is a message rather than a stored
-    // artifact, so version 1 stays readable: it carries nothing version 2 cannot express,
-    // and a version 1 producer never emits the object form version 2 added.
-    if !matches!(
-        object.get("result_version").and_then(Value::as_u64),
-        Some(1 | 2)
-    ) {
-        return Some("result_version must be 1 or 2".to_owned());
+    // One version, matching the registry. `supported` there means the versions this
+    // implementation accepts as input, and nothing in NostDB reads an envelope — it only
+    // produces them. Accepting version 1 here would let a producer emitting it pass a check
+    // whose whole job is to catch that.
+    if object.get("result_version").and_then(Value::as_u64) != Some(RESULT_VERSION) {
+        return Some(format!("result_version must be {RESULT_VERSION}"));
     }
     let columns = object.get("columns")?.as_array()?;
     let rows = object.get("rows")?.as_array()?;
