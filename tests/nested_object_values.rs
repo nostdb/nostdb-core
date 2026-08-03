@@ -7,7 +7,7 @@
 //! pass while validation said nothing and the container stored a different graph.
 
 use nostdb_core::container::{
-    Container, ContainerBuilder, FORMAT_VERSION, SUPPORTED_FORMAT_VERSIONS,
+    Container, ContainerBuilder, ContainerError, FORMAT_VERSION, SUPPORTED_FORMAT_VERSIONS,
 };
 use nostdb_core::encoding::{decode_graph, encode_graph};
 use nostdb_core::generation::Generation;
@@ -34,12 +34,24 @@ node app: Project {
 }
 ";
 
-fn container_of(graph: &nostdb_core::encoding::Graph) -> Container {
+fn built_bytes(graph: &nostdb_core::encoding::Graph) -> Vec<u8> {
     let mut builder = ContainerBuilder::new(Generation::INITIAL);
     for section in encode_graph(graph) {
         builder.push_section(section.kind, section.payload).unwrap();
     }
-    Container::parse(&builder.build().unwrap()).unwrap()
+    builder.build().unwrap()
+}
+
+fn container_of(graph: &nostdb_core::encoding::Graph) -> Container {
+    Container::parse(&built_bytes(graph)).unwrap()
+}
+
+/// Recomputes the header checksum, so a byte edited above it is a *version* change rather
+/// than corruption. Without this the reader would refuse the file for the wrong reason and
+/// the test would pass while proving nothing.
+fn fix_header_checksum(bytes: &mut [u8]) {
+    let checksum = nostdb_core::crc::crc32c(&bytes[..44]);
+    bytes[44..48].copy_from_slice(&checksum.to_le_bytes());
 }
 
 #[test]
@@ -106,16 +118,27 @@ fn the_stored_graph_survives_a_container_round_trip() {
 }
 
 #[test]
-fn a_written_container_declares_the_current_format_version_and_still_reads_its_predecessor() {
-    let file = parse(DOCUMENT).expect("the document parses");
-    let container = container_of(&to_graph(&file).expect("converts"));
-    assert_eq!(container.version(), FORMAT_VERSION);
+fn the_format_reads_and_writes_exactly_one_version() {
     assert_eq!(FORMAT_VERSION, 3);
-    assert!(
-        SUPPORTED_FORMAT_VERSIONS.contains(&2),
-        "version 2 stays readable, because a container holds contributions no analyzer \
-         can rebuild"
+    assert_eq!(
+        SUPPORTED_FORMAT_VERSIONS,
+        [FORMAT_VERSION],
+        "one version, because nothing released exists to read"
     );
+
+    // A container written by this build opens. Anything else is refused at the header, which
+    // is where the previous version's reader used to be.
+    let file = parse(DOCUMENT).expect("the document parses");
+    let graph = to_graph(&file).expect("converts");
+    assert!(decode_graph(&container_of(&graph)).is_ok());
+
+    let mut bytes = built_bytes(&graph);
+    bytes[8..12].copy_from_slice(&2_u32.to_le_bytes());
+    fix_header_checksum(&mut bytes);
+    match Container::parse(&bytes) {
+        Err(ContainerError::UnsupportedVersion { found }) => assert_eq!(found, 2),
+        other => panic!("version 2 must be refused at the header, got {other:?}"),
+    }
 }
 
 #[test]

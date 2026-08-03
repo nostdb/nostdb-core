@@ -988,15 +988,14 @@ pub fn decode_graph(container: &Container) -> Result<Graph, DecodeError> {
                     });
                 }
             };
-            // 13 bytes is the smallest a field can be at either version: an interned
-            // key, a type, and a required flag, where the smallest type is a tag and
-            // one `u32`. Version 2's fields were 16 bytes each, and keeping that
-            // number here rejected a valid version 3 section — the guard bounds an
-            // allocation, so the smaller of the two is the one that is never wrong.
+            // 13 bytes is the smallest a field can be: an interned key, a type, and a
+            // required flag, where the smallest type is a tag and one `u32`. The guard
+            // bounds an allocation before it is made, so what matters is that it never
+            // exceeds the real minimum.
             let field_count = reader.count(MIN_FIELD_BYTES)?;
             let mut fields = Vec::with_capacity(field_count);
             for _ in 0..field_count {
-                fields.push(read_field(&mut reader, &table, container.version(), 0)?);
+                fields.push(read_field(&mut reader, &table, 0)?);
             }
             graph.schemas.push(Schema {
                 name,
@@ -1010,15 +1009,14 @@ pub fn decode_graph(container: &Container) -> Result<Graph, DecodeError> {
     Ok(graph)
 }
 
-/// Reads one schema field at the given container version.
+/// Reads one schema field.
 fn read_field(
     reader: &mut Reader<'_>,
     table: &Table,
-    version: u32,
     depth: usize,
 ) -> Result<SchemaField, DecodeError> {
     let key = PropertyKey::new(table.get(reader.u32()?)?)?;
-    let field_type = read_field_type(reader, table, version, depth)?;
+    let field_type = read_field_type(reader, table, depth)?;
     let required = read_flag(reader, "schema field required marker")?;
     Ok(SchemaField {
         key,
@@ -1027,32 +1025,16 @@ fn read_field(
     })
 }
 
-/// Reads a declared field type, in the shape the container's version wrote.
+/// Reads a declared field type: a tag, then whatever that tag introduces.
 ///
-/// This is the one place a version branch is needed. Version 2 wrote a scalar
-/// discriminant and an array flag, which cannot express an object type; version 3 writes a
-/// tagged recursive shape. Every other section reads identically, which is why a version 2
-/// container opens rather than being refused.
+/// This carried a version branch while version 2 was still readable, because version 2 wrote
+/// a scalar discriminant and an array flag with no tag at all, and a recursive type cannot be
+/// spelled that way. With one supported version there is one shape to read.
 fn read_field_type(
     reader: &mut Reader<'_>,
     table: &Table,
-    version: u32,
     depth: usize,
 ) -> Result<FieldType, DecodeError> {
-    if version < 3 {
-        let raw = reader.u32()?;
-        let scalar = ScalarType::from_raw(raw).ok_or(DecodeError::UnknownTag {
-            what: "scalar type",
-            tag: raw,
-        })?;
-        let array = read_flag(reader, "schema field array marker")?;
-        return Ok(if array {
-            FieldType::array(scalar)
-        } else {
-            FieldType::Scalar(scalar)
-        });
-    }
-
     let tag = reader.u8()?;
     match tag {
         TYPE_SCALAR => {
@@ -1070,13 +1052,13 @@ fn read_field_type(
             }
             if tag == TYPE_ARRAY {
                 return Ok(FieldType::Array(Box::new(read_field_type(
-                    reader, table, version, entered,
+                    reader, table, entered,
                 )?)));
             }
             let count = reader.count(MIN_FIELD_BYTES)?;
             let mut fields = Vec::with_capacity(count);
             for _ in 0..count {
-                fields.push(read_field(reader, table, version, entered)?);
+                fields.push(read_field(reader, table, entered)?);
             }
             Ok(FieldType::Object(fields))
         }

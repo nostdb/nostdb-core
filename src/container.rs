@@ -36,28 +36,28 @@ pub const HEADER_LENGTH: u64 = 48;
 /// Length of one section table entry.
 pub const SECTION_ENTRY_LENGTH: u64 = 32;
 
-/// Format versions this build reads and writes.
+/// The one format version this build reads and writes.
 ///
-/// Version 1 is **not** among them, and that is deliberate. A contribution's owner was three tagged shapes in
-/// version 1 and is one interned name in version 2, with no reader left for the earlier tags. Keeping version 1
-/// here would mean an old database decoded until it reached an owner byte and then reported an unknown tag,
-/// which is what a corrupt file reports. Refusing it at the header instead says what is true: a database to
-/// rebuild, not a database to fear.
-/// Version 3 keeps version 2 readable, which the previous bump could not offer. A property
-/// value may now be an object, and the two sections that changed differ narrowly: a list
-/// element is a value rather than a scalar, which is byte-identical wherever the element is
-/// a scalar, and a schema field's declared type is a recursive shape rather than a scalar
-/// and a flag. Only the second needs a reader that knows which version it is reading.
+/// Every earlier version is refused at the header rather than decoded on a guessed layout.
+/// For version 1 there was never a choice: a contribution's owner was three tagged shapes
+/// there and one interned name afterwards, so a version 1 database would have decoded until
+/// it reached an owner byte and then reported an unknown tag — which is what a *corrupt* file
+/// reports.
 ///
-/// Refusing version 2 would have destroyed data to avoid that one branch: a container holds
-/// user-owned contributions no analyzer can rebuild from source. That is the difference from
-/// version 1, for which no reader existed at all.
-pub const SUPPORTED_FORMAT_VERSIONS: [u32; 2] = [2, 3];
+/// Version 2 was briefly kept readable, on the reasoning that a container holds user-owned
+/// contributions no analyzer can rebuild from source. That reasoning describes a **released**
+/// product. This one is not released, so there is no database anywhere whose loss would be a
+/// user's rather than a developer's, and the compatibility bought a version branch in the
+/// schema reader plus a version field on [`Container`] that existed only to feed it. Both are
+/// gone.
+///
+/// The check that matters is unchanged: an unsupported version reports
+/// `NOSTDB_FORMAT_UNSUPPORTED` with the version in the diagnostic, which is the migration
+/// *detection* `docs/PRD.md` section 12 requires. Rebuilding costs time and, for supported
+/// source, no external tokens.
+pub const SUPPORTED_FORMAT_VERSIONS: [u32; 1] = [3];
 
 /// The version this build writes.
-///
-/// A version 2 container opens, and the next write promotes it, because a write emits this
-/// version through the same atomic path every write uses.
 pub const FORMAT_VERSION: u32 = 3;
 
 /// Largest permitted section count.
@@ -310,7 +310,6 @@ fn corrupt<T>(reason: CorruptReason) -> Result<T, ContainerError> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Container {
     generation: Generation,
-    version: u32,
     sections: Vec<Section>,
 }
 
@@ -485,7 +484,6 @@ impl Container {
 
         Ok(Self {
             generation,
-            version,
             sections,
         })
     }
@@ -494,17 +492,6 @@ impl Container {
     #[must_use]
     pub const fn generation(&self) -> Generation {
         self.generation
-    }
-
-    /// The `nostdb_format_version` this container declared.
-    ///
-    /// Retained rather than discarded after validation because one section decodes
-    /// differently per version: a schema field's declared type. Every other section is
-    /// version-independent, which is why this is a decoder input rather than a migration
-    /// step.
-    #[must_use]
-    pub const fn version(&self) -> u32 {
-        self.version
     }
 
     /// Every section, in the order the table listed them.
