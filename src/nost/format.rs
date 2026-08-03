@@ -28,8 +28,8 @@
 
 use super::{
     Comment, Comments, ContributionBlock, EdgeDeclaration, Endpoint, EvidenceBlock, EvidenceValue,
-    NodeDeclaration, OwnerDeclaration, Property, RecordBody, SchemaDeclaration, SourceFile,
-    Spanned, Value,
+    FieldType, NodeDeclaration, OwnerDeclaration, Property, RecordBody, SchemaDeclaration,
+    SchemaField, SourceFile, Spanned, Value,
 };
 
 const INDENT: &str = "  ";
@@ -122,7 +122,82 @@ fn render_number(text: &str, float: bool) -> String {
     }
 }
 
-fn render_value(value: &Value) -> String {
+/// Reports whether an object type appears anywhere in this declared type.
+fn contains_object_type(declared: &FieldType) -> bool {
+    match declared {
+        FieldType::Object(_) => true,
+        FieldType::Array(inner) => contains_object_type(inner),
+        FieldType::Scalar(_) => false,
+    }
+}
+
+/// Renders a declared type, expanding an object type across lines.
+///
+/// Mirrors [`render_value`], and for the same rule: canonical rule 6 asks for one field per
+/// line **at every depth**, and an object type holds fields. `FieldType`'s `Display` puts a
+/// type in a diagnostic sentence on one line, which is a different job — a document keeps
+/// the shape its author wrote.
+fn render_field_type(declared: &FieldType, depth: usize) -> String {
+    if !contains_object_type(declared) {
+        return declared.to_string();
+    }
+    match declared {
+        FieldType::Array(inner) => format!("{}[]", render_field_type(inner, depth)),
+        FieldType::Object(object) => {
+            if object.fields.is_empty() && object.block_comments.is_empty() {
+                return "{}".to_owned();
+            }
+            let pad = INDENT.repeat(depth);
+            let inner = INDENT.repeat(depth + 1);
+            let mut fields: Vec<&SchemaField> = object.fields.iter().collect();
+            fields.sort_by(|left, right| left.key.value.cmp(&right.key.value));
+
+            let mut out = String::from("{\n");
+            let last = fields.len().saturating_sub(1);
+            for (index, field) in fields.iter().enumerate() {
+                for comment in &field.comments.leading {
+                    out.push_str(&inner);
+                    out.push_str(&render_comment(comment));
+                    out.push('\n');
+                }
+                let separator = if index == last { "" } else { "," };
+                let text = format!(
+                    "{}{}: {}{separator}",
+                    field.key.value,
+                    if field.optional { "?" } else { "" },
+                    render_field_type(&field.field_type.value, depth + 1)
+                );
+                out.push_str(&inner);
+                out.push_str(&with_trailing(text, &field.comments));
+                out.push('\n');
+            }
+            for comment in &object.block_comments {
+                out.push_str(&inner);
+                out.push_str(&render_comment(comment));
+                out.push('\n');
+            }
+            out.push_str(&pad);
+            out.push('}');
+            out
+        }
+        FieldType::Scalar(_) => declared.to_string(),
+    }
+}
+
+/// Reports whether an object appears anywhere in this value.
+///
+/// What decides between the two forms of canonical rule 8: a value holding only scalars
+/// stays on one line, and a value containing an object expands.
+fn contains_object(value: &Value) -> bool {
+    match value {
+        Value::Map(_) => true,
+        Value::List(items) => items.iter().any(|item| contains_object(&item.value)),
+        _ => false,
+    }
+}
+
+/// Renders a value on one line. Every element is a scalar or a list of them.
+fn render_inline(value: &Value) -> String {
     match value {
         Value::Boolean(true) => "true".to_owned(),
         Value::Boolean(false) => "false".to_owned(),
@@ -132,10 +207,81 @@ fn render_value(value: &Value) -> String {
         Value::Bytes { digits, .. } => format!("bytes\"{}\"", digits.to_lowercase()),
         Value::DateTime(text) => format!("datetime\"{text}\""),
         Value::List(items) => {
-            let rendered: Vec<String> =
-                items.iter().map(|item| render_value(&item.value)).collect();
+            let rendered: Vec<String> = items
+                .iter()
+                .map(|item| render_inline(&item.value))
+                .collect();
             format!("[{}]", rendered.join(", "))
         }
+        // Unreachable: the caller checks `contains_object` first. Rendering the shape is a
+        // better failure than a panic if that ever stops being true.
+        Value::Map(_) => "{}".to_owned(),
+    }
+}
+
+/// Renders a value, expanding it across lines when it contains an object.
+///
+/// `depth` is the indent depth of the line the value begins on, so a continuation line
+/// carries its own indent and the closing bracket lines up with the key.
+fn render_value(value: &Value, depth: usize) -> String {
+    if !contains_object(value) {
+        return render_inline(value);
+    }
+    let pad = INDENT.repeat(depth);
+    let inner = INDENT.repeat(depth + 1);
+    match value {
+        Value::List(items) => {
+            let mut out = String::from("[\n");
+            let last = items.len().saturating_sub(1);
+            for (index, item) in items.iter().enumerate() {
+                out.push_str(&inner);
+                out.push_str(&render_value(&item.value, depth + 1));
+                if index != last {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            out.push_str(&pad);
+            out.push(']');
+            out
+        }
+        Value::Map(object) => {
+            if object.entries.is_empty() && object.block_comments.is_empty() {
+                return "{}".to_owned();
+            }
+            // Sorted by key, and without the `id`-first rule a record block uses: `id` is
+            // not a reserved key inside an object, so it sorts like any other.
+            let mut entries: Vec<&Property> = object.entries.iter().collect();
+            entries.sort_by(|left, right| left.key.value.cmp(&right.key.value));
+
+            let mut out = String::from("{\n");
+            let last = entries.len().saturating_sub(1);
+            for (index, entry) in entries.iter().enumerate() {
+                for comment in &entry.comments.leading {
+                    out.push_str(&inner);
+                    out.push_str(&render_comment(comment));
+                    out.push('\n');
+                }
+                let separator = if index == last { "" } else { "," };
+                let text = format!(
+                    "{}: {}{separator}",
+                    entry.key.value,
+                    render_value(&entry.value.value, depth + 1)
+                );
+                out.push_str(&inner);
+                out.push_str(&with_trailing(text, &entry.comments));
+                out.push('\n');
+            }
+            for comment in &object.block_comments {
+                out.push_str(&inner);
+                out.push_str(&render_comment(comment));
+                out.push('\n');
+            }
+            out.push_str(&pad);
+            out.push('}');
+            out
+        }
+        _ => render_inline(value),
     }
 }
 
@@ -202,7 +348,7 @@ fn write_record_body(writer: &mut Writer, depth: usize, head: &str, record: &Rec
             let text = format!(
                 "{}: {}{separator}",
                 property.key.value,
-                render_value(&property.value.value)
+                render_value(&property.value.value, depth + 1)
             );
             writer.line(depth + 1, &with_trailing(text, &property.comments));
         }
@@ -342,7 +488,7 @@ fn write_schema(writer: &mut Writer, schema: &SchemaDeclaration) {
                 "{}{}: {}{separator}",
                 field.key.value,
                 if field.optional { "?" } else { "" },
-                field.field_type.value
+                render_field_type(&field.field_type.value, 1)
             );
             writer.line(1, &with_trailing(text, &field.comments));
         }
@@ -454,11 +600,11 @@ mod tests {
     #[test]
     fn formatting_is_idempotent() {
         for source in [
-            "@nost 3\n",
-            "@nost 3\n@link \"./b\"\n@link \"./a\" as a\n",
-            "@nost 3\nschema L {\n b?: integer,\n a: string,\n}\nnode z: B, A {\n k: 1,\n}\nnode a: L {}\nedge a -> z :R {\n q: [1, 2],\n}\n",
-            "// lead\n@nost 3 // trail\n\n// about\nnode n: L {\n // key\n k: \"v\", // after\n}\n",
-            "@nost 3\nnode n: L {\n k: 1,\n\n @by \"r\" unit \"u_1\" {\n  @evidence {\n   source: \"./\",\n   confidence: inferred(0.5),\n  }\n }\n\n @by \"user\" {}\n}\n",
+            "@nost 4\n",
+            "@nost 4\n@link \"./b\"\n@link \"./a\" as a\n",
+            "@nost 4\nschema L {\n b?: integer,\n a: string,\n}\nnode z: B, A {\n k: 1,\n}\nnode a: L {}\nedge a -> z :R {\n q: [1, 2],\n}\n",
+            "// lead\n@nost 4 // trail\n\n// about\nnode n: L {\n // key\n k: \"v\", // after\n}\n",
+            "@nost 4\nnode n: L {\n k: 1,\n\n @by \"r\" unit \"u_1\" {\n  @evidence {\n   source: \"./\",\n   confidence: inferred(0.5),\n  }\n }\n\n @by \"user\" {}\n}\n",
         ] {
             let once = round_trip(source);
             let twice = round_trip(&once);
@@ -469,7 +615,7 @@ mod tests {
     #[test]
     fn output_is_sorted_deterministically() {
         let formatted = round_trip(
-            "@nost 3\n@link \"./z\"\n@link \"./a\"\nnode z: L {}\nnode a: L {}\nschema L {}\n",
+            "@nost 4\n@link \"./z\"\n@link \"./a\"\nnode z: L {}\nnode a: L {}\nschema L {}\n",
         );
         assert!(formatted.find("\"./a\"").unwrap() < formatted.find("\"./z\"").unwrap());
         assert!(formatted.find("node a").unwrap() < formatted.find("node z").unwrap());
@@ -480,7 +626,7 @@ mod tests {
     #[test]
     fn schema_names_and_keys_are_sorted_and_nodes_precede_edges() {
         let formatted =
-            round_trip("@nost 3\nedge a -> a :R {}\nnode a: Zed, Alpha {\n zz: 1,\n aa: 2,\n}\n");
+            round_trip("@nost 4\nedge a -> a :R {}\nnode a: Zed, Alpha {\n zz: 1,\n aa: 2,\n}\n");
         assert!(formatted.contains("node a: Alpha, Zed"), "{formatted}");
         assert!(formatted.find("aa: 2").unwrap() < formatted.find("zz: 1").unwrap());
         assert!(formatted.find("node a").unwrap() < formatted.find("edge a").unwrap());
@@ -489,7 +635,7 @@ mod tests {
     #[test]
     fn edges_sort_by_endpoints_then_relation_then_identifier() {
         let formatted =
-            round_trip("@nost 3\nedge b -> a :R {}\nedge a -> b :Z {}\nedge a -> b :A {}\n");
+            round_trip("@nost 4\nedge b -> a :R {}\nedge a -> b :Z {}\nedge a -> b :A {}\n");
         let first = formatted.find("edge a -> b :A").unwrap();
         let second = formatted.find("edge a -> b :Z").unwrap();
         let third = formatted.find("edge b -> a :R").unwrap();
@@ -498,7 +644,7 @@ mod tests {
 
     #[test]
     fn properties_are_comma_separated_with_no_trailing_comma() {
-        let formatted = round_trip("@nost 3\nnode n: L {\n a: 1,\n b: 2,\n}\n");
+        let formatted = round_trip("@nost 4\nnode n: L {\n a: 1,\n b: 2,\n}\n");
         assert!(formatted.contains("a: 1,\n"), "{formatted}");
         assert!(formatted.contains("b: 2\n"), "{formatted}");
         assert!(!formatted.contains("b: 2,"), "{formatted}");
@@ -506,20 +652,20 @@ mod tests {
 
     #[test]
     fn an_optional_field_keeps_its_question_mark() {
-        let formatted = round_trip("@nost 3\nschema S {\n a?: string[],\n b: integer,\n}\n");
+        let formatted = round_trip("@nost 4\nschema S {\n a?: string[],\n b: integer,\n}\n");
         assert!(formatted.contains("a?: string[],"), "{formatted}");
         assert!(formatted.contains("b: integer\n"), "{formatted}");
     }
 
     #[test]
     fn an_endpoint_constraint_is_reproduced() {
-        let formatted = round_trip("@nost 3\nschema R (A -> B) {\n s?: datetime,\n}\n");
+        let formatted = round_trip("@nost 4\nschema R (A -> B) {\n s?: datetime,\n}\n");
         assert!(formatted.contains("schema R (A -> B) {"), "{formatted}");
     }
 
     #[test]
     fn an_empty_block_is_written_as_braces() {
-        let formatted = round_trip("@nost 3\nnode a: L {\n}\nschema L {\n}\n");
+        let formatted = round_trip("@nost 4\nnode a: L {\n}\nschema L {\n}\n");
         assert!(formatted.contains("node a: L {}"), "{formatted}");
         assert!(formatted.contains("schema L {}"), "{formatted}");
     }
@@ -527,7 +673,7 @@ mod tests {
     #[test]
     fn contributions_sort_analyzer_then_ai_then_user() {
         let formatted = round_trip(
-            "@nost 3\nnode n: L {\n @by \"user\" {}\n @by \"ai:sha256:a\" {}\n @by \"z\" {}\n @by \"a\" {}\n}\n",
+            "@nost 4\nnode n: L {\n @by \"user\" {}\n @by \"ai:sha256:a\" {}\n @by \"z\" {}\n @by \"a\" {}\n}\n",
         );
         let analyzer_a = formatted.find("@by \"a\"").unwrap();
         let analyzer_z = formatted.find("@by \"z\"").unwrap();
@@ -540,7 +686,7 @@ mod tests {
 
     #[test]
     fn every_comment_survives_a_round_trip() {
-        let source = "// one\n@nost 3 // two\n\n// three\n@link \"./a\"\n\n\
+        let source = "// one\n@nost 4 // two\n\n// three\n@link \"./a\"\n\n\
             // four\nnode n: L { // five\n k: 1, // six\n // seven\n}\n\n// eight\n";
         let parsed = parse(source).unwrap();
         let before = parsed.all_comments().len();
@@ -554,7 +700,7 @@ mod tests {
 
     #[test]
     fn a_comment_inside_a_contribution_survives() {
-        let source = "@nost 3\nnode n: L {\n @by \"user\" { // owner\n  // inside\n }\n}\n";
+        let source = "@nost 4\nnode n: L {\n @by \"user\" { // owner\n  // inside\n }\n}\n";
         let parsed = parse(source).unwrap();
         assert_eq!(parsed.all_comments().len(), 2);
         let formatted = format(&parsed);
@@ -565,7 +711,7 @@ mod tests {
 
     #[test]
     fn a_number_is_normalized_when_it_can_be_read() {
-        let formatted = round_trip("@nost 3\nnode a: L {\n i: 007,\n f: 2E+1,\n}\n");
+        let formatted = round_trip("@nost 4\nnode a: L {\n i: 007,\n f: 2E+1,\n}\n");
         assert!(formatted.contains("i: 7"), "{formatted}");
         assert!(formatted.contains("f: 20.0"), "{formatted}");
     }
@@ -574,21 +720,21 @@ mod tests {
     fn an_unreadable_number_is_left_exactly_as_written() {
         // An out-of-range integer is a semantic diagnostic, so the formatter must not
         // silently alter the text a diagnostic will quote.
-        let formatted = round_trip("@nost 3\nnode a: L {\n i: 9223372036854775808,\n}\n");
+        let formatted = round_trip("@nost 4\nnode a: L {\n i: 9223372036854775808,\n}\n");
         assert!(formatted.contains("i: 9223372036854775808"), "{formatted}");
     }
 
     #[test]
     fn bytes_digits_are_lower_cased_and_strings_are_re_escaped() {
         let formatted =
-            round_trip("@nost 3\nnode a: L {\n b: bytes\"DEADbeef\",\n s: \"tab\\there\",\n}\n");
+            round_trip("@nost 4\nnode a: L {\n b: bytes\"DEADbeef\",\n s: \"tab\\there\",\n}\n");
         assert!(formatted.contains("bytes\"deadbeef\""), "{formatted}");
         assert!(formatted.contains("\"tab\\there\""), "{formatted}");
     }
 
     #[test]
     fn the_file_ends_with_exactly_one_newline() {
-        for source in ["@nost 3\n", "@nost 3\nnode a: L {}\n"] {
+        for source in ["@nost 4\n", "@nost 4\nnode a: L {}\n"] {
             let formatted = round_trip(source);
             assert!(formatted.ends_with('\n'));
             assert!(!formatted.ends_with("\n\n"), "{formatted:?}");

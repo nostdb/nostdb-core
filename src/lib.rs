@@ -106,7 +106,7 @@ pub use mutate::WriteSummary;
 pub use name::{DeclarationName, Label, LinkAlias, PropertyKey, RelationName};
 pub use procedure::{FUNCTIONS, PROCEDURES};
 pub use project::{Project, ProjectError};
-pub use property::{PropertyScalar, PropertyValue};
+pub use property::{MAX_NESTING_DEPTH, PropertyScalar, PropertyValue};
 pub use result::{RESULT_VERSION, ResultEnvelope};
 pub use schema::{
     EffectiveSchema, EndpointConstraint, FieldType, ScalarType, Schema, SchemaField,

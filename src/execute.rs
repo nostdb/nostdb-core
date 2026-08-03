@@ -51,6 +51,7 @@ use crate::locator::CanonicalSourceLocator;
 use crate::mutate::{
     PatternValues, WriteSummary, Writer, remove_variable, set_value, set_variable,
 };
+use crate::name::PropertyKey;
 use crate::procedure;
 use crate::property::{FiniteF64, PropertyValue};
 use std::collections::{BTreeMap, BTreeSet};
@@ -167,6 +168,13 @@ pub enum QueryValue {
     Text(String),
     /// A list.
     List(Vec<QueryValue>),
+    /// An object, returned whole.
+    ///
+    /// A query can produce one only by returning a property that holds one. The subset has
+    /// no syntax for reaching inside it — `QUERY_SUBSET.md` section 3.1 refuses a path step
+    /// past the property key — so this variant is carried to the envelope and never
+    /// indexed, compared field by field, or constructed from an expression.
+    Object(Vec<(PropertyKey, QueryValue)>),
     /// A bound node.
     Node(ScopedNode),
     /// A bound relationship.
@@ -200,6 +208,7 @@ impl QueryValue {
             Self::Float(_) => "a number",
             Self::Text(_) => "text",
             Self::List(_) => "a list",
+            Self::Object(_) => "an object",
             Self::Node(_) => "a node",
             Self::Relationship(_) => "a relationship",
             Self::Path { .. } => "a path",
@@ -219,10 +228,13 @@ impl QueryValue {
                     .collect::<String>(),
             ),
             PropertyValue::DateTime(inner) => Self::Text(inner.as_str().to_owned()),
-            PropertyValue::List(items) => Self::List(
-                items
+            PropertyValue::List(items) => {
+                Self::List(items.iter().map(Self::from_property).collect())
+            }
+            PropertyValue::Map(entries) => Self::Object(
+                entries
                     .iter()
-                    .map(|item| Self::from_property(&PropertyValue::from(item.clone())))
+                    .map(|(key, held)| (key.clone(), Self::from_property(held)))
                     .collect(),
             ),
         }
@@ -241,6 +253,12 @@ impl QueryValue {
             Self::Float(value) => SortKey::Number(Number::Float(value.get())),
             Self::Text(value) => SortKey::Text(value.clone()),
             Self::List(items) => SortKey::List(items.iter().map(Self::sort_key).collect()),
+            Self::Object(entries) => SortKey::Object(
+                entries
+                    .iter()
+                    .map(|(key, held)| (key.as_str().to_owned(), held.sort_key()))
+                    .collect(),
+            ),
             Self::Node(id) => SortKey::Node(id.sort_key()),
             Self::Relationship(id) => SortKey::Relationship(id.sort_key()),
             Self::Path { nodes, .. } => SortKey::Path(nodes.iter().map(Scoped::sort_key).collect()),
@@ -306,6 +324,12 @@ enum SortKey {
     Node(String),
     Relationship(String),
     Path(Vec<String>),
+    /// Entries in stored order, each a key and the key's own sort key.
+    ///
+    /// Last, so an object orders after every other kind. The query contract's total
+    /// order names the kinds in this sequence, and an object joining it at the end is
+    /// the only position that reorders nothing that already had one.
+    Object(Vec<(String, SortKey)>),
 }
 
 /// A numeric value, compared by value across both representations.
@@ -385,6 +409,13 @@ impl fmt::Display for QueryValue {
             Self::Integer(value) => write!(formatter, "{value}"),
             Self::Float(value) => write!(formatter, "{value}"),
             Self::Text(value) => write!(formatter, "{value}"),
+            Self::Object(entries) => {
+                let rendered: Vec<String> = entries
+                    .iter()
+                    .map(|(key, held)| format!("{}: {held}", key.as_str()))
+                    .collect();
+                write!(formatter, "{{{}}}", rendered.join(", "))
+            }
             Self::List(items) => {
                 let rendered: Vec<String> = items.iter().map(ToString::to_string).collect();
                 write!(formatter, "[{}]", rendered.join(", "))

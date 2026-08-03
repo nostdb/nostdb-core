@@ -852,7 +852,7 @@ mod tests {
 
     #[test]
     fn every_token_carries_a_usable_range() {
-        let tokens = tokenize("@nost 3\nschema S {}\n").unwrap();
+        let tokens = tokenize("@nost 4\nschema S {}\n").unwrap();
         for token in &tokens {
             assert!(token.range.start().line >= 1);
             assert!(token.range.start().column >= 1);

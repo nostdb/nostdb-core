@@ -29,7 +29,7 @@ pub mod validate;
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Severity};
 use crate::evidence::SourceRange;
-pub use crate::schema::{FieldType, ScalarType};
+pub use crate::schema::ScalarType;
 use crate::text::NonEmptyText;
 use std::fmt;
 
@@ -141,7 +141,16 @@ pub struct Spanned<T> {
 /// Refusing at the header is the point. A version 2 document reaching a version 3 parser would otherwise fail
 /// at `@by` with a parse error, which reads as a malformed document rather than as one written to a contract
 /// this build no longer implements.
-pub const LANGUAGE_VERSION: u32 = 3;
+///
+/// Version 4 is the one case where every change is **additive** — an object field type, an object literal, a
+/// repeatable array suffix, and an optional separator — so a version 3 document would mean exactly what it
+/// meant before. It is still refused, because a reader accepting `@nost 3` would have to refuse the syntax
+/// version 3 had no production for, or else the number it read governed nothing. Gating syntax on a declared
+/// version is machinery whose whole return is saving a one-line edit to a file `nost: true` regenerates.
+///
+/// `nostdb_format_version` moved with it and does **not** refuse its predecessor. The asymmetry is deliberate:
+/// a `.nost` file is editable text, and a `.nostdb` is opaque and holds contributions no analyzer can rebuild.
+pub const LANGUAGE_VERSION: u32 = 4;
 
 /// A parsed `.nost` file.
 #[derive(Clone, Debug, PartialEq)]
@@ -286,6 +295,96 @@ pub struct SchemaField {
     pub field_type: Spanned<FieldType>,
     /// Attached comments.
     pub comments: Comments,
+}
+
+/// A declared field type, as written.
+///
+/// This is the CST's own type rather than [`crate::schema::FieldType`], which the CST
+/// re-exported while a field type was one token and carried nothing to preserve. An
+/// object type contains fields, and a field in this tree carries comments and a source
+/// range that the model deliberately does not. Sharing one type would have made a
+/// comment inside a nested object type unrepresentable, and the canonical form requires
+/// every comment to survive a format pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FieldType {
+    /// One scalar.
+    Scalar(ScalarType),
+    /// An object type, written as a field block.
+    Object(ObjectType),
+    /// A list whose every element has the inner type.
+    Array(Box<FieldType>),
+}
+
+/// The field block an object type is written as.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectType {
+    /// Fields, in source order.
+    pub fields: Vec<SchemaField>,
+    /// Own-line comments left at the end of the block.
+    pub block_comments: Vec<Comment>,
+}
+
+impl fmt::Display for FieldType {
+    /// Renders the type as a diagnostic quotes it, on one line.
+    ///
+    /// This is not the canonical writer. `format` expands an object type across lines
+    /// and reproduces its comments; a diagnostic wants the shape in a sentence.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Scalar(scalar) => formatter.write_str(scalar.as_str()),
+            Self::Array(inner) => write!(formatter, "{inner}[]"),
+            Self::Object(object) => {
+                if object.fields.is_empty() {
+                    return formatter.write_str("{}");
+                }
+                formatter.write_str("{ ")?;
+                for (index, field) in object.fields.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    formatter.write_str(&field.key.value)?;
+                    if field.optional {
+                        formatter.write_str("?")?;
+                    }
+                    write!(formatter, ": {}", field.field_type.value)?;
+                }
+                formatter.write_str(" }")
+            }
+        }
+    }
+}
+
+impl FieldType {
+    /// The nesting depth of this type: 0 for a scalar, and one more than its inner type
+    /// for a list or an object.
+    ///
+    /// Iterative, because the parser measures a type while building it and a document
+    /// deep enough to matter is deep enough to overflow the stack being measured.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        let mut deepest = 0;
+        let mut pending = vec![(self, 0_usize)];
+        while let Some((declared, depth)) = pending.pop() {
+            deepest = deepest.max(depth);
+            match declared {
+                Self::Array(inner) => {
+                    deepest = deepest.max(depth + 1);
+                    pending.push((inner.as_ref(), depth + 1));
+                }
+                Self::Object(object) => {
+                    deepest = deepest.max(depth + 1);
+                    pending.extend(
+                        object
+                            .fields
+                            .iter()
+                            .map(|field| (&field.field_type.value, depth + 1)),
+                    );
+                }
+                Self::Scalar(_) => {}
+            }
+        }
+        deepest
+    }
 }
 
 /// The body every record declaration shares.
@@ -444,7 +543,9 @@ pub enum Endpoint {
 }
 
 /// A property.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `Eq` because an object literal holds these and [`Value`] is `Eq`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Property {
     /// The key.
     pub key: Spanned<String>,
@@ -478,8 +579,23 @@ pub enum Value {
     },
     /// A `datetime` literal, as written.
     DateTime(String),
-    /// A list of scalars, which does not nest.
+    /// A list of values, which may nest.
     List(Vec<Spanned<Value>>),
+    /// An object literal.
+    Map(ObjectValue),
+}
+
+/// The property list an object literal is written as.
+///
+/// Its entries are [`Property`], the same type a record block holds, because an object
+/// literal is exactly a record block's property list. That is what carries a comment
+/// written inside one through a format pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectValue {
+    /// Entries, in source order.
+    pub entries: Vec<Property>,
+    /// Own-line comments left at the end of the block.
+    pub block_comments: Vec<Comment>,
 }
 
 impl Value {
@@ -494,6 +610,37 @@ impl Value {
             Self::Bytes { .. } => "bytes",
             Self::DateTime(_) => "datetime",
             Self::List(_) => "list",
+            Self::Map(_) => "object",
         }
+    }
+
+    /// The nesting depth of this value: 0 for a scalar, and one more than its deepest
+    /// child for a list or an object.
+    ///
+    /// Iterative, for the reason [`FieldType::depth`] is.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        let mut deepest = 0;
+        let mut pending = vec![(self, 0_usize)];
+        while let Some((value, depth)) = pending.pop() {
+            deepest = deepest.max(depth);
+            match value {
+                Self::List(items) => {
+                    deepest = deepest.max(depth + 1);
+                    pending.extend(items.iter().map(|item| (&item.value, depth + 1)));
+                }
+                Self::Map(object) => {
+                    deepest = deepest.max(depth + 1);
+                    pending.extend(
+                        object
+                            .entries
+                            .iter()
+                            .map(|entry| (&entry.value.value, depth + 1)),
+                    );
+                }
+                _ => {}
+            }
+        }
+        deepest
     }
 }

@@ -8,14 +8,38 @@
 //! assigning `null` removes a property; a property that should not exist is simply
 //! absent from a record.
 //!
-//! # A list holds scalars
+//! # A list holds values, and a value may be an object
 //!
-//! [`PropertyValue::List`] holds [`PropertyScalar`], not [`PropertyValue`], so
-//! lists cannot nest. That is enforced by the types rather than checked.
+//! [`PropertyValue::List`] holds [`PropertyValue`], so a list of objects and a list
+//! of lists are both representable. [`PropertyValue::Map`] is an object: entries in
+//! source order, each a [`PropertyKey`] and a value.
+//!
+//! Until `nost_language_version` 4 a list held [`PropertyScalar`] and could not
+//! nest, which the type enforced rather than checked. [`PropertyScalar`] remains,
+//! because a context that genuinely admits no container still wants to say so in
+//! its signature rather than in a runtime check.
+//!
+//! # Nesting is bounded
+//!
+//! A `.nost` file and a `.nostdb` container are untrusted input, and every nested
+//! level costs stack in a recursive reader, writer, or comparison. [`MAX_NESTING_DEPTH`]
+//! is the limit the language contract requires every implementation to accept, and
+//! [`PropertyValue::depth`] measures a value against it.
 
+use crate::name::PropertyKey;
 use crate::text::NonEmptyText;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+
+/// The maximum nesting depth of a property value or a declared field type.
+///
+/// The `.nost` language contract section 5.3.1.1 requires every implementation to
+/// accept at least this many levels and permits refusing more. This implementation
+/// refuses more, because accepting an unbounded depth would let one document
+/// exhaust the stack of every reader that walks it.
+///
+/// A scalar has depth 0. Each list and each object adds one.
+pub const MAX_NESTING_DEPTH: usize = 8;
 
 /// A finite double-precision number.
 ///
@@ -312,9 +336,11 @@ fn validate_rfc3339(value: &str) -> Result<(), DateTimeError> {
     Ok(())
 }
 
-/// A scalar property value.
+/// A scalar property value: a value that is neither a list nor an object.
 ///
-/// A list holds scalars, so this type is what a list element may be.
+/// This was the element type of [`PropertyValue::List`] while lists could not nest.
+/// It stays because it is the honest signature for a position that admits no
+/// container, and converts into a [`PropertyValue`] whenever one is wanted.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PropertyScalar {
     /// A boolean.
@@ -348,8 +374,14 @@ pub enum PropertyValue {
     Bytes(Vec<u8>),
     /// An RFC 3339 timestamp.
     DateTime(DateTime),
-    /// An ordered list of scalars, which does not nest.
-    List(Vec<PropertyScalar>),
+    /// An ordered list of values, which may nest.
+    List(Vec<PropertyValue>),
+    /// An object: entries in source order.
+    ///
+    /// A `Vec` rather than a map, for the reason `Node::properties` is one: order is
+    /// what a comment-preserving round trip reproduces, and a duplicate key is a
+    /// diagnostic rather than something a container silently drops.
+    Map(Vec<(PropertyKey, PropertyValue)>),
 }
 
 impl PropertyValue {
@@ -357,6 +389,12 @@ impl PropertyValue {
     #[must_use]
     pub const fn is_list(&self) -> bool {
         matches!(self, Self::List(_))
+    }
+
+    /// Reports whether this value is an object.
+    #[must_use]
+    pub const fn is_map(&self) -> bool {
+        matches!(self, Self::Map(_))
     }
 
     /// The name of this value's type, for diagnostics.
@@ -370,7 +408,44 @@ impl PropertyValue {
             Self::Bytes(_) => "bytes",
             Self::DateTime(_) => "datetime",
             Self::List(_) => "list",
+            Self::Map(_) => "object",
         }
+    }
+
+    /// The nesting depth of this value: 0 for a scalar, and one more than its
+    /// deepest child for a list or an object.
+    ///
+    /// An empty list or object has depth 1: the container is a level even with
+    /// nothing in it, because a reader still descends into it.
+    ///
+    /// Written iteratively over an explicit stack rather than recursively, because a
+    /// value deep enough to be worth measuring is deep enough to overflow the stack
+    /// while measuring it.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        let mut deepest = 0;
+        let mut pending = vec![(self, 0_usize)];
+        while let Some((value, depth)) = pending.pop() {
+            deepest = deepest.max(depth);
+            match value {
+                Self::List(items) => {
+                    deepest = deepest.max(depth + 1);
+                    pending.extend(items.iter().map(|item| (item, depth + 1)));
+                }
+                Self::Map(entries) => {
+                    deepest = deepest.max(depth + 1);
+                    pending.extend(entries.iter().map(|(_, item)| (item, depth + 1)));
+                }
+                _ => {}
+            }
+        }
+        deepest
+    }
+
+    /// Reports whether this value nests deeper than [`MAX_NESTING_DEPTH`].
+    #[must_use]
+    pub fn exceeds_nesting_limit(&self) -> bool {
+        self.depth() > MAX_NESTING_DEPTH
     }
 }
 
@@ -536,11 +611,11 @@ mod tests {
     }
 
     #[test]
-    fn a_list_holds_scalars_and_therefore_cannot_nest() {
+    fn a_list_holds_values_of_mixed_kinds() {
         let list = PropertyValue::List(vec![
-            PropertyScalar::Integer(1),
-            PropertyScalar::String("two".to_owned()),
-            PropertyScalar::Float(FiniteF64::new(2.5).unwrap()),
+            PropertyValue::Integer(1),
+            PropertyValue::String("two".to_owned()),
+            PropertyValue::Float(FiniteF64::new(2.5).unwrap()),
         ]);
         assert!(list.is_list());
         assert_eq!(list.type_name(), "list");

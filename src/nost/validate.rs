@@ -151,7 +151,7 @@ fn check_schemas(file: &SourceFile, found: &mut Vec<Diagnostic>) {
 /// required in either is required. Taking the stricter reading is the only rule that
 /// cannot silently weaken a declaration its author wrote.
 struct EffectiveSchema<'a> {
-    fields: BTreeMap<&'a str, (FieldType, bool)>,
+    fields: BTreeMap<&'a str, (&'a FieldType, bool)>,
 }
 
 fn effective_schema<'a>(
@@ -159,7 +159,7 @@ fn effective_schema<'a>(
     named: &'a [Spanned<String>],
     found: &mut Vec<Diagnostic>,
 ) -> EffectiveSchema<'a> {
-    let mut fields: BTreeMap<&'a str, (FieldType, bool)> = BTreeMap::new();
+    let mut fields: BTreeMap<&'a str, (&'a FieldType, bool)> = BTreeMap::new();
     for name in named {
         let Some(schema) = schemas.get(name.value.as_str()) else {
             // A record may name an undeclared schema; the name is then an unvalidated
@@ -169,7 +169,7 @@ fn effective_schema<'a>(
         };
         for field in &schema.fields {
             let key = field.key.value.as_str();
-            let declared = field.field_type.value;
+            let declared = &field.field_type.value;
             match fields.get_mut(key) {
                 None => {
                     fields.insert(key, (declared, !field.optional));
@@ -193,16 +193,83 @@ fn effective_schema<'a>(
     EffectiveSchema { fields }
 }
 
-fn value_matches(value: &Value, declared: FieldType) -> bool {
-    if declared.array {
-        return match value {
-            Value::List(items) => items
-                .iter()
-                .all(|item| scalar_matches(&item.value, declared.scalar)),
-            _ => false,
-        };
+/// Reports whether `value` has the *shape* `declared` states.
+///
+/// An object type matches any object, and the entries inside it are checked by
+/// [`check_nested`]. The split is the one [`crate::schema::FieldType::accepts`] makes and
+/// for the same reason: a Schema is open and validation is soft, so a missing nested key
+/// is a violation of that key rather than evidence the value is not an object.
+fn value_matches(value: &Value, declared: &FieldType) -> bool {
+    match (declared, value) {
+        (FieldType::Scalar(scalar), _) => scalar_matches(value, *scalar),
+        (FieldType::Array(inner), Value::List(items)) => {
+            items.iter().all(|item| value_matches(&item.value, inner))
+        }
+        (FieldType::Object(_), Value::Map(_)) => true,
+        _ => false,
     }
-    scalar_matches(value, declared.scalar)
+}
+
+/// Reports every violation inside an object value, naming each by path.
+///
+/// Reached only once [`value_matches`] agreed on the shape. Each diagnostic points at the
+/// offending value's own range rather than at the record head, which is the whole reason
+/// this walk lives here rather than only in the model: the CST has spans and the graph
+/// does not.
+fn check_nested(
+    declared: &FieldType,
+    value: &Spanned<Value>,
+    path: &str,
+    found: &mut Vec<Diagnostic>,
+) {
+    match (declared, &value.value) {
+        (FieldType::Object(object), Value::Map(map)) => {
+            for field in &object.fields {
+                let child = format!("{path}.{}", field.key.value);
+                // The first entry with this key wins. A repeated key is reported as
+                // NOST_DUPLICATE_PROPERTY_KEY where duplicates are found.
+                match map
+                    .entries
+                    .iter()
+                    .find(|entry| entry.key.value == field.key.value)
+                {
+                    None => {
+                        if !field.optional {
+                            found.push(diagnostic(
+                                DiagnosticCode::NostSchemaViolation,
+                                value.range,
+                                format!(
+                                    "the required field {child} of type {} is missing",
+                                    field.field_type.value
+                                ),
+                            ));
+                        }
+                    }
+                    Some(entry) => {
+                        if value_matches(&entry.value.value, &field.field_type.value) {
+                            check_nested(&field.field_type.value, &entry.value, &child, found);
+                        } else {
+                            found.push(diagnostic(
+                                DiagnosticCode::NostSchemaViolation,
+                                entry.value.range,
+                                format!(
+                                    "the field {child} is declared {} but holds a {}",
+                                    field.field_type.value,
+                                    entry.value.value.kind_name()
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        (FieldType::Array(inner), Value::List(items)) => {
+            for (index, item) in items.iter().enumerate() {
+                check_nested(inner, item, &format!("{path}[{index}]"), found);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn scalar_matches(value: &Value, scalar: ScalarType) -> bool {
@@ -259,7 +326,9 @@ fn check_record(
                 }
             }
             Some(property) => {
-                if !value_matches(&property.value.value, *declared) {
+                if value_matches(&property.value.value, declared) {
+                    check_nested(declared, &property.value, key, found);
+                } else {
                     found.push(diagnostic(
                         DiagnosticCode::NostSchemaViolation,
                         property.value.range,
@@ -713,6 +782,25 @@ fn check_value(key: &str, value: &Spanned<Value>, found: &mut Vec<Diagnostic>) {
                 check_value(key, item, found);
             }
         }
+        Value::Map(object) => {
+            // An object's entries follow every rule a record block's properties follow,
+            // including the duplicate-key rule. Each entry is checked under its own key,
+            // so a nested `confidence_score` is range-checked like a top-level one.
+            let mut seen: BTreeSet<&str> = BTreeSet::new();
+            for entry in &object.entries {
+                if !seen.insert(entry.key.value.as_str()) {
+                    found.push(diagnostic(
+                        DiagnosticCode::NostDuplicatePropertyKey,
+                        entry.key.range,
+                        format!(
+                            "the property key {} is set more than once in this object",
+                            entry.key.value
+                        ),
+                    ));
+                }
+                check_value(&entry.key.value, &entry.value, found);
+            }
+        }
         Value::Boolean(_) | Value::String(_) | Value::Bytes { .. } => {}
     }
 }
@@ -742,7 +830,7 @@ mod tests {
 
     #[test]
     fn a_valid_file_reports_nothing() {
-        assert!(codes("@nost 3\nschema L {\n k: integer,\n}\nnode n: L {\n k: 1,\n}\n").is_empty());
+        assert!(codes("@nost 4\nschema L {\n k: integer,\n}\nnode n: L {\n k: 1,\n}\n").is_empty());
     }
 
     #[test]
@@ -764,11 +852,11 @@ mod tests {
     #[test]
     fn reports_duplicate_links() {
         assert_eq!(
-            codes("@nost 3\n@link \"./a\"\n@link \"./a\" as a\n"),
+            codes("@nost 4\n@link \"./a\"\n@link \"./a\" as a\n"),
             vec![DiagnosticCode::NostDuplicateLinkSource]
         );
         assert_eq!(
-            codes("@nost 3\n@link \"./a\" as s\n@link \"./b\" as s\n"),
+            codes("@nost 4\n@link \"./a\" as s\n@link \"./b\" as s\n"),
             vec![DiagnosticCode::NostDuplicateLinkAlias]
         );
     }
@@ -776,7 +864,7 @@ mod tests {
     #[test]
     fn reports_a_duplicate_schema_name() {
         assert_eq!(
-            codes("@nost 3\nschema S {}\nschema S {}\n"),
+            codes("@nost 4\nschema S {}\nschema S {}\n"),
             vec![DiagnosticCode::NostDuplicateSchemaName]
         );
     }
@@ -784,17 +872,17 @@ mod tests {
     #[test]
     fn reports_duplicate_names_ids_and_keys() {
         assert_eq!(
-            codes("@nost 3\nnode d: L {}\nnode d: L {}\n"),
+            codes("@nost 4\nnode d: L {}\nnode d: L {}\n"),
             vec![DiagnosticCode::NostDuplicateDeclarationName]
         );
         assert_eq!(
             codes(&format!(
-                "@nost 3\nnode a: L {{\n id: \"{NODE_ID}\",\n}}\nnode b: L {{\n id: \"{NODE_ID}\",\n}}\n"
+                "@nost 4\nnode a: L {{\n id: \"{NODE_ID}\",\n}}\nnode b: L {{\n id: \"{NODE_ID}\",\n}}\n"
             )),
             vec![DiagnosticCode::NostDuplicateId]
         );
         assert_eq!(
-            codes("@nost 3\nnode a: L {\n k: 1,\n k: 2,\n}\n"),
+            codes("@nost 4\nnode a: L {\n k: 1,\n k: 2,\n}\n"),
             vec![DiagnosticCode::NostDuplicatePropertyKey]
         );
     }
@@ -802,13 +890,13 @@ mod tests {
     #[test]
     fn reports_a_malformed_record_identifier() {
         assert_eq!(
-            codes("@nost 3\nnode a: L {\n id: \"n_1\",\n}\n"),
+            codes("@nost 4\nnode a: L {\n id: \"n_1\",\n}\n"),
             vec![DiagnosticCode::NostInvalidId]
         );
         // A node identifier where an edge identifier belongs is refused by its prefix.
         assert_eq!(
             codes(&format!(
-                "@nost 3\nedge a -> a :R {{\n id: \"{NODE_ID}\",\n}}\n"
+                "@nost 4\nedge a -> a :R {{\n id: \"{NODE_ID}\",\n}}\n"
             ))
             .into_iter()
             .filter(|code| *code == DiagnosticCode::NostInvalidId)
@@ -821,14 +909,14 @@ mod tests {
     fn an_edge_identifier_is_accepted_on_an_edge() {
         let edge_id = format!("e_{}", &NODE_ID[2..]);
         let source =
-            format!("@nost 3\nnode a: L {{}}\nedge a -> a :R {{\n id: \"{edge_id}\",\n}}\n");
+            format!("@nost 4\nnode a: L {{}}\nedge a -> a :R {{\n id: \"{edge_id}\",\n}}\n");
         assert!(codes(&source).is_empty(), "{:?}", codes(&source));
     }
 
     #[test]
     fn two_records_may_state_different_identifiers() {
         let source = format!(
-            "@nost 3\nnode a: L {{\n id: \"{NODE_ID}\",\n}}\nnode b: L {{\n id: \"{OTHER_ID}\",\n}}\n"
+            "@nost 4\nnode a: L {{\n id: \"{NODE_ID}\",\n}}\nnode b: L {{\n id: \"{OTHER_ID}\",\n}}\n"
         );
         assert!(codes(&source).is_empty(), "{:?}", codes(&source));
     }
@@ -836,11 +924,11 @@ mod tests {
     #[test]
     fn reports_a_missing_required_field_and_a_wrong_type() {
         assert_eq!(
-            codes("@nost 3\nschema S {\n name: string,\n}\nnode a: S {}\n"),
+            codes("@nost 4\nschema S {\n name: string,\n}\nnode a: S {}\n"),
             vec![DiagnosticCode::NostSchemaViolation]
         );
         assert_eq!(
-            codes("@nost 3\nschema S {\n name: string,\n}\nnode a: S {\n name: 42,\n}\n"),
+            codes("@nost 4\nschema S {\n name: string,\n}\nnode a: S {\n name: 42,\n}\n"),
             vec![DiagnosticCode::NostSchemaViolation]
         );
     }
@@ -848,7 +936,7 @@ mod tests {
     #[test]
     fn an_optional_field_may_be_omitted_and_a_schema_is_open() {
         assert!(
-            codes("@nost 3\nschema S {\n name?: string,\n}\nnode a: S {\n extra: 1,\n}\n")
+            codes("@nost 4\nschema S {\n name?: string,\n}\nnode a: S {\n extra: 1,\n}\n")
                 .is_empty()
         );
     }
@@ -856,15 +944,15 @@ mod tests {
     #[test]
     fn an_array_field_checks_every_element() {
         assert!(
-            codes("@nost 3\nschema S {\n t: string[],\n}\nnode a: S {\n t: [\"x\", \"y\"],\n}\n")
+            codes("@nost 4\nschema S {\n t: string[],\n}\nnode a: S {\n t: [\"x\", \"y\"],\n}\n")
                 .is_empty()
         );
         assert_eq!(
-            codes("@nost 3\nschema S {\n t: string[],\n}\nnode a: S {\n t: [\"x\", 1],\n}\n"),
+            codes("@nost 4\nschema S {\n t: string[],\n}\nnode a: S {\n t: [\"x\", 1],\n}\n"),
             vec![DiagnosticCode::NostSchemaViolation]
         );
         assert_eq!(
-            codes("@nost 3\nschema S {\n t: string[],\n}\nnode a: S {\n t: \"x\",\n}\n"),
+            codes("@nost 4\nschema S {\n t: string[],\n}\nnode a: S {\n t: \"x\",\n}\n"),
             vec![DiagnosticCode::NostSchemaViolation]
         );
     }
@@ -873,7 +961,7 @@ mod tests {
     fn two_schemas_disagreeing_on_a_field_type_conflict() {
         assert_eq!(
             codes(
-                "@nost 3\nschema A {\n k: string,\n}\nschema B {\n k: integer,\n}\nnode n: A, B {\n k: \"x\",\n}\n"
+                "@nost 4\nschema A {\n k: string,\n}\nschema B {\n k: integer,\n}\nnode n: A, B {\n k: \"x\",\n}\n"
             )
             .into_iter()
             .filter(|code| *code == DiagnosticCode::NostSchemaConflict)
@@ -887,7 +975,7 @@ mod tests {
         // Required in one and optional in the other means required.
         assert_eq!(
             codes(
-                "@nost 3\nschema A {\n k: string,\n}\nschema B {\n k?: string,\n}\nnode n: A, B {}\n"
+                "@nost 4\nschema A {\n k: string,\n}\nschema B {\n k?: string,\n}\nnode n: A, B {}\n"
             ),
             vec![DiagnosticCode::NostSchemaViolation]
         );
@@ -895,12 +983,12 @@ mod tests {
 
     #[test]
     fn an_undeclared_schema_name_is_an_unvalidated_label() {
-        assert!(codes("@nost 3\nnode n: NotDeclared {\n anything: 1,\n}\n").is_empty());
+        assert!(codes("@nost 4\nnode n: NotDeclared {\n anything: 1,\n}\n").is_empty());
     }
 
     #[test]
     fn reports_an_endpoint_constraint_violation() {
-        let source = "@nost 3\nschema A {}\nschema B {}\nschema R (A -> B) {}\n\
+        let source = "@nost 4\nschema A {}\nschema B {}\nschema R (A -> B) {}\n\
             node x: A {}\nnode y: A {}\nedge x -> y :R {}\n";
         assert_eq!(
             codes(source),
@@ -911,7 +999,7 @@ mod tests {
 
     #[test]
     fn reports_an_unknown_alias_or_locator_and_an_unresolved_local_endpoint() {
-        let base = "@nost 3\nnode a: L {}\n";
+        let base = "@nost 4\nnode a: L {}\n";
         assert_eq!(
             codes(&format!("{base}edge a -> absent::x :R {{}}\n")),
             vec![DiagnosticCode::NostUnknownLinkAlias]
@@ -929,7 +1017,7 @@ mod tests {
     #[test]
     fn an_unresolved_endpoint_and_a_schema_violation_are_only_warnings() {
         let file =
-            parse("@nost 3\nschema S {\n k: string,\n}\nnode a: S {}\nedge a -> gone :R {}\n")
+            parse("@nost 4\nschema S {\n k: string,\n}\nnode a: S {}\nedge a -> gone :R {}\n")
                 .unwrap();
         let found = validate(&file);
         assert_eq!(found.len(), 2);
@@ -941,7 +1029,7 @@ mod tests {
 
     #[test]
     fn reports_value_rules_including_inside_a_list() {
-        let head = "@nost 3\nnode a: L {\n";
+        let head = "@nost 4\nnode a: L {\n";
         assert_eq!(
             codes(&format!("{head} k: 9223372036854775808,\n}}\n")),
             vec![DiagnosticCode::NostIntegerOutOfRange]
@@ -963,18 +1051,18 @@ mod tests {
     #[test]
     fn an_ordinary_float_outside_zero_to_one_is_accepted() {
         // The range rule applies to a confidence score, not to every number.
-        assert!(codes("@nost 3\nnode a: L {\n ratio: 7.5,\n}\n").is_empty());
+        assert!(codes("@nost 4\nnode a: L {\n ratio: 7.5,\n}\n").is_empty());
     }
 
     #[test]
     fn the_labels_key_must_hold_a_list_of_strings() {
-        assert!(codes("@nost 3\nnode a: L {\n labels: [\"X\", \"Y\"],\n}\n").is_empty());
+        assert!(codes("@nost 4\nnode a: L {\n labels: [\"X\", \"Y\"],\n}\n").is_empty());
         assert_eq!(
-            codes("@nost 3\nnode a: L {\n labels: \"X\",\n}\n"),
+            codes("@nost 4\nnode a: L {\n labels: \"X\",\n}\n"),
             vec![DiagnosticCode::NostSchemaViolation]
         );
         assert_eq!(
-            codes("@nost 3\nnode a: L {\n labels: [1],\n}\n"),
+            codes("@nost 4\nnode a: L {\n labels: [1],\n}\n"),
             vec![DiagnosticCode::NostSchemaViolation]
         );
     }
@@ -991,7 +1079,7 @@ mod tests {
             format!("{body}   producer_version: \"1\",\n")
         };
         codes(&format!(
-            "@nost 3\nnode a: L {{\n @by \"r\" {{\n  @evidence {{\n{body}  }}\n }}\n}}\n"
+            "@nost 4\nnode a: L {{\n @by \"r\" {{\n  @evidence {{\n{body}  }}\n }}\n}}\n"
         ))
     }
 
@@ -1063,13 +1151,13 @@ mod tests {
 
     #[test]
     fn only_a_user_contribution_may_omit_evidence() {
-        assert!(codes("@nost 3\nnode a: L {\n @by \"user\" {}\n}\n").is_empty());
+        assert!(codes("@nost 4\nnode a: L {\n @by \"user\" {}\n}\n").is_empty());
         assert_eq!(
-            codes("@nost 3\nnode a: L {\n @by \"r\" {}\n}\n"),
+            codes("@nost 4\nnode a: L {\n @by \"r\" {}\n}\n"),
             vec![DiagnosticCode::NostInvalidEvidence]
         );
         assert_eq!(
-            codes("@nost 3\nnode a: L {\n @by \"ai:sha256:x\" {}\n}\n"),
+            codes("@nost 4\nnode a: L {\n @by \"ai:sha256:x\" {}\n}\n"),
             vec![DiagnosticCode::NostInvalidEvidence]
         );
     }
@@ -1077,7 +1165,7 @@ mod tests {
     #[test]
     fn a_producer_is_required_when_there_is_no_analyzer_to_inherit_from() {
         let found = codes(
-            "@nost 3\nnode a: L {\n @by \"ai:sha256:x\" {\n  @evidence {\n   source: \"./\",\n   \
+            "@nost 4\nnode a: L {\n @by \"ai:sha256:x\" {\n  @evidence {\n   source: \"./\",\n   \
              digest: \"sha256:abcdef0123456789abcdef0123456789\",\n   method: ai_inferred,\n   \
              confidence: inferred(0.5),\n  }\n }\n}\n",
         );
@@ -1094,7 +1182,7 @@ mod tests {
     #[test]
     fn a_malformed_source_unit_is_reported() {
         assert_eq!(
-            codes("@nost 3\nnode a: L {\n @by \"user\" unit \"u_1\" {}\n}\n"),
+            codes("@nost 4\nnode a: L {\n @by \"user\" unit \"u_1\" {}\n}\n"),
             vec![DiagnosticCode::NostInvalidEvidence]
         );
     }

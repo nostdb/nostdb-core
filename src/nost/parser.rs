@@ -9,10 +9,11 @@ use super::lexer::{Keyword, Token, TokenKind, TriviaKind, tokenize};
 use super::{
     Comment, Comments, ContributionBlock, DeclarationRef, EdgeDeclaration, Endpoint,
     EndpointConstraint, EvidenceBlock, EvidenceField, EvidenceValue, FieldType, LinkDeclaration,
-    NodeDeclaration, OwnerDeclaration, ParseError, Property, RecordBody, ScalarType,
-    SchemaDeclaration, SchemaField, SourceFile, Spanned, Value,
+    NodeDeclaration, ObjectType, ObjectValue, OwnerDeclaration, ParseError, Property, RecordBody,
+    ScalarType, SchemaDeclaration, SchemaField, SourceFile, Spanned, Value,
 };
 use crate::evidence::SourceRange;
+use crate::property::MAX_NESTING_DEPTH;
 
 struct Parser {
     tokens: Vec<Token>,
@@ -36,6 +37,15 @@ impl Parser {
 
     fn range(&self) -> SourceRange {
         self.current().range
+    }
+
+    /// The end of the most recently consumed token, for closing a range over a construct
+    /// whose last token has already been taken.
+    fn previous_end(&self) -> crate::evidence::SourcePosition {
+        self.index
+            .checked_sub(1)
+            .and_then(|index| self.tokens.get(index))
+            .map_or_else(|| self.range().end(), |token| token.range.end())
     }
 
     fn error(&self, message: impl Into<String>) -> ParseError {
@@ -196,9 +206,6 @@ impl Parser {
                 digits: token.text.clone(),
             },
             TokenKind::DateTimeLiteral => Value::DateTime(token.text.clone()),
-            TokenKind::LeftBracket => {
-                return Err(self.error("a list holds scalars only, so it does not nest"));
-            }
             _ => return Err(self.error("expected a scalar value")),
         };
         self.index += 1;
@@ -208,18 +215,35 @@ impl Parser {
         })
     }
 
+    /// Parses a property value, checking the nesting bound once on the finished value.
     fn parse_value(&mut self) -> Result<Spanned<Value>, ParseError> {
-        self.skip_trivia();
-        if self.kind() != TokenKind::LeftBracket {
-            return self.parse_scalar();
+        let parsed = self.parse_value_expression()?;
+        if parsed.value.depth() > MAX_NESTING_DEPTH {
+            return Err(self.error(format!(
+                "a property value nests {} levels, and the maximum is {MAX_NESTING_DEPTH}",
+                parsed.value.depth()
+            )));
         }
+        Ok(parsed)
+    }
+
+    fn parse_value_expression(&mut self) -> Result<Spanned<Value>, ParseError> {
+        self.skip_trivia();
+        match self.kind() {
+            TokenKind::LeftBracket => self.parse_list(),
+            TokenKind::LeftBrace => self.parse_object_value(),
+            _ => self.parse_scalar(),
+        }
+    }
+
+    fn parse_list(&mut self) -> Result<Spanned<Value>, ParseError> {
         let open = self.range();
         self.index += 1;
         let mut items = Vec::new();
         self.skip_trivia();
         if self.kind() != TokenKind::RightBracket {
             loop {
-                items.push(self.parse_scalar()?);
+                items.push(self.parse_value_expression()?);
                 self.skip_trivia();
                 if self.kind() == TokenKind::Comma {
                     self.index += 1;
@@ -239,38 +263,60 @@ impl Parser {
         })
     }
 
-    /// Parses a record block: comma-separated properties, then contribution blocks.
+    /// Parses an object literal.
     ///
-    /// The two are separated by shape rather than by a marker. A property starts with an
-    /// identifier and a contribution starts with `@by`, so no lookahead beyond the
-    /// current token is needed.
-    fn parse_record_body(&mut self, leading: Vec<Comment>) -> Result<RecordBody, ParseError> {
-        self.expect(TokenKind::LeftBrace, "`{` to open a record block")?;
-        let head_trailing = self.take_trailing();
+    /// Deliberately does not accept a contribution block. `@by` attaches ownership to a
+    /// record, and an object is one property's value rather than a record, so the
+    /// closing brace is expected where a contribution would have started and the caller
+    /// sees a parse error naming `}`.
+    fn parse_object_value(&mut self) -> Result<Spanned<Value>, ParseError> {
+        let open = self.range();
+        self.index += 1;
+        let entries = self.parse_property_entries()?;
+        let block_comments = self.take_pending();
+        let close = self.expect(TokenKind::RightBrace, "`}` to close an object value")?;
+        Ok(Spanned {
+            value: Value::Map(ObjectValue {
+                entries,
+                block_comments,
+            }),
+            range: SourceRange::new(open.start(), close.range.end()).unwrap_or(open),
+        })
+    }
 
+    /// Parses properties with an optional separator between two.
+    fn parse_property_entries(&mut self) -> Result<Vec<Property>, ParseError> {
         let mut properties = Vec::new();
         loop {
             self.skip_trivia();
             if self.kind() != TokenKind::Identifier {
                 break;
             }
-            let property_leading = self.take_pending();
+            let leading = self.take_pending();
             let key = self.expect_identifier("a property key")?;
             self.expect(TokenKind::Colon, "`:` after a property key")?;
             let value = self.parse_value()?;
-            let (separated, trailing) = self.finish_entry();
+            let (_, trailing) = self.finish_entry();
             properties.push(Property {
                 key,
                 value,
-                comments: Comments {
-                    leading: property_leading,
-                    trailing,
-                },
+                comments: Comments { leading, trailing },
             });
-            if !separated {
-                break;
-            }
         }
+        Ok(properties)
+    }
+
+    /// Parses a record block: properties, then contribution blocks.
+    ///
+    /// The two are separated by shape rather than by a marker. A property starts with an
+    /// identifier and a contribution starts with `@by`, so no lookahead beyond the
+    /// current token is needed — which is also what lets the property separator be
+    /// optional without ambiguity.
+    fn parse_record_body(&mut self, leading: Vec<Comment>) -> Result<RecordBody, ParseError> {
+        self.expect(TokenKind::LeftBrace, "`{` to open a record block")?;
+        let head_trailing = self.take_trailing();
+
+        let properties = self.parse_property_entries()?;
 
         let mut contributions = Vec::new();
         loop {
@@ -443,31 +489,7 @@ impl Parser {
         self.expect(TokenKind::LeftBrace, "`{` to open a field block")?;
         let head_trailing = self.take_trailing();
 
-        let mut fields = Vec::new();
-        loop {
-            self.skip_trivia();
-            if self.kind() != TokenKind::Identifier {
-                break;
-            }
-            let field_leading = self.take_pending();
-            let key = self.expect_identifier("a field key")?;
-            let optional = self.eat(TokenKind::Question);
-            self.expect(TokenKind::Colon, "`:` after a field key")?;
-            let field_type = self.parse_field_type()?;
-            let (separated, trailing) = self.finish_entry();
-            fields.push(SchemaField {
-                key,
-                optional,
-                field_type,
-                comments: Comments {
-                    leading: field_leading,
-                    trailing,
-                },
-            });
-            if !separated {
-                break;
-            }
-        }
+        let fields = self.parse_field_entries()?;
 
         let block_comments = self.take_pending();
         self.expect(TokenKind::RightBrace, "`}` to close a field block")?;
@@ -483,41 +505,112 @@ impl Parser {
         })
     }
 
+    /// Parses a field type: a scalar or an object, then any number of `[]` suffixes.
+    ///
+    /// The depth bound is checked once here rather than at each recursive step, because
+    /// the check is on the finished type and one comparison against
+    /// [`MAX_NESTING_DEPTH`] is easier to reason about than a counter threaded through
+    /// the recursion. The recursion itself is bounded by the source: each level needs a
+    /// `{` and its matching `}`, and the file is read into memory before parsing.
     fn parse_field_type(&mut self) -> Result<Spanned<FieldType>, ParseError> {
-        self.skip_trivia();
-        let token = self.current().clone();
-        // A scalar type name is not a reserved word, so it arrives as an identifier
-        // except for `bytes` and `datetime`, which are reserved as literal tags.
-        let text = match token.kind {
-            TokenKind::Identifier => token.text.clone(),
-            TokenKind::Keyword(Keyword::Bytes) => "bytes".to_owned(),
-            TokenKind::Keyword(Keyword::Datetime) => "datetime".to_owned(),
-            _ => return Err(self.error("expected a field type")),
-        };
-        let Some(scalar) = ScalarType::from_text(&text) else {
+        let parsed = self.parse_type_expression()?;
+        if parsed.value.depth() > MAX_NESTING_DEPTH {
             return Err(self.error(format!(
-                "`{text}` is not a field type; expected boolean, integer, double, string, \
-                 bytes, or datetime, optionally followed by `[]`"
+                "a field type nests {} levels, and the maximum is {MAX_NESTING_DEPTH}",
+                parsed.value.depth()
             )));
-        };
-        self.index += 1;
+        }
+        Ok(parsed)
+    }
 
-        let mut range = token.range;
-        let mut array = false;
-        if self.kind() == TokenKind::LeftBracket {
+    fn parse_type_expression(&mut self) -> Result<Spanned<FieldType>, ParseError> {
+        self.skip_trivia();
+        let start = self.range();
+
+        let mut value = if self.kind() == TokenKind::LeftBrace {
+            FieldType::Object(self.parse_object_type()?)
+        } else {
+            let token = self.current().clone();
+            // A scalar type name is not a reserved word, so it arrives as an identifier
+            // except for `bytes` and `datetime`, which are reserved as literal tags.
+            let text = match token.kind {
+                TokenKind::Identifier => token.text.clone(),
+                TokenKind::Keyword(Keyword::Bytes) => "bytes".to_owned(),
+                TokenKind::Keyword(Keyword::Datetime) => "datetime".to_owned(),
+                _ => return Err(self.error("expected a field type")),
+            };
+            let Some(scalar) = ScalarType::from_text(&text) else {
+                return Err(self.error(format!(
+                    "`{text}` is not a field type; expected boolean, integer, double, string, \
+                     bytes, datetime, or an object type written `{{ … }}`, each optionally \
+                     followed by `[]`"
+                )));
+            };
+            self.index += 1;
+            FieldType::Scalar(scalar)
+        };
+
+        let mut range = SourceRange::new(start.start(), self.previous_end()).unwrap_or(start);
+        loop {
+            // Deliberately no `skip_trivia` before this check. Skipping trivia files any
+            // comment as a *pending leading* one, which would take the trailing comment on
+            // `name: string // note` away from the field before `finish_entry` could claim
+            // it — and a format pass would then move that comment down a line, every time.
+            // An array suffix therefore sits directly against its type, which is what
+            // version 3 required of the one suffix it allowed.
+            if self.kind() != TokenKind::LeftBracket {
+                break;
+            }
             self.index += 1;
             let close = self.expect(TokenKind::RightBracket, "`]` to close an array type")?;
-            array = true;
-            range = SourceRange::new(token.range.start(), close.range.end()).unwrap_or(token.range);
-            self.skip_trivia();
-            if self.kind() == TokenKind::LeftBracket {
-                return Err(self.error("an array does not nest, so `[][]` is not a field type"));
-            }
+            value = FieldType::Array(Box::new(value));
+            range = SourceRange::new(start.start(), close.range.end()).unwrap_or(range);
         }
-        Ok(Spanned {
-            value: FieldType { scalar, array },
-            range,
+
+        Ok(Spanned { value, range })
+    }
+
+    /// Parses the field block an object type is written as.
+    ///
+    /// The same shape as a schema's field block, and deliberately the same code: an
+    /// object type *is* a field block, so a rule that held for one and not the other
+    /// would be a rule nobody could state.
+    fn parse_object_type(&mut self) -> Result<ObjectType, ParseError> {
+        self.expect(TokenKind::LeftBrace, "`{` to open an object type")?;
+        let fields = self.parse_field_entries()?;
+        let block_comments = self.take_pending();
+        self.expect(TokenKind::RightBrace, "`}` to close an object type")?;
+        Ok(ObjectType {
+            fields,
+            block_comments,
         })
+    }
+
+    /// Parses the fields of a field block, with an optional separator between two.
+    fn parse_field_entries(&mut self) -> Result<Vec<SchemaField>, ParseError> {
+        let mut fields = Vec::new();
+        loop {
+            self.skip_trivia();
+            if self.kind() != TokenKind::Identifier {
+                break;
+            }
+            let field_leading = self.take_pending();
+            let key = self.expect_identifier("a field key")?;
+            let optional = self.eat(TokenKind::Question);
+            self.expect(TokenKind::Colon, "`:` after a field key")?;
+            let field_type = self.parse_field_type()?;
+            let (_, trailing) = self.finish_entry();
+            fields.push(SchemaField {
+                key,
+                optional,
+                field_type,
+                comments: Comments {
+                    leading: field_leading,
+                    trailing,
+                },
+            });
+        }
+        Ok(fields)
     }
 
     fn parse_node(&mut self, leading: Vec<Comment>) -> Result<NodeDeclaration, ParseError> {
@@ -681,8 +774,8 @@ mod tests {
 
     #[test]
     fn parses_the_smallest_file() {
-        let file = parse("@nost 3\n").unwrap();
-        assert_eq!(file.version.value, 3);
+        let file = parse("@nost 4\n").unwrap();
+        assert_eq!(file.version.value, super::super::LANGUAGE_VERSION);
         assert!(file.links.is_empty());
         assert!(file.schemas.is_empty());
         assert!(file.nodes.is_empty());
@@ -691,7 +784,7 @@ mod tests {
 
     #[test]
     fn parses_links_with_and_without_an_alias() {
-        let file = parse("@nost 3\n@link \"./a\"\n@link \"./b\" as b\n").unwrap();
+        let file = parse("@nost 4\n@link \"./a\"\n@link \"./b\" as b\n").unwrap();
         assert_eq!(file.links.len(), 2);
         assert_eq!(file.links[0].source.value, "./a");
         assert!(file.links[0].alias.is_none());
@@ -704,7 +797,7 @@ mod tests {
     #[test]
     fn parses_a_schema_with_required_optional_and_array_fields() {
         let file = parse(
-            "@nost 3\nschema S {\n  a: string,\n  b?: integer,\n  c: double[],\n  d?: bytes,\n}\n",
+            "@nost 4\nschema S {\n  a: string,\n  b?: integer,\n  c: double[],\n  d?: bytes,\n}\n",
         )
         .unwrap();
         let schema = &file.schemas[0];
@@ -712,15 +805,24 @@ mod tests {
         assert!(schema.endpoints.is_none());
         assert_eq!(schema.fields.len(), 4);
         assert!(!schema.fields[0].optional);
-        assert_eq!(schema.fields[0].field_type.value.scalar, ScalarType::String);
+        assert_eq!(
+            schema.fields[0].field_type.value,
+            FieldType::Scalar(ScalarType::String)
+        );
         assert!(schema.fields[1].optional);
-        assert!(schema.fields[2].field_type.value.array);
-        assert_eq!(schema.fields[3].field_type.value.scalar, ScalarType::Bytes);
+        assert!(matches!(
+            schema.fields[2].field_type.value,
+            FieldType::Array(_)
+        ));
+        assert_eq!(
+            schema.fields[3].field_type.value,
+            FieldType::Scalar(ScalarType::Bytes)
+        );
     }
 
     #[test]
     fn parses_an_edge_schema_endpoint_constraint() {
-        let file = parse("@nost 3\nschema R (A -> B) {\n  since?: datetime,\n}\n").unwrap();
+        let file = parse("@nost 4\nschema R (A -> B) {\n  since?: datetime,\n}\n").unwrap();
         let constraint = file.schemas[0].endpoints.as_ref().unwrap();
         assert_eq!(constraint.source.value, "A");
         assert_eq!(constraint.target.value, "B");
@@ -728,7 +830,7 @@ mod tests {
 
     #[test]
     fn a_node_may_name_several_schemas() {
-        let file = parse("@nost 3\nnode n: A, B, C {}\n").unwrap();
+        let file = parse("@nost 4\nnode n: A, B, C {}\n").unwrap();
         let names: Vec<&str> = file.nodes[0]
             .schemas
             .iter()
@@ -739,7 +841,7 @@ mod tests {
 
     #[test]
     fn parses_all_three_endpoint_forms() {
-        let source = "@nost 3\n@link \"./c\"\n@link \"./s\" as s\n\
+        let source = "@nost 4\n@link \"./c\"\n@link \"./s\" as s\n\
             node a: L {}\nnode b: L {}\n\
             edge a -> b :CALLS {}\n\
             edge a -> s::x :CALLS {}\n\
@@ -754,23 +856,31 @@ mod tests {
 
     #[test]
     fn a_trailing_comma_is_accepted_and_optional() {
-        assert!(parse("@nost 3\nnode n: L {\n  a: 1,\n  b: 2,\n}\n").is_ok());
-        assert!(parse("@nost 3\nnode n: L {\n  a: 1,\n  b: 2\n}\n").is_ok());
-        assert!(parse("@nost 3\nschema S {\n  a: string,\n}\n").is_ok());
-        assert!(parse("@nost 3\nschema S {\n  a: string\n}\n").is_ok());
+        assert!(parse("@nost 4\nnode n: L {\n  a: 1,\n  b: 2,\n}\n").is_ok());
+        assert!(parse("@nost 4\nnode n: L {\n  a: 1,\n  b: 2\n}\n").is_ok());
+        assert!(parse("@nost 4\nschema S {\n  a: string,\n}\n").is_ok());
+        assert!(parse("@nost 4\nschema S {\n  a: string\n}\n").is_ok());
     }
 
     #[test]
-    fn a_property_must_be_separated_by_a_comma() {
-        // Without the comma the second key is not read as a property, so the block does
-        // not close where the author expected.
-        let error = parse("@nost 3\nnode n: L {\n  a: 1\n  b: 2\n}\n").unwrap_err();
-        assert!(error.message.contains("close a record block"), "{error}");
+    fn the_separator_between_two_entries_is_optional() {
+        // Version 3 refused this: without the comma the second key was not read as a
+        // property and the block did not close where the author expected.
+        let file = parse("@nost 4\nnode n: L {\n  a: 1\n  b: 2\n}\n").unwrap();
+        let properties = &file.nodes[0].record.properties;
+        assert_eq!(properties.len(), 2);
+        assert_eq!(properties[0].key.value, "a");
+        assert_eq!(properties[1].key.value, "b");
+
+        // A comma, a newline, and both mixed all mean the same thing.
+        let mixed =
+            parse("@nost 4\nschema S {\n  a: string\n  b?: integer,\n  c: boolean\n}\n").unwrap();
+        assert_eq!(mixed.schemas[0].fields.len(), 3);
     }
 
     #[test]
     fn parses_contributions_and_evidence() {
-        let source = "@nost 3\nnode n: L {\n  k: \"v\",\n\n\
+        let source = "@nost 4\nnode n: L {\n  k: \"v\",\n\n\
             \x20 @by \"rust\" unit \"u_1\" {\n\
             \x20   @evidence {\n      source: \"./\",\n      method: deterministic,\n\
             \x20     confidence: inferred(0.5),\n    }\n  }\n\n  @by \"user\" {}\n}\n";
@@ -808,7 +918,7 @@ mod tests {
 
     #[test]
     fn an_ai_owner_carries_its_contract_digest() {
-        let file = parse("@nost 3\nnode n: L {\n  @by \"ai:sha256:abc\" {}\n}\n").unwrap();
+        let file = parse("@nost 4\nnode n: L {\n  @by \"ai:sha256:abc\" {}\n}\n").unwrap();
         let owner = &file.nodes[0].record.contributions[0].owner;
         assert_eq!(owner.kind(), crate::contribution::OwnerKind::AiAnalysis);
         assert_eq!(owner.name.value, "ai:sha256:abc");
@@ -816,7 +926,7 @@ mod tests {
 
     #[test]
     fn declaration_order_is_preserved() {
-        let file = parse("@nost 3\nnode a: L {}\nschema L {}\nedge a -> a :R {}\n").unwrap();
+        let file = parse("@nost 4\nnode a: L {}\nschema L {}\nedge a -> a :R {}\n").unwrap();
         assert_eq!(
             file.order,
             [
@@ -829,7 +939,7 @@ mod tests {
 
     #[test]
     fn attaches_leading_and_trailing_comments() {
-        let source = "// file\n@nost 3 // version\n\
+        let source = "// file\n@nost 4 // version\n\
             // about the node\nnode n: L {\n\
             \x20 // about the key\n  k: \"v\", // after the key\n}\n";
         let file = parse(source).unwrap();
@@ -854,7 +964,7 @@ mod tests {
 
     #[test]
     fn a_comment_with_nothing_after_it_attaches_to_the_block() {
-        let file = parse("@nost 3\nnode n: L {\n  // nothing follows\n}\n").unwrap();
+        let file = parse("@nost 4\nnode n: L {\n  // nothing follows\n}\n").unwrap();
         assert_eq!(file.nodes[0].record.block_comments.len(), 1);
         assert_eq!(
             file.nodes[0].record.block_comments[0].text,
@@ -864,26 +974,26 @@ mod tests {
 
     #[test]
     fn a_link_after_a_declaration_is_rejected_with_a_useful_message() {
-        let error = parse("@nost 3\nschema S {}\n@link \"./a\"\n").unwrap_err();
+        let error = parse("@nost 4\nschema S {}\n@link \"./a\"\n").unwrap_err();
         assert!(error.message.contains("before every schema"), "{error}");
         assert_eq!(error.range.start().line, 3);
     }
 
     #[test]
     fn a_reserved_word_where_a_name_belongs_is_named_in_the_message() {
-        let error = parse("@nost 3\nschema schema {}\n").unwrap_err();
+        let error = parse("@nost 4\nschema schema {}\n").unwrap_err();
         assert!(error.message.contains("reserved word"), "{error}");
     }
 
     #[test]
     fn the_version_1_module_declaration_no_longer_parses() {
-        let error = parse("@nost 3\nmodule auth id \"m_1\" {\n}\n").unwrap_err();
+        let error = parse("@nost 4\nmodule auth id \"m_1\" {\n}\n").unwrap_err();
         assert!(error.message.contains("expected `schema`"), "{error}");
     }
 
     #[test]
     fn the_version_1_edge_form_no_longer_parses() {
-        let error = parse("@nost 3\nedge e id \"e_1\" :CALLS (a -> b) {}\n").unwrap_err();
+        let error = parse("@nost 4\nedge e id \"e_1\" :CALLS (a -> b) {}\n").unwrap_err();
         assert!(error.message.contains("`->`"), "{error}");
     }
 
@@ -891,29 +1001,32 @@ mod tests {
     fn rejects_the_syntax_the_contract_forbids() {
         for (source, note) in [
             ("@link \"./a\"\n", "a missing version header"),
-            ("\u{FEFF}@nost 3\n", "a byte-order mark"),
-            ("@nost 3\nnode n {\n}\n", "a node without a schema"),
+            ("\u{FEFF}@nost 4\n", "a byte-order mark"),
+            ("@nost 4\nnode n {\n}\n", "a node without a schema"),
             (
-                "@nost 3\nnode n: A, {\n}\n",
+                "@nost 4\nnode n: A, {\n}\n",
                 "a trailing comma in a schema list",
             ),
-            ("@nost 3\nnode n: L {\n k: null\n}\n", "a null value"),
+            ("@nost 4\nnode n: L {\n k: null\n}\n", "a null value"),
             (
-                "@nost 3\nnode n: L {\n k: [1, 2,]\n}\n",
+                "@nost 4\nnode n: L {\n k: [1, 2,]\n}\n",
                 "a trailing comma in a list",
             ),
-            ("@nost 3\nnode n: L {\n k: [1, [2]]\n}\n", "a nested list"),
-            ("@nost 3\nedge a -> :R {}\n", "a missing endpoint"),
-            ("@nost 3\nedge a -> b :R :S {}\n", "two relation names"),
             (
-                "@nost 3\nschema S {\n name: text,\n}\n",
+                "@nost 4\nnode n: L {\n k: { a: 1, @by \"user\" {} }\n}\n",
+                "a contribution block inside an object value",
+            ),
+            ("@nost 4\nedge a -> :R {}\n", "a missing endpoint"),
+            ("@nost 4\nedge a -> b :R :S {}\n", "two relation names"),
+            (
+                "@nost 4\nschema S {\n name: text,\n}\n",
                 "an unknown field type",
             ),
             (
-                "@nost 3\nschema S {\n g: string[][],\n}\n",
-                "a nested array type",
+                "@nost 4\nschema S {\n a: { a: { a: { a: { a: { a: { a: { a: { a: string } } } } } } } } }\n}\n",
+                "an object type nesting past the depth limit",
             ),
-            ("@nost 3\nschema S {\n name,\n}\n", "a field without a type"),
+            ("@nost 4\nschema S {\n name,\n}\n", "a field without a type"),
         ] {
             let result = parse(source);
             assert!(result.is_err(), "{note} must be rejected");
@@ -924,7 +1037,7 @@ mod tests {
 
     #[test]
     fn an_unknown_field_type_says_what_is_accepted() {
-        let error = parse("@nost 3\nschema S {\n  name: text,\n}\n").unwrap_err();
+        let error = parse("@nost 4\nschema S {\n  name: text,\n}\n").unwrap_err();
         assert!(
             error.message.contains("`text` is not a field type"),
             "{error}"
@@ -934,7 +1047,7 @@ mod tests {
 
     #[test]
     fn an_out_of_range_integer_parses_because_that_is_a_semantic_rule() {
-        let file = parse("@nost 3\nnode n: L {\n  k: 9223372036854775808,\n}\n").unwrap();
+        let file = parse("@nost 4\nnode n: L {\n  k: 9223372036854775808,\n}\n").unwrap();
         assert_eq!(
             file.nodes[0].record.properties[0].value.value,
             Value::Integer("9223372036854775808".to_owned())

@@ -713,7 +713,11 @@ pub fn stored_value(
                         ));
                     }
                 };
-                scalars.push(scalar);
+                // A list element is a value in the stored model, and the query language
+                // has no object literal in an expression position, so a list a query
+                // builds still holds scalars only. The conversion says that rather than
+                // the element type saying it.
+                scalars.push(PropertyValue::from(scalar));
             }
             PropertyValue::List(scalars)
         }

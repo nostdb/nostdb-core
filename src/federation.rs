@@ -804,7 +804,7 @@ mod tests {
         let dir = TempDir::new("document");
         fs::write(
             dir.path().join("child.nost"),
-            "@nost 3\nnode child: Child {}\n",
+            "@nost 4\nnode child: Child {}\n",
         )
         .unwrap();
         let root = graph(1, "Root", vec![Link::new(locator("./child.nost"))]);

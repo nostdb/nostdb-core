@@ -39,7 +39,8 @@ use crate::link::Link;
 use crate::locator::{CanonicalSourceLocator, LocatorError};
 use crate::name::{Label, LinkAlias, NameError, PropertyKey, RelationName};
 use crate::property::{
-    DateTime, DateTimeError, FiniteF64, NumberError, PropertyScalar, PropertyValue,
+    DateTime, DateTimeError, FiniteF64, MAX_NESTING_DEPTH, NumberError, PropertyScalar,
+    PropertyValue,
 };
 use crate::schema::{EndpointConstraint, FieldType, ScalarType, Schema, SchemaField};
 use crate::storage::{Database, StorageError};
@@ -57,6 +58,21 @@ const VALUE_STRING: u8 = 4;
 const VALUE_BYTES: u8 = 5;
 const VALUE_DATETIME: u8 = 6;
 const VALUE_LIST: u8 = 7;
+const VALUE_MAP: u8 = 8;
+
+/// Field type tags, written only by `nostdb_format_version` 3 and later.
+///
+/// Version 2 wrote a scalar discriminant and an array flag, two `u32`s with no tag, which
+/// a recursive type cannot be spelled in. The tags start at 1 so a zero byte is never a
+/// valid type, which is what makes a truncated payload read as an unknown tag rather than
+/// as a scalar.
+const TYPE_SCALAR: u8 = 1;
+const TYPE_ARRAY: u8 = 2;
+const TYPE_OBJECT: u8 = 3;
+
+/// The fewest bytes one schema field can occupy, for bounding an allocation before it
+/// is made: an interned key, the smallest type, and a required flag.
+const MIN_FIELD_BYTES: usize = 13;
 
 /// An owner as one interned name, which is the only shape this format holds.
 ///
@@ -147,6 +163,16 @@ pub enum DecodeError {
     InvalidRange(RangeError),
     /// A decoded string was not valid UTF-8.
     InvalidUtf8,
+    /// A value or a declared type nested past the permitted depth.
+    ///
+    /// Checked while reading rather than afterwards. A container is untrusted input, and
+    /// nothing in a length or a count bounds how deeply a list may be nested inside a
+    /// list, so a reader that measured the finished value would already have recursed as
+    /// deep as the bytes asked before it could object.
+    NestingTooDeep {
+        /// The depth that was reached.
+        depth: usize,
+    },
 }
 
 impl DecodeError {
@@ -163,6 +189,10 @@ impl DecodeError {
 impl fmt::Display for DecodeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NestingTooDeep { depth } => write!(
+                formatter,
+                "a value nests {depth} levels, and the maximum is {MAX_NESTING_DEPTH}"
+            ),
             Self::Truncated => formatter.write_str("a payload ended mid-value"),
             Self::TrailingBytes => formatter.write_str("a payload had unread trailing bytes"),
             Self::UnknownTag { what, tag } => {
@@ -287,13 +317,49 @@ fn put_scalar(out: &mut Vec<u8>, strings: &mut Strings, scalar: &PropertyScalar)
     }
 }
 
+/// Writes one schema field: its key, its declared type, and whether it is required.
+fn put_field(out: &mut Vec<u8>, strings: &mut Strings, field: &SchemaField) {
+    put_u32(out, strings.intern(field.key.as_str()));
+    put_field_type(out, strings, &field.field_type);
+    put_u32(out, u32::from(field.required));
+}
+
+/// Writes a declared field type, tagged so a recursive shape is readable.
+fn put_field_type(out: &mut Vec<u8>, strings: &mut Strings, declared: &FieldType) {
+    match declared {
+        FieldType::Scalar(scalar) => {
+            out.push(TYPE_SCALAR);
+            put_u32(out, scalar.raw());
+        }
+        FieldType::Array(inner) => {
+            out.push(TYPE_ARRAY);
+            put_field_type(out, strings, inner);
+        }
+        FieldType::Object(fields) => {
+            out.push(TYPE_OBJECT);
+            put_u32(out, fields.len() as u32);
+            for field in fields {
+                put_field(out, strings, field);
+            }
+        }
+    }
+}
+
 fn put_value(out: &mut Vec<u8>, strings: &mut Strings, value: &PropertyValue) {
     match value {
         PropertyValue::List(items) => {
             out.push(VALUE_LIST);
             put_u32(out, items.len() as u32);
             for item in items {
-                put_scalar(out, strings, item);
+                put_value(out, strings, item);
+            }
+        }
+        PropertyValue::Map(entries) => {
+            out.push(VALUE_MAP);
+            put_u32(out, entries.len() as u32);
+            for (key, held) in entries {
+                put_u32(out, strings.intern(key.as_str()));
+                put_value(out, strings, held);
             }
         }
         PropertyValue::Boolean(inner) => put_scalar(out, strings, &PropertyScalar::Boolean(*inner)),
@@ -455,10 +521,7 @@ pub fn encode_graph(graph: &Graph) -> Vec<Section> {
         }
         put_u32(&mut schemas, schema.fields.len() as u32);
         for field in &schema.fields {
-            put_u32(&mut schemas, strings.intern(field.key.as_str()));
-            put_u32(&mut schemas, field.field_type.scalar.raw());
-            put_u32(&mut schemas, u32::from(field.field_type.array));
-            put_u32(&mut schemas, u32::from(field.required));
+            put_field(&mut schemas, &mut strings, field);
         }
     }
 
@@ -649,18 +712,47 @@ fn read_scalar(reader: &mut Reader<'_>, table: &Table) -> Result<PropertyScalar,
     })
 }
 
-fn read_value(reader: &mut Reader<'_>, table: &Table) -> Result<PropertyValue, DecodeError> {
-    // A list is the only non-scalar, and its tag is distinct, so peek without consuming.
-    if reader.bytes.get(reader.at).copied() == Some(VALUE_LIST) {
-        reader.at += 1;
-        let count = reader.count(2)?;
-        let mut items = Vec::with_capacity(count);
-        for _ in 0..count {
-            items.push(read_scalar(reader, table)?);
+/// Reads one property value, recursing through lists and objects.
+///
+/// Version-independent, and that is a property of the encoding rather than luck. A version
+/// 2 list wrote its elements with the scalar writer, and a scalar's bytes are the same
+/// whether they are read as a scalar or as a value — the tags are disjoint, so the peek
+/// below falls through to [`read_scalar`] for exactly the bytes version 2 could produce.
+/// A version 2 container has no `VALUE_MAP` in it because no writer could emit one.
+///
+/// `depth` is the level being entered, so the outermost call passes 0 and refuses the
+/// first container that would exceed [`MAX_NESTING_DEPTH`].
+fn read_value(
+    reader: &mut Reader<'_>,
+    table: &Table,
+    depth: usize,
+) -> Result<PropertyValue, DecodeError> {
+    // The two container tags are distinct from every scalar tag, so peek without consuming.
+    match reader.bytes.get(reader.at).copied() {
+        Some(tag @ (VALUE_LIST | VALUE_MAP)) => {
+            let entered = depth + 1;
+            if entered > MAX_NESTING_DEPTH {
+                return Err(DecodeError::NestingTooDeep { depth: entered });
+            }
+            reader.at += 1;
+            if tag == VALUE_LIST {
+                let count = reader.count(2)?;
+                let mut items = Vec::with_capacity(count);
+                for _ in 0..count {
+                    items.push(read_value(reader, table, entered)?);
+                }
+                return Ok(PropertyValue::List(items));
+            }
+            let count = reader.count(6)?;
+            let mut entries = Vec::with_capacity(count);
+            for _ in 0..count {
+                let key = PropertyKey::new(table.get(reader.u32()?)?)?;
+                entries.push((key, read_value(reader, table, entered)?));
+            }
+            Ok(PropertyValue::Map(entries))
         }
-        return Ok(PropertyValue::List(items));
+        _ => Ok(PropertyValue::from(read_scalar(reader, table)?)),
     }
-    Ok(PropertyValue::from(read_scalar(reader, table)?))
 }
 
 fn read_properties(
@@ -671,7 +763,7 @@ fn read_properties(
     let mut properties = Vec::with_capacity(count);
     for _ in 0..count {
         let key = PropertyKey::new(table.get(reader.u32()?)?)?;
-        properties.push((key, read_value(reader, table)?));
+        properties.push((key, read_value(reader, table, 0)?));
     }
     Ok(properties)
 }
@@ -896,22 +988,15 @@ pub fn decode_graph(container: &Container) -> Result<Graph, DecodeError> {
                     });
                 }
             };
-            let field_count = reader.count(16)?;
+            // 13 bytes is the smallest a field can be at either version: an interned
+            // key, a type, and a required flag, where the smallest type is a tag and
+            // one `u32`. Version 2's fields were 16 bytes each, and keeping that
+            // number here rejected a valid version 3 section — the guard bounds an
+            // allocation, so the smaller of the two is the one that is never wrong.
+            let field_count = reader.count(MIN_FIELD_BYTES)?;
             let mut fields = Vec::with_capacity(field_count);
             for _ in 0..field_count {
-                let key = PropertyKey::new(table.get(reader.u32()?)?)?;
-                let raw = reader.u32()?;
-                let scalar = ScalarType::from_raw(raw).ok_or(DecodeError::UnknownTag {
-                    what: "scalar type",
-                    tag: raw,
-                })?;
-                let array = read_flag(&mut reader, "schema field array marker")?;
-                let required = read_flag(&mut reader, "schema field required marker")?;
-                fields.push(SchemaField {
-                    key,
-                    field_type: FieldType { scalar, array },
-                    required,
-                });
+                fields.push(read_field(&mut reader, &table, container.version(), 0)?);
             }
             graph.schemas.push(Schema {
                 name,
@@ -923,6 +1008,83 @@ pub fn decode_graph(container: &Container) -> Result<Graph, DecodeError> {
     }
 
     Ok(graph)
+}
+
+/// Reads one schema field at the given container version.
+fn read_field(
+    reader: &mut Reader<'_>,
+    table: &Table,
+    version: u32,
+    depth: usize,
+) -> Result<SchemaField, DecodeError> {
+    let key = PropertyKey::new(table.get(reader.u32()?)?)?;
+    let field_type = read_field_type(reader, table, version, depth)?;
+    let required = read_flag(reader, "schema field required marker")?;
+    Ok(SchemaField {
+        key,
+        field_type,
+        required,
+    })
+}
+
+/// Reads a declared field type, in the shape the container's version wrote.
+///
+/// This is the one place a version branch is needed. Version 2 wrote a scalar
+/// discriminant and an array flag, which cannot express an object type; version 3 writes a
+/// tagged recursive shape. Every other section reads identically, which is why a version 2
+/// container opens rather than being refused.
+fn read_field_type(
+    reader: &mut Reader<'_>,
+    table: &Table,
+    version: u32,
+    depth: usize,
+) -> Result<FieldType, DecodeError> {
+    if version < 3 {
+        let raw = reader.u32()?;
+        let scalar = ScalarType::from_raw(raw).ok_or(DecodeError::UnknownTag {
+            what: "scalar type",
+            tag: raw,
+        })?;
+        let array = read_flag(reader, "schema field array marker")?;
+        return Ok(if array {
+            FieldType::array(scalar)
+        } else {
+            FieldType::Scalar(scalar)
+        });
+    }
+
+    let tag = reader.u8()?;
+    match tag {
+        TYPE_SCALAR => {
+            let raw = reader.u32()?;
+            let scalar = ScalarType::from_raw(raw).ok_or(DecodeError::UnknownTag {
+                what: "scalar type",
+                tag: raw,
+            })?;
+            Ok(FieldType::Scalar(scalar))
+        }
+        TYPE_ARRAY | TYPE_OBJECT => {
+            let entered = depth + 1;
+            if entered > MAX_NESTING_DEPTH {
+                return Err(DecodeError::NestingTooDeep { depth: entered });
+            }
+            if tag == TYPE_ARRAY {
+                return Ok(FieldType::Array(Box::new(read_field_type(
+                    reader, table, version, entered,
+                )?)));
+            }
+            let count = reader.count(MIN_FIELD_BYTES)?;
+            let mut fields = Vec::with_capacity(count);
+            for _ in 0..count {
+                fields.push(read_field(reader, table, version, entered)?);
+            }
+            Ok(FieldType::Object(fields))
+        }
+        other => Err(DecodeError::UnknownTag {
+            what: "field type",
+            tag: u32::from(other),
+        }),
+    }
 }
 
 /// Reads a boolean stored as a `u32`, refusing any value but 0 and 1.
@@ -1042,9 +1204,9 @@ mod tests {
                         (
                             PropertyKey::new("tags").unwrap(),
                             PropertyValue::List(vec![
-                                PropertyScalar::String("auth".to_owned()),
-                                PropertyScalar::Integer(1),
-                                PropertyScalar::Boolean(false),
+                                PropertyValue::String("auth".to_owned()),
+                                PropertyValue::Integer(1),
+                                PropertyValue::Boolean(false),
                             ]),
                         ),
                         (

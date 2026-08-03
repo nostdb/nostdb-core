@@ -14,7 +14,7 @@
 //! treating those as violations would fill a build with warnings that say nothing.
 
 use crate::name::{Label, PropertyKey};
-use crate::property::PropertyValue;
+use crate::property::{MAX_NESTING_DEPTH, PropertyValue};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -103,58 +103,175 @@ impl fmt::Display for ScalarType {
     }
 }
 
-/// A declared field type: a scalar, or an array of that scalar.
+/// A declared field type: a scalar, an anonymous object, or a list of either.
 ///
-/// Arrays do not nest, because a stored list holds scalars only.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FieldType {
-    /// The scalar the field holds.
-    pub scalar: ScalarType,
-    /// Whether the field holds an array of that scalar rather than one value.
-    pub array: bool,
+/// An object type is the fields a nested value declares. It is anonymous because a
+/// named shape is a Schema, and a Schema's name is a label a record carries — which a
+/// nested value is not.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FieldType {
+    /// One scalar.
+    Scalar(ScalarType),
+    /// An object declaring these fields.
+    Object(Vec<SchemaField>),
+    /// A list whose every element has the inner type.
+    Array(Box<FieldType>),
 }
 
 impl FieldType {
     /// A field holding one scalar.
     #[must_use]
     pub const fn scalar(scalar: ScalarType) -> Self {
-        Self {
-            scalar,
-            array: false,
-        }
+        Self::Scalar(scalar)
     }
 
     /// A field holding an array of one scalar.
     #[must_use]
-    pub const fn array(scalar: ScalarType) -> Self {
-        Self {
-            scalar,
-            array: true,
+    pub fn array(scalar: ScalarType) -> Self {
+        Self::Array(Box::new(Self::Scalar(scalar)))
+    }
+
+    /// A field holding a list of `inner`.
+    #[must_use]
+    pub fn list_of(inner: Self) -> Self {
+        Self::Array(Box::new(inner))
+    }
+
+    /// Reports whether `value` has the *shape* this type declares.
+    ///
+    /// An object type accepts any object, and the entries inside it are reported by
+    /// [`EffectiveSchema::violations`] instead. The split follows the two rules the
+    /// language contract already states: a Schema is **open**, so an entry nothing
+    /// declares is not an error, and validation is **soft**, so a missing required entry
+    /// is a warning about a value rather than a claim the value is the wrong type.
+    /// Folding both into one boolean would report a nested typo as "this is not an
+    /// object", which it is.
+    #[must_use]
+    pub fn accepts(&self, value: &PropertyValue) -> bool {
+        match (self, value) {
+            (Self::Scalar(scalar), _) => scalar_of(value) == Some(*scalar),
+            (Self::Array(inner), PropertyValue::List(items)) => {
+                items.iter().all(|item| inner.accepts(item))
+            }
+            (Self::Object(_), PropertyValue::Map(_)) => true,
+            _ => false,
         }
     }
 
-    /// Reports whether `value` satisfies this declared type.
+    /// The nesting depth of this type: 0 for a scalar, and one more than its inner type
+    /// for a list or an object.
+    ///
+    /// Iterative for the reason [`PropertyValue::depth`] is.
     #[must_use]
-    pub fn accepts(self, value: &PropertyValue) -> bool {
-        if self.array {
-            return match value {
-                PropertyValue::List(items) => items
-                    .iter()
-                    .all(|item| self.scalar == scalar_of_scalar(item)),
-                _ => false,
-            };
+    pub fn depth(&self) -> usize {
+        let mut deepest = 0;
+        let mut pending = vec![(self, 0_usize)];
+        while let Some((declared, depth)) = pending.pop() {
+            deepest = deepest.max(depth);
+            match declared {
+                Self::Array(inner) => {
+                    deepest = deepest.max(depth + 1);
+                    pending.push((inner.as_ref(), depth + 1));
+                }
+                Self::Object(fields) => {
+                    deepest = deepest.max(depth + 1);
+                    pending.extend(fields.iter().map(|field| (&field.field_type, depth + 1)));
+                }
+                Self::Scalar(_) => {}
+            }
         }
-        scalar_of(value) == Some(self.scalar)
+        deepest
+    }
+
+    /// Reports whether this type nests deeper than [`MAX_NESTING_DEPTH`].
+    #[must_use]
+    pub fn exceeds_nesting_limit(&self) -> bool {
+        self.depth() > MAX_NESTING_DEPTH
     }
 }
 
 impl fmt::Display for FieldType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.scalar.as_str())?;
-        if self.array {
-            formatter.write_str("[]")?;
+        match self {
+            Self::Scalar(scalar) => formatter.write_str(scalar.as_str()),
+            Self::Array(inner) => write!(formatter, "{inner}[]"),
+            Self::Object(fields) => {
+                if fields.is_empty() {
+                    return formatter.write_str("{}");
+                }
+                formatter.write_str("{ ")?;
+                for (index, field) in fields.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    formatter.write_str(field.key.as_str())?;
+                    if !field.required {
+                        formatter.write_str("?")?;
+                    }
+                    write!(formatter, ": {}", field.field_type)?;
+                }
+                formatter.write_str(" }")
+            }
         }
-        Ok(())
+    }
+}
+
+/// Reports every violation *inside* an object or a list of them, naming each by path.
+///
+/// Called only when [`FieldType::accepts`] already agreed on the shape, so the two
+/// arms below are the whole of it: an object type beside an object, and a list type
+/// beside a list.
+///
+/// Recursion is bounded by [`MAX_NESTING_DEPTH`], which the `.nost` parser and the
+/// container decoder both enforce before a value reaches here. A value that has not
+/// passed one of those two doors is not one this function is safe to walk.
+fn nested_violations(
+    declared: &FieldType,
+    value: &PropertyValue,
+    path: &str,
+    found: &mut Vec<SchemaViolation>,
+) {
+    match (declared, value) {
+        (FieldType::Object(fields), PropertyValue::Map(entries)) => {
+            for field in fields {
+                let child = format!("{path}.{}", field.key.as_str());
+                // The first entry with this key wins. A repeated key is
+                // NOST_DUPLICATE_PROPERTY_KEY, reported where duplicates are found
+                // rather than as a schema violation here.
+                match entries.iter().find(|(name, _)| *name == field.key) {
+                    None => {
+                        if field.required {
+                            found.push(SchemaViolation::Nested {
+                                path: child,
+                                inner: Box::new(SchemaViolation::MissingField {
+                                    key: field.key.clone(),
+                                    declared: field.field_type.clone(),
+                                }),
+                            });
+                        }
+                    }
+                    Some((_, held)) => {
+                        if field.field_type.accepts(held) {
+                            nested_violations(&field.field_type, held, &child, found);
+                        } else {
+                            found.push(SchemaViolation::Nested {
+                                path: child,
+                                inner: Box::new(SchemaViolation::WrongType {
+                                    key: field.key.clone(),
+                                    declared: field.field_type.clone(),
+                                }),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        (FieldType::Array(inner), PropertyValue::List(items)) => {
+            for (index, item) in items.iter().enumerate() {
+                nested_violations(inner, item, &format!("{path}[{index}]"), found);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -166,24 +283,15 @@ fn scalar_of(value: &PropertyValue) -> Option<ScalarType> {
         PropertyValue::String(_) => ScalarType::String,
         PropertyValue::Bytes(_) => ScalarType::Bytes,
         PropertyValue::DateTime(_) => ScalarType::DateTime,
-        PropertyValue::List(_) => return None,
+        PropertyValue::List(_) | PropertyValue::Map(_) => return None,
     })
 }
 
-fn scalar_of_scalar(value: &crate::property::PropertyScalar) -> ScalarType {
-    use crate::property::PropertyScalar;
-    match value {
-        PropertyScalar::Boolean(_) => ScalarType::Boolean,
-        PropertyScalar::Integer(_) => ScalarType::Integer,
-        PropertyScalar::Float(_) => ScalarType::Double,
-        PropertyScalar::String(_) => ScalarType::String,
-        PropertyScalar::Bytes(_) => ScalarType::Bytes,
-        PropertyScalar::DateTime(_) => ScalarType::DateTime,
-    }
-}
-
 /// One field a Schema declares.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Ordered and hashable because [`FieldType::Object`] holds these, and `FieldType` is
+/// compared and hashed wherever a declared type is.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SchemaField {
     /// The field key.
     pub key: PropertyKey,
@@ -242,6 +350,18 @@ pub enum SchemaViolation {
         /// The type the second declares.
         second: FieldType,
     },
+    /// A violation inside an object value.
+    Nested {
+        /// The path from the record to the offending entry, such as
+        /// `dependencies[0].name`.
+        ///
+        /// A rendered string rather than a typed path, because the only consumer is a
+        /// diagnostic message and a typed path would be a second spelling of one that
+        /// already exists in the value being walked.
+        path: String,
+        /// The violation at that path.
+        inner: Box<SchemaViolation>,
+    },
 }
 
 impl fmt::Display for SchemaViolation {
@@ -263,6 +383,7 @@ impl fmt::Display for SchemaViolation {
                  record names",
                 key.as_str()
             ),
+            Self::Nested { path, inner } => write!(formatter, "at {path}, {inner}"),
         }
     }
 }
@@ -294,16 +415,17 @@ impl EffectiveSchema {
             for field in &schema.fields {
                 match combined.fields.get_mut(&field.key) {
                     None => {
-                        combined
-                            .fields
-                            .insert(field.key.clone(), (field.field_type, field.required));
+                        combined.fields.insert(
+                            field.key.clone(),
+                            (field.field_type.clone(), field.required),
+                        );
                     }
                     Some((existing, required)) => {
                         if *existing != field.field_type {
                             combined.conflicts.push(SchemaViolation::ConflictingField {
                                 key: field.key.clone(),
-                                first: *existing,
-                                second: field.field_type,
+                                first: existing.clone(),
+                                second: field.field_type.clone(),
                             });
                         }
                         *required = *required || field.required;
@@ -332,15 +454,17 @@ impl EffectiveSchema {
                     if *required {
                         found.push(SchemaViolation::MissingField {
                             key: key.clone(),
-                            declared: *declared,
+                            declared: declared.clone(),
                         });
                     }
                 }
                 Some((_, value)) => {
-                    if !declared.accepts(value) {
+                    if declared.accepts(value) {
+                        nested_violations(declared, value, key.as_str(), &mut found);
+                    } else {
                         found.push(SchemaViolation::WrongType {
                             key: key.clone(),
-                            declared: *declared,
+                            declared: declared.clone(),
                         });
                     }
                 }
@@ -371,7 +495,7 @@ mod tests {
                 .iter()
                 .map(|(text, field_type, required)| SchemaField {
                     key: key(text),
-                    field_type: *field_type,
+                    field_type: field_type.clone(),
                     required: *required,
                 })
                 .collect(),
@@ -405,15 +529,14 @@ mod tests {
 
     #[test]
     fn an_array_field_checks_every_element_and_accepts_an_empty_list() {
-        use crate::property::PropertyScalar;
         let declared = FieldType::array(ScalarType::String);
         assert!(declared.accepts(&PropertyValue::List(Vec::new())));
         assert!(
-            declared.accepts(&PropertyValue::List(vec![PropertyScalar::String(
+            declared.accepts(&PropertyValue::List(vec![PropertyValue::String(
                 "a".to_owned()
             )]))
         );
-        assert!(!declared.accepts(&PropertyValue::List(vec![PropertyScalar::Integer(1)])));
+        assert!(!declared.accepts(&PropertyValue::List(vec![PropertyValue::Integer(1)])));
         assert!(!declared.accepts(&PropertyValue::String("a".to_owned())));
     }
 

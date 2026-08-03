@@ -37,8 +37,8 @@
 use super::{Comments, DeclarationRef, LANGUAGE_VERSION};
 use super::{
     ContributionBlock, EdgeDeclaration, Endpoint, EvidenceBlock, EvidenceValue, LinkDeclaration,
-    NodeDeclaration, OwnerDeclaration, Property, RecordBody, SchemaDeclaration, SchemaField,
-    SourceFile, Spanned, Value,
+    NodeDeclaration, ObjectType, ObjectValue, OwnerDeclaration, Property, RecordBody,
+    SchemaDeclaration, SchemaField, SourceFile, Spanned, Value,
 };
 use crate::contribution::{Contribution, Owner};
 use crate::encoding::Graph;
@@ -172,31 +172,55 @@ fn scalar(value: &Spanned<Value>) -> Result<PropertyScalar, ConversionError> {
             DateTime::new(text.clone())
                 .map_err(|error| invalid(value.range, format!("{text}: {error}")))?,
         ),
-        Value::List(_) => {
+        // Reached only where a scalar is the only thing that fits. `property_value`
+        // handles a container before it ever calls this, so this arm is the guard for a
+        // position that genuinely admits no container rather than a rule about lists.
+        Value::List(_) | Value::Map(_) => {
             return Err(invalid(
                 value.range,
-                "a list holds scalars only, so it does not nest",
+                format!("expected a scalar, found a {}", value.value.kind_name()),
             ));
         }
     })
 }
 
+/// Turns a written value into a stored one, recursing through lists and objects.
+///
+/// The parser has already refused anything nesting past `MAX_NESTING_DEPTH`, so the
+/// recursion here is bounded by that check rather than by its own counter. A value
+/// reaching this function from anywhere other than the parser would need the same
+/// guarantee.
 fn property_value(value: &Spanned<Value>) -> Result<PropertyValue, ConversionError> {
-    if let Value::List(items) = &value.value {
-        let mut list = Vec::with_capacity(items.len());
-        for item in items {
-            list.push(scalar(item)?);
+    match &value.value {
+        Value::List(items) => {
+            let mut list = Vec::with_capacity(items.len());
+            for item in items {
+                list.push(property_value(item)?);
+            }
+            Ok(PropertyValue::List(list))
         }
-        return Ok(PropertyValue::List(list));
+        Value::Map(object) => {
+            let mut entries = Vec::with_capacity(object.entries.len());
+            for entry in &object.entries {
+                let key = PropertyKey::new(entry.key.value.as_str()).map_err(|error| {
+                    invalid(
+                        entry.key.range,
+                        format!("{} is not a property key: {error}", entry.key.value),
+                    )
+                })?;
+                entries.push((key, property_value(&entry.value)?));
+            }
+            Ok(PropertyValue::Map(entries))
+        }
+        _ => Ok(match scalar(value)? {
+            PropertyScalar::Boolean(flag) => PropertyValue::Boolean(flag),
+            PropertyScalar::Integer(number) => PropertyValue::Integer(number),
+            PropertyScalar::Float(number) => PropertyValue::Float(number),
+            PropertyScalar::String(text) => PropertyValue::String(text),
+            PropertyScalar::Bytes(bytes) => PropertyValue::Bytes(bytes),
+            PropertyScalar::DateTime(moment) => PropertyValue::DateTime(moment),
+        }),
     }
-    Ok(match scalar(value)? {
-        PropertyScalar::Boolean(flag) => PropertyValue::Boolean(flag),
-        PropertyScalar::Integer(number) => PropertyValue::Integer(number),
-        PropertyScalar::Float(number) => PropertyValue::Float(number),
-        PropertyScalar::String(text) => PropertyValue::String(text),
-        PropertyScalar::Bytes(bytes) => PropertyValue::Bytes(bytes),
-        PropertyScalar::DateTime(moment) => PropertyValue::DateTime(moment),
-    })
 }
 
 /// The labels and ordinary properties a record body carries.
@@ -483,7 +507,7 @@ fn schema(declaration: &SchemaDeclaration) -> Result<Schema, ConversionError> {
                     format!("{} is not a field key: {error}", field.key.value),
                 )
             })?,
-            field_type: field.field_type.value,
+            field_type: model_field_type(&field.field_type)?,
             required: !field.optional,
         });
     }
@@ -701,17 +725,62 @@ fn spanned<T>(value: T) -> Spanned<T> {
     }
 }
 
-fn value_of_scalar(scalar: &PropertyScalar) -> Value {
-    match scalar {
-        PropertyScalar::Boolean(flag) => Value::Boolean(*flag),
-        PropertyScalar::Integer(number) => Value::Integer(number.to_string()),
-        PropertyScalar::Float(number) => Value::Float(format!("{:?}", number.get())),
-        PropertyScalar::String(text) => Value::String(text.clone()),
-        PropertyScalar::Bytes(bytes) => Value::Bytes {
-            decoded: bytes.clone(),
-            digits: bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
-        },
-        PropertyScalar::DateTime(moment) => Value::DateTime(moment.as_str().to_owned()),
+/// Turns a written field type into a stored one, dropping the spans and comments the
+/// model does not carry.
+///
+/// A nested field key is validated here rather than at parse time, because the parser's
+/// job is that it is an identifier and the model's is that it is a [`PropertyKey`]. The
+/// two rules differ, and the diagnostic points at the key that failed.
+fn model_field_type(
+    written: &Spanned<super::FieldType>,
+) -> Result<crate::schema::FieldType, ConversionError> {
+    use crate::schema::FieldType as Model;
+    Ok(match &written.value {
+        super::FieldType::Scalar(scalar) => Model::Scalar(*scalar),
+        super::FieldType::Array(inner) => Model::Array(Box::new(model_field_type(&Spanned {
+            value: inner.as_ref().clone(),
+            range: written.range,
+        })?)),
+        super::FieldType::Object(object) => {
+            let mut fields = Vec::with_capacity(object.fields.len());
+            for field in &object.fields {
+                fields.push(crate::schema::SchemaField {
+                    key: PropertyKey::new(field.key.value.as_str()).map_err(|error| {
+                        invalid(
+                            field.key.range,
+                            format!("{} is not a field key: {error}", field.key.value),
+                        )
+                    })?,
+                    field_type: model_field_type(&field.field_type)?,
+                    required: !field.optional,
+                });
+            }
+            Model::Object(fields)
+        }
+    })
+}
+
+/// Turns a stored field type into a written one, with no comments to restore.
+///
+/// A field type exported from a database has never been written by a person, so there is
+/// nothing to preserve. A field type read from a document keeps its own CST.
+fn written_field_type(model: &crate::schema::FieldType) -> super::FieldType {
+    use crate::schema::FieldType as Model;
+    match model {
+        Model::Scalar(scalar) => super::FieldType::Scalar(*scalar),
+        Model::Array(inner) => super::FieldType::Array(Box::new(written_field_type(inner))),
+        Model::Object(fields) => super::FieldType::Object(ObjectType {
+            fields: fields
+                .iter()
+                .map(|field| SchemaField {
+                    key: spanned(field.key.as_str().to_owned()),
+                    optional: !field.required,
+                    field_type: spanned(written_field_type(&field.field_type)),
+                    comments: Comments::default(),
+                })
+                .collect(),
+            block_comments: Vec::new(),
+        }),
     }
 }
 
@@ -726,12 +795,16 @@ fn value_of(value: &PropertyValue) -> Value {
             digits: bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
         },
         PropertyValue::DateTime(moment) => Value::DateTime(moment.as_str().to_owned()),
-        PropertyValue::List(items) => Value::List(
-            items
+        PropertyValue::List(items) => {
+            Value::List(items.iter().map(|item| spanned(value_of(item))).collect())
+        }
+        PropertyValue::Map(entries) => Value::Map(ObjectValue {
+            entries: entries
                 .iter()
-                .map(|item| spanned(value_of_scalar(item)))
+                .map(|(key, held)| property(key.as_str(), value_of(held)))
                 .collect(),
-        ),
+            block_comments: Vec::new(),
+        }),
     }
 }
 
@@ -933,7 +1006,7 @@ pub fn from_graph(graph: &Graph) -> SourceFile {
                 .map(|field| SchemaField {
                     key: spanned(field.key.as_str().to_owned()),
                     optional: !field.required,
-                    field_type: spanned(field.field_type),
+                    field_type: spanned(written_field_type(&field.field_type)),
                     comments: Comments::default(),
                 })
                 .collect(),
@@ -1071,7 +1144,7 @@ mod tests {
 
     #[test]
     fn an_empty_document_converts_to_an_empty_graph() {
-        assert!(graph_of("@nost 3\n").is_empty());
+        assert!(graph_of("@nost 4\n").is_empty());
     }
 
     #[test]
@@ -1087,7 +1160,7 @@ mod tests {
     fn a_stated_identifier_is_kept_and_an_absent_one_is_minted() {
         let stated = "n_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
         let graph = graph_of(&format!(
-            "@nost 3\nnode a: L {{\n id: \"{stated}\",\n}}\nnode b: L {{}}\n"
+            "@nost 4\nnode a: L {{\n id: \"{stated}\",\n}}\nnode b: L {{}}\n"
         ));
         assert_eq!(graph.nodes[0].id.to_string(), stated);
         assert_ne!(graph.nodes[1].id.to_string(), stated);
@@ -1096,7 +1169,7 @@ mod tests {
 
     #[test]
     fn schema_names_and_the_labels_key_both_become_labels() {
-        let graph = graph_of("@nost 3\nnode a: Alpha, Beta {\n labels: [\"Gamma\"],\n}\n");
+        let graph = graph_of("@nost 4\nnode a: Alpha, Beta {\n labels: [\"Gamma\"],\n}\n");
         let labels: Vec<&str> = graph.nodes[0]
             .labels
             .iter()
@@ -1108,14 +1181,14 @@ mod tests {
 
     #[test]
     fn a_repeated_label_is_kept_once() {
-        let graph = graph_of("@nost 3\nnode a: Alpha {\n labels: [\"Alpha\"],\n}\n");
+        let graph = graph_of("@nost 4\nnode a: Alpha {\n labels: [\"Alpha\"],\n}\n");
         assert_eq!(graph.nodes[0].labels.len(), 1);
     }
 
     #[test]
     fn every_property_value_type_converts() {
         let graph = graph_of(
-            "@nost 3\nnode a: L {\n flag: true,\n count: 42,\n ratio: 0.5,\n name: \"x\",\n \
+            "@nost 4\nnode a: L {\n flag: true,\n count: 42,\n ratio: 0.5,\n name: \"x\",\n \
              payload: bytes\"dead\",\n at: datetime\"2026-07-27T00:00:00Z\",\n \
              tags: [\"a\", 1],\n}\n",
         );
@@ -1134,7 +1207,7 @@ mod tests {
 
     #[test]
     fn an_out_of_range_integer_is_a_conversion_error_not_a_panic() {
-        let file = parse("@nost 3\nnode a: L {\n k: 9223372036854775808,\n}\n").unwrap();
+        let file = parse("@nost 4\nnode a: L {\n k: 9223372036854775808,\n}\n").unwrap();
         let error = to_graph(&file).unwrap_err();
         assert!(matches!(error, ConversionError::InvalidValue { .. }));
         assert!(error.range().is_some());
@@ -1142,7 +1215,7 @@ mod tests {
 
     #[test]
     fn an_unresolved_endpoint_becomes_a_placeholder_node() {
-        let graph = graph_of("@nost 3\nnode a: L {}\nedge a -> gone :R {}\n");
+        let graph = graph_of("@nost 4\nnode a: L {}\nedge a -> gone :R {}\n");
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.nodes[1].labels[0].as_str(), PLACEHOLDER_LABEL);
         // Never a null endpoint.
@@ -1152,8 +1225,8 @@ mod tests {
     #[test]
     fn an_external_endpoint_is_refused_rather_than_degraded() {
         for source in [
-            "@nost 3\n@link \"./s\" as s\nnode a: L {}\nedge a -> s::x :R {}\n",
-            "@nost 3\n@link \"./c\"\nnode a: L {}\nedge a -> \"./c\"::x :R {}\n",
+            "@nost 4\n@link \"./s\" as s\nnode a: L {}\nedge a -> s::x :R {}\n",
+            "@nost 4\n@link \"./c\"\nnode a: L {}\nedge a -> \"./c\"::x :R {}\n",
         ] {
             let file = parse(source).unwrap();
             let error = to_graph(&file).unwrap_err();
@@ -1167,7 +1240,7 @@ mod tests {
     #[test]
     fn links_and_schemas_convert() {
         let graph = graph_of(
-            "@nost 3\n@link \"./c\"\n@link \"./s\" as s\n\
+            "@nost 4\n@link \"./c\"\n@link \"./s\" as s\n\
              schema Function {\n name: string,\n tags?: string[],\n}\n\
              schema CALLS (Function -> Function) {}\n",
         );
@@ -1200,7 +1273,7 @@ mod tests {
     #[test]
     fn contributions_and_evidence_convert() {
         let graph = graph_of(
-            "@nost 3\nnode a: L {\n \
+            "@nost 4\nnode a: L {\n \
              @by \"rust\" unit \"u_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\" {\n  \
              @evidence {\n   source: \"./\",\n   path: \"src/a.rs\",\n   \
              digest: \"sha256:abcdef0123456789abcdef0123456789\",\n   \
@@ -1233,7 +1306,7 @@ mod tests {
     #[test]
     fn a_score_carrying_confidence_converts() {
         let graph = graph_of(
-            "@nost 3\nnode a: L {\n @by \"ai:sha256:abcdef0123456789abcdef0123456789\" {\n  \
+            "@nost 4\nnode a: L {\n @by \"ai:sha256:abcdef0123456789abcdef0123456789\" {\n  \
              @evidence {\n   source: \"./\",\n   \
              digest: \"sha256:abcdef0123456789abcdef0123456789\",\n   producer: \"p\",\n   \
              producer_version: \"1\",\n   method: ai_inferred,\n   confidence: inferred(0.25),\n  \
@@ -1261,7 +1334,7 @@ mod tests {
     #[test]
     fn graph_content_survives_a_round_trip() {
         round_trip(
-            "@nost 3\n@link \"./c\"\n@link \"./s\" as s\n\
+            "@nost 4\n@link \"./c\"\n@link \"./s\" as s\n\
              schema Function {\n name: string,\n tags?: string[],\n}\n\
              node login: Function {\n id: \"n_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\",\n \
              name: \"login\",\n tags: [\"a\"],\n labels: [\"Public\"],\n}\n\
@@ -1275,7 +1348,7 @@ mod tests {
     #[test]
     fn contributions_survive_a_round_trip() {
         round_trip(
-            "@nost 3\nnode a: L {\n id: \"n_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\",\n \
+            "@nost 4\nnode a: L {\n id: \"n_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\",\n \
              @by \"rust\" unit \"u_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\" {\n  \
              @evidence {\n   source: \"./\",\n   path: \"src/a.rs\",\n   \
              revision: \"abc\",\n   \
@@ -1292,7 +1365,7 @@ mod tests {
         // would come back owned by the user, and an analyzer refresh would then be free
         // to replace work a person did by hand.
         let (graph, _) = round_trip(
-            "@nost 3\nnode a: L {\n id: \"n_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\",\n \
+            "@nost 4\nnode a: L {\n id: \"n_0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\",\n \
              @by \"rust\" {\n  @evidence {\n   source: \"./\",\n   \
              digest: \"sha256:abcdef0123456789abcdef0123456789\",\n   \
              producer_version: \"1\",\n   method: deterministic,\n   \
@@ -1317,7 +1390,7 @@ mod tests {
     fn a_minted_identifier_is_written_out_so_the_next_pass_carries_it() {
         // The first export is where a minted identifier becomes durable. Before it, two
         // conversions of the same text produce different graphs; after it, they do not.
-        let source = "@nost 3\nnode a: L {}\n";
+        let source = "@nost 4\nnode a: L {}\n";
         let exported = format(&from_graph(&graph_of(source)));
         assert!(exported.contains("id: \"n_"), "{exported}");
         assert_eq!(graph_of(&exported), graph_of(&exported));

@@ -18,7 +18,14 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-const TAGS: [&str; 5] = ["bytes", "datetime", "node", "relationship", "path"];
+const TAGS: [&str; 6] = [
+    "bytes",
+    "datetime",
+    "node",
+    "relationship",
+    "path",
+    "object",
+];
 
 fn fixture_root() -> Option<PathBuf> {
     let raw = std::env::var("NOSTDB_SPEC_FIXTURES").ok()?;
@@ -50,8 +57,14 @@ fn registry_codes() -> BTreeSet<String> {
 /// make agreement automatic and therefore meaningless.
 fn violation(document: &Value, codes: &BTreeSet<String>) -> Option<String> {
     let object = document.as_object()?;
-    if object.get("result_version").and_then(Value::as_u64) != Some(1) {
-        return Some("result_version must be 1".to_owned());
+    // Both supported versions are accepted. An envelope is a message rather than a stored
+    // artifact, so version 1 stays readable: it carries nothing version 2 cannot express,
+    // and a version 1 producer never emits the object form version 2 added.
+    if !matches!(
+        object.get("result_version").and_then(Value::as_u64),
+        Some(1 | 2)
+    ) {
+        return Some("result_version must be 1 or 2".to_owned());
     }
     let columns = object.get("columns")?.as_array()?;
     let rows = object.get("rows")?.as_array()?;
@@ -169,6 +182,29 @@ fn produced() -> Vec<(&'static str, ResultEnvelope)> {
                 ]],
                 database_generation: 42,
                 linked_databases_opened: 2,
+                writes: None,
+                warnings: Vec::new(),
+            },
+        ),
+        (
+            "an object value, with a nested key that shadows a tag",
+            ResultEnvelope {
+                columns: vec!["detail".to_owned()],
+                rows: vec![vec![QueryValue::Object(vec![
+                    (
+                        nostdb_core::PropertyKey::new("path").unwrap(),
+                        QueryValue::Text("not a path".to_owned()),
+                    ),
+                    (
+                        nostdb_core::PropertyKey::new("nested").unwrap(),
+                        QueryValue::Object(vec![(
+                            nostdb_core::PropertyKey::new("n").unwrap(),
+                            QueryValue::Integer(1),
+                        )]),
+                    ),
+                ])]],
+                database_generation: 4,
+                linked_databases_opened: 0,
                 writes: None,
                 warnings: Vec::new(),
             },

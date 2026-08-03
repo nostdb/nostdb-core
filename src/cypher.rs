@@ -2026,6 +2026,27 @@ fn parse_identifier_expression(parser: &mut Parser) -> Result<Expression, QueryE
         if parser.kind() == Kind::LeftParen {
             return parse_call(parser, format!("{}.{second}", first.text), first.range);
         }
+        // A property value may be an object or a list of them, so a caller will try to
+        // reach inside one. Both steps are outside the subset, and both are named here
+        // rather than left to the general "expected the end of the query": that message
+        // describes a malformed query, and this one is a well-formed query asking for
+        // something this build does not implement. `QUERY_SUBSET.md` section 3.1 states
+        // the refusal, and the diagnostic has to agree with it.
+        if matches!(parser.kind(), Kind::LeftBracket | Kind::Dot) {
+            let step = if parser.kind() == Kind::LeftBracket {
+                "indexing into"
+            } else {
+                "a path step past"
+            };
+            return Err(QueryError::unsupported(
+                format!(
+                    "{step} the property `{}.{second}` is outside the declared query \
+                     subset; return the property and read the value in the caller",
+                    first.text
+                ),
+                parser.range(),
+            ));
+        }
         return Ok(Expression::Property {
             variable: first.text,
             key: second,

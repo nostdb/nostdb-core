@@ -207,7 +207,7 @@ fn a_nost_document_survives_a_trip_through_a_real_database_file() {
     // it to a real file, reopen that file, and write the document back out.
     use nostdb_core::nost::{format, from_graph, parse, to_graph};
 
-    let source = "@nost 3\n\
+    let source = "@nost 4\n\
         \n\
         @link \"./packages/child\"\n\
         @link \"./packages/shared\" as shared\n\

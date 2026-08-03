@@ -23,7 +23,7 @@ use crate::mutate::WriteSummary;
 use serde_json::{Map, Value, json};
 
 /// The envelope version this build writes.
-pub const RESULT_VERSION: u64 = 1;
+pub const RESULT_VERSION: u64 = 2;
 
 /// Warnings that make a result partial.
 ///
@@ -201,6 +201,18 @@ pub fn value_json(value: &QueryValue) -> Value {
         }
         QueryValue::Text(text) => json!(text),
         QueryValue::List(items) => Value::Array(items.iter().map(value_json).collect()),
+        // Tagged, and not for symmetry with the four below. `bytes`, `datetime`, and
+        // `node` are reserved words, so no property key can be one of those — but
+        // `relationship`, `path`, and `object` are ordinary identifiers and a stored
+        // object may carry any of them. Emitted bare, `{"path": "src/main.rs"}` would be
+        // a path to every consumer reading the contract's table, and nothing in the
+        // payload could tell the two readings apart.
+        QueryValue::Object(entries) => json!({
+            "object": entries
+                .iter()
+                .map(|(key, held)| (key.as_str().to_owned(), value_json(held)))
+                .collect::<serde_json::Map<String, Value>>(),
+        }),
         QueryValue::Node(id) => json!({ "node": id.to_string() }),
         QueryValue::Relationship(id) => json!({ "relationship": id.to_string() }),
         QueryValue::Path {
